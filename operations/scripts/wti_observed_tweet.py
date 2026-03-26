@@ -3,14 +3,14 @@
 
 Reads observed content JSON from wilma-server and tweet_state.json for the
 predicted tweet ID to reply to. If no predicted tweet exists, posts standalone.
-
-Phase 1: Text-only. Phase 2 will add Remotion video rendering.
+Renders Remotion video on wilma, SCPs it locally, uploads to Twitter with text.
 """
 
 import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import date, timedelta
 from pathlib import Path
@@ -21,10 +21,12 @@ from requests_oauthlib import OAuth1
 # --- Configuration ---
 SSH_HOST = "wilma@192.168.2.75"
 CONTENT_DIR = "/home/wilma/hazeydata/pipeline/content"
+REMOTION_DIR = "/home/wilma/clawd-anthropic/remotion-experiments/remotion-tpcr"
 STATE_FILE = Path.home() / "hazeydata" / "reports" / "wti_daily" / "tweet_state.json"
 DISCORD_CHANNEL_ID = "1479351574177513576"
 DISCORD_API = "https://discord.com/api/v10"
 TWITTER_API = "https://api.twitter.com/2/tweets"
+TWITTER_UPLOAD_API = "https://upload.twitter.com/1.1/media/upload.json"
 
 
 def load_env():
@@ -57,6 +59,97 @@ def ssh_read_file(path):
     if result.returncode != 0:
         return None
     return result.stdout.strip()
+
+
+def render_video_on_wilma(target_date):
+    """Trigger Remotion render on wilma-server and SCP the video back.
+
+    Returns local path to the mp4, or None on failure.
+    """
+    remote_output = f"{REMOTION_DIR}/out/observed-wti-{target_date}.mp4"
+
+    # Extract observed data and render
+    print("Rendering video on wilma-server...")
+    render_cmd = (
+        f"cd {REMOTION_DIR} && "
+        f"/home/wilma/theme-park-crowd-report/.venv/bin/python3 scripts/extract_daily_wti.py --mode observed && "
+        f"npx remotion render DailyWTIAll '{remote_output}' --codec h264 --crf 18 --log=error"
+    )
+    result = subprocess.run(
+        ["ssh", SSH_HOST, render_cmd],
+        capture_output=True, text=True, timeout=120,
+    )
+    if result.returncode != 0:
+        print(f"Render failed: {result.stderr}", file=sys.stderr)
+        return None
+
+    local_path = Path(tempfile.mkdtemp()) / f"observed-wti-{target_date}.mp4"
+    scp_result = subprocess.run(
+        ["scp", f"{SSH_HOST}:{remote_output}", str(local_path)],
+        capture_output=True, text=True, timeout=30,
+    )
+    if scp_result.returncode != 0:
+        print(f"SCP failed: {scp_result.stderr}", file=sys.stderr)
+        return None
+
+    print(f"Video downloaded: {local_path} ({local_path.stat().st_size} bytes)")
+    return local_path
+
+
+def upload_media(video_path):
+    """Upload video to Twitter via v1.1 chunked media upload. Returns media_id or None."""
+    auth = get_twitter_auth()
+    file_size = video_path.stat().st_size
+
+    # INIT
+    resp = requests.post(TWITTER_UPLOAD_API, auth=auth, data={
+        "command": "INIT",
+        "total_bytes": file_size,
+        "media_type": "video/mp4",
+        "media_category": "tweet_video",
+    }, timeout=30)
+    if resp.status_code not in (200, 201, 202):
+        print(f"Media INIT failed: {resp.status_code} {resp.text}", file=sys.stderr)
+        return None
+    media_id = resp.json()["media_id_string"]
+
+    # APPEND
+    with open(video_path, "rb") as f:
+        resp = requests.post(TWITTER_UPLOAD_API, auth=auth, data={
+            "command": "APPEND",
+            "media_id": media_id,
+            "segment_index": 0,
+        }, files={"media": f}, timeout=60)
+    if resp.status_code not in (200, 204):
+        print(f"Media APPEND failed: {resp.status_code} {resp.text}", file=sys.stderr)
+        return None
+
+    # FINALIZE
+    resp = requests.post(TWITTER_UPLOAD_API, auth=auth, data={
+        "command": "FINALIZE",
+        "media_id": media_id,
+    }, timeout=30)
+    if resp.status_code not in (200, 201):
+        print(f"Media FINALIZE failed: {resp.status_code} {resp.text}", file=sys.stderr)
+        return None
+
+    processing = resp.json().get("processing_info")
+    while processing and processing.get("state") == "pending":
+        wait = processing.get("check_after_secs", 5)
+        print(f"Media processing... waiting {wait}s")
+        time.sleep(wait)
+        resp = requests.get(TWITTER_UPLOAD_API, auth=auth, params={
+            "command": "STATUS",
+            "media_id": media_id,
+        }, timeout=15)
+        processing = resp.json().get("processing_info")
+
+    if processing and processing.get("state") == "failed":
+        print(f"Media processing failed: {processing}", file=sys.stderr)
+        return None
+
+    print(f"Media uploaded: {media_id}")
+    return media_id
 
 
 def load_content():
@@ -125,12 +218,14 @@ def crowd_bar(wti):
         return "\U0001f534"  # red
 
 
-def post_tweet(text, reply_to=None):
+def post_tweet(text, reply_to=None, media_id=None):
     """Post a tweet via Twitter API v2. Returns tweet_id or None."""
     auth = get_twitter_auth()
     payload = {"text": text}
     if reply_to:
         payload["reply"] = {"in_reply_to_tweet_id": reply_to}
+    if media_id:
+        payload["media"] = {"media_ids": [media_id]}
 
     resp = requests.post(TWITTER_API, json=payload, auth=auth, timeout=30)
     if resp.status_code in (200, 201):
@@ -186,8 +281,18 @@ def main():
     tweet_text = format_tweet(content, is_reply=is_reply)
     print(f"\nTweet ({len(tweet_text)} chars, reply_to={reply_to}):\n{tweet_text}\n")
 
+    # Render and upload video
+    media_id = None
+    video_path = render_video_on_wilma(content["target_date"])
+    if video_path:
+        media_id = upload_media(video_path)
+        if not media_id:
+            print("WARNING: Video upload failed — posting text-only tweet")
+    else:
+        print("WARNING: Video render failed — posting text-only tweet")
+
     # Post tweet
-    tweet_id = post_tweet(tweet_text, reply_to=reply_to)
+    tweet_id = post_tweet(tweet_text, reply_to=reply_to, media_id=media_id)
     if not tweet_id:
         post_discord(":x: **WTI Observed Tweet** — Twitter API error, tweet failed")
         sys.exit(1)
