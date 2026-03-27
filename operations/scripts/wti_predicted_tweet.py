@@ -62,14 +62,60 @@ def ssh_read_file(path):
     return result.stdout.strip()
 
 
-def render_video_on_wilma(target_date):
-    """Trigger Remotion render on wilma-server and SCP the video back.
+def render_video_on_wilma(target_date, content):
+    """Write predicted data to Remotion, render, SCP the video back.
 
     Returns local path to the mp4, or None on failure.
     """
     remote_output = f"{REMOTION_DIR}/out/predicted-wti-{target_date}.mp4"
+    data_path = f"{REMOTION_DIR}/public/daily-wti-data.json"
 
-    # Write content data to Remotion's public JSON, then render
+    # Build Remotion data JSON from content
+    park_emojis = {"MK": "\U0001f3f0", "EP": "\U0001f310", "HS": "\U0001f3ac", "AK": "\U0001f981"}
+    parks_data = []
+    for p in content.get("parks", []):
+        wti = p.get("wti", 0)
+        if wti < 15:
+            label, emoji = "Low", "\U0001f48e"
+        elif wti < 25:
+            label, emoji = "Average", "\U0001f338"
+        elif wti < 35:
+            label, emoji = "Above Average", "\U0001f525"
+        else:
+            label, emoji = "High", "\U0001f534"
+        parks_data.append({
+            "parkCode": p.get("park_code", ""),
+            "parkName": p.get("park_name", ""),
+            "parkEmoji": park_emojis.get(p.get("park_code", ""), "\U0001f3a2"),
+            "wtiScore": wti,
+            "wtiEmoji": emoji,
+            "wtiLabel": label,
+            "headlinerRide": "Check the app!",
+            "headlinerWait": 0,
+            "bestRide": "Check the app!",
+            "bestRideWait": 0,
+        })
+
+    from datetime import datetime
+    dt = datetime.strptime(target_date, "%Y-%m-%d")
+    date_display = dt.strftime("%B %d, %Y")
+
+    remotion_data = json.dumps({
+        "date": date_display,
+        "dateISO": target_date,
+        "mode": "predicted",
+        "qualityGateStatus": "ready",
+        "parks": parks_data,
+    })
+
+    # Write data to Remotion's public file via SSH
+    print("Writing predicted data to Remotion...")
+    subprocess.run(
+        ["ssh", SSH_HOST, f"cat > '{data_path}'"],
+        input=remotion_data, capture_output=True, text=True, timeout=15,
+    )
+
+    # Render
     print("Rendering video on wilma-server...")
     render_cmd = (
         f"cd {REMOTION_DIR} && "
@@ -289,7 +335,7 @@ def main():
 
     # Render and upload video
     media_id = None
-    video_path = render_video_on_wilma(content["target_date"])
+    video_path = render_video_on_wilma(content["target_date"], content)
     if video_path:
         media_id = upload_media(video_path)
         if not media_id:
