@@ -61,18 +61,53 @@ def ssh_read_file(path):
     return result.stdout.strip()
 
 
-def render_video_on_wilma(target_date):
-    """Trigger Remotion render on wilma-server and SCP the video back.
+def render_video_on_wilma(target_date, content):
+    """Write content data to Remotion, render, SCP the video back.
+
+    Bypasses extract_daily_wti.py (has known date bug). Instead, writes
+    the content JSON directly to Remotion's public data file.
 
     Returns local path to the mp4, or None on failure.
     """
     remote_output = f"{REMOTION_DIR}/out/observed-wti-{target_date}.mp4"
+    data_path = f"{REMOTION_DIR}/public/daily-wti-data.json"
 
-    # Extract observed data and render
+    # Build Remotion data JSON from content
+    parks_data = []
+    for p in content.get("parks", []):
+        parks_data.append({
+            "parkCode": p.get("park_code", ""),
+            "parkName": p.get("park_name", ""),
+            "parkEmoji": p.get("park_emoji", ""),
+            "wtiScore": p.get("wti", 0),
+            "wtiEmoji": p.get("wti_emoji", ""),
+            "wtiLabel": p.get("wti_label", ""),
+            "headlinerRide": p.get("headliner_ride", "Check the app!"),
+            "headlinerWait": p.get("headliner_wait", 0),
+            "bestRide": p.get("best_ride", "Check the app!"),
+            "bestRideWait": p.get("best_ride_wait", 0),
+        })
+
+    remotion_data = json.dumps({
+        "date": target_date,
+        "dateISO": target_date,
+        "mode": "observed",
+        "parks": parks_data,
+    })
+
+    # Write data to Remotion's public file via SSH
+    print("Writing observed data to Remotion...")
+    write_result = subprocess.run(
+        ["ssh", SSH_HOST, f"cat > '{data_path}'"],
+        input=remotion_data, capture_output=True, text=True, timeout=15,
+    )
+    if write_result.returncode != 0:
+        print(f"Data write failed: {write_result.stderr}", file=sys.stderr)
+
+    # Render
     print("Rendering video on wilma-server...")
     render_cmd = (
         f"cd {REMOTION_DIR} && "
-        f"/home/wilma/theme-park-crowd-report/.venv/bin/python3 scripts/extract_daily_wti.py --mode observed && "
         f"npx remotion render DailyWTIAll '{remote_output}' --codec h264 --crf 18 --log=error"
     )
     result = subprocess.run(
@@ -283,7 +318,7 @@ def main():
 
     # Render and upload video
     media_id = None
-    video_path = render_video_on_wilma(content["target_date"])
+    video_path = render_video_on_wilma(content["target_date"], content)
     if video_path:
         media_id = upload_media(video_path)
         if not media_id:
