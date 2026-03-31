@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """WTI Observed Tweet — Posts yesterday's actual WTI as a reply to the prediction at 8:30 AM ET.
 
-Reads observed content JSON from wilma-server and tweet_state.json for the
-predicted tweet ID to reply to. If no predicted tweet exists, posts standalone.
-Renders Remotion video on wilma, SCPs it locally, uploads to Twitter with text.
+Every tweet has two dates:
+  - tweet_date: when the tweet is posted (today)
+  - reference_date: the date the statistics apply to (yesterday for observed)
+
+The observed tweet replies to the PREDICTED tweet that shares the same
+reference_date. For example, the observed tweet for March 30 replies to
+the predicted tweet for March 30 (which was posted on March 29 at 4 PM).
+
+Looks up the predicted tweet_id from tweet_state.json["predicted"][reference_date].
 """
 
 import json
@@ -62,17 +68,10 @@ def ssh_read_file(path):
 
 
 def render_video_on_wilma(target_date, content):
-    """Write content data to Remotion, render, SCP the video back.
-
-    Bypasses extract_daily_wti.py (has known date bug). Instead, writes
-    the content JSON directly to Remotion's public data file.
-
-    Returns local path to the mp4, or None on failure.
-    """
+    """Write content data to Remotion, render, SCP the video back."""
     remote_output = f"{REMOTION_DIR}/out/observed-wti-{target_date}.mp4"
     data_path = f"{REMOTION_DIR}/public/daily-wti-data.json"
 
-    # Build Remotion data JSON from content
     parks_data = []
     for p in content.get("parks", []):
         parks_data.append({
@@ -95,7 +94,6 @@ def render_video_on_wilma(target_date, content):
         "parks": parks_data,
     })
 
-    # Write data to Remotion's public file via SSH
     print("Writing observed data to Remotion...")
     write_result = subprocess.run(
         ["ssh", SSH_HOST, f"cat > '{data_path}'"],
@@ -104,7 +102,6 @@ def render_video_on_wilma(target_date, content):
     if write_result.returncode != 0:
         print(f"Data write failed: {write_result.stderr}", file=sys.stderr)
 
-    # Render
     print("Rendering video on wilma-server...")
     render_cmd = (
         f"cd {REMOTION_DIR} && "
@@ -136,33 +133,25 @@ def upload_media(video_path):
     auth = get_twitter_auth()
     file_size = video_path.stat().st_size
 
-    # INIT
     resp = requests.post(TWITTER_UPLOAD_API, auth=auth, data={
-        "command": "INIT",
-        "total_bytes": file_size,
-        "media_type": "video/mp4",
-        "media_category": "tweet_video",
+        "command": "INIT", "total_bytes": file_size,
+        "media_type": "video/mp4", "media_category": "tweet_video",
     }, timeout=30)
     if resp.status_code not in (200, 201, 202):
         print(f"Media INIT failed: {resp.status_code} {resp.text}", file=sys.stderr)
         return None
     media_id = resp.json()["media_id_string"]
 
-    # APPEND
     with open(video_path, "rb") as f:
         resp = requests.post(TWITTER_UPLOAD_API, auth=auth, data={
-            "command": "APPEND",
-            "media_id": media_id,
-            "segment_index": 0,
+            "command": "APPEND", "media_id": media_id, "segment_index": 0,
         }, files={"media": f}, timeout=60)
     if resp.status_code not in (200, 204):
         print(f"Media APPEND failed: {resp.status_code} {resp.text}", file=sys.stderr)
         return None
 
-    # FINALIZE
     resp = requests.post(TWITTER_UPLOAD_API, auth=auth, data={
-        "command": "FINALIZE",
-        "media_id": media_id,
+        "command": "FINALIZE", "media_id": media_id,
     }, timeout=30)
     if resp.status_code not in (200, 201):
         print(f"Media FINALIZE failed: {resp.status_code} {resp.text}", file=sys.stderr)
@@ -174,8 +163,7 @@ def upload_media(video_path):
         print(f"Media processing... waiting {wait}s")
         time.sleep(wait)
         resp = requests.get(TWITTER_UPLOAD_API, auth=auth, params={
-            "command": "STATUS",
-            "media_id": media_id,
+            "command": "STATUS", "media_id": media_id,
         }, timeout=15)
         processing = resp.json().get("processing_info")
 
@@ -205,28 +193,60 @@ def load_content():
     return None
 
 
-def load_predicted_tweet_id():
-    """Load the predicted tweet ID from state file for reply threading."""
+def find_predicted_tweet_id(reference_date):
+    """Look up the predicted tweet ID for a specific reference_date.
+
+    The observed tweet for reference_date X replies to the predicted
+    tweet for that same reference_date X.
+
+    State file structure:
+      {
+        "predicted": {
+          "2026-03-31": {"tweet_id": "...", "posted_at": "..."},
+          "2026-03-30": {"tweet_id": "...", "posted_at": "..."},
+        },
+        "last_predicted": {...}  // legacy fallback
+      }
+    """
     if not STATE_FILE.exists():
+        print(f"No state file found at {STATE_FILE}")
         return None
+
     try:
         state = json.loads(STATE_FILE.read_text())
-        return state.get("last_predicted", {}).get("tweet_id")
-    except (json.JSONDecodeError, KeyError):
+    except json.JSONDecodeError:
+        print("State file is invalid JSON")
         return None
+
+    # Primary lookup: by reference_date in the predicted dict
+    predicted = state.get("predicted", {})
+    if reference_date in predicted:
+        tweet_id = predicted[reference_date].get("tweet_id")
+        print(f"Found predicted tweet for ref={reference_date}: {tweet_id}")
+        return tweet_id
+
+    # Fallback: check last_predicted if reference_date matches
+    last = state.get("last_predicted", {})
+    last_ref = last.get("reference_date") or last.get("target_date")
+    if last_ref == reference_date:
+        tweet_id = last.get("tweet_id")
+        print(f"Found predicted tweet via last_predicted fallback: {tweet_id}")
+        return tweet_id
+
+    print(f"No predicted tweet found for reference_date={reference_date}")
+    return None
 
 
 def format_tweet(content, is_reply=False):
     """Format the observed WTI content as a tweet."""
     target = content["target_date"]
     parks = content["parks"]
-
     parks_sorted = sorted(parks, key=lambda p: p["wti"])
 
     if is_reply:
-        lines = [f"How it actually went — {target}:"]
+        lines = [f"How it actually went \u2014 {target}:"]
     else:
-        lines = [f"Walt Disney World Actual Wait Times — {target}"]
+        lines = [f"Walt Disney World Actual Wait Times \u2014 {target}"]
 
     lines.append("")
     for p in parks_sorted:
@@ -242,19 +262,17 @@ def format_tweet(content, is_reply=False):
 
 
 def crowd_bar(wti):
-    """Return an emoji indicator for crowd level."""
     if wti < 15:
-        return "\U0001f7e2"  # green
+        return "\U0001f7e2"
     elif wti < 25:
-        return "\U0001f7e1"  # yellow
+        return "\U0001f7e1"
     elif wti < 35:
-        return "\U0001f7e0"  # orange
+        return "\U0001f7e0"
     else:
-        return "\U0001f534"  # red
+        return "\U0001f534"
 
 
 def post_tweet(text, reply_to=None, media_id=None):
-    """Post a tweet via Twitter API v2. Returns tweet_id or None."""
     auth = get_twitter_auth()
     payload = {"text": text}
     if reply_to:
@@ -274,18 +292,13 @@ def post_tweet(text, reply_to=None, media_id=None):
 
 
 def post_discord(message):
-    """Post confirmation to Discord #wti-pipeline."""
     token = os.environ.get("DISCORD_BOT_TOKEN", "")
     if not token:
         return
-    payload = json.dumps({"content": message})
     requests.post(
         f"{DISCORD_API}/channels/{DISCORD_CHANNEL_ID}/messages",
-        data=payload,
-        headers={
-            "Authorization": f"Bot {token}",
-            "Content-Type": "application/json",
-        },
+        json={"content": message},
+        headers={"Authorization": f"Bot {token}", "Content-Type": "application/json"},
         timeout=15,
     )
 
@@ -293,7 +306,7 @@ def post_discord(message):
 def main():
     load_env()
 
-    print(f"WTI Observed Tweet — {date.today().isoformat()}")
+    print(f"WTI Observed Tweet \u2014 {date.today().isoformat()}")
 
     for key in ["TWITTER_CONSUMER_KEY", "TWITTER_CONSUMER_SECRET",
                 "TWITTER_ACCESS_TOKEN", "TWITTER_ACCESS_TOKEN_SECRET"]:
@@ -304,38 +317,47 @@ def main():
     # Load content
     content = load_content()
     if not content:
-        print("No ready observed content found — skipping tweet")
-        post_discord(":warning: **WTI Observed Tweet** — No ready content found, tweet skipped")
+        print("No ready observed content found \u2014 skipping tweet")
+        post_discord(":warning: **WTI Observed Tweet** \u2014 No ready content found, tweet skipped")
         return
 
-    # Check for predicted tweet to reply to
-    reply_to = load_predicted_tweet_id()
+    # The reference_date is the date the stats apply to (yesterday)
+    reference_date = content["target_date"]
+
+    # Find the predicted tweet for THIS reference_date to reply to
+    reply_to = find_predicted_tweet_id(reference_date)
     is_reply = reply_to is not None
+
+    if is_reply:
+        print(f"Will reply to predicted tweet {reply_to} (ref={reference_date})")
+    else:
+        print(f"No predicted tweet found for ref={reference_date} \u2014 posting standalone")
 
     # Format tweet
     tweet_text = format_tweet(content, is_reply=is_reply)
-    print(f"\nTweet ({len(tweet_text)} chars, reply_to={reply_to}):\n{tweet_text}\n")
+    print(f"\nTweet ({len(tweet_text)} chars, ref={reference_date}, reply_to={reply_to}):\n{tweet_text}\n")
 
     # Render and upload video
     media_id = None
-    video_path = render_video_on_wilma(content["target_date"], content)
+    video_path = render_video_on_wilma(reference_date, content)
     if video_path:
         media_id = upload_media(video_path)
         if not media_id:
-            print("WARNING: Video upload failed — posting text-only tweet")
+            print("WARNING: Video upload failed \u2014 posting text-only tweet")
     else:
-        print("WARNING: Video render failed — posting text-only tweet")
+        print("WARNING: Video render failed \u2014 posting text-only tweet")
 
     # Post tweet
     tweet_id = post_tweet(tweet_text, reply_to=reply_to, media_id=media_id)
     if not tweet_id:
-        post_discord(":x: **WTI Observed Tweet** — Twitter API error, tweet failed")
+        post_discord(":x: **WTI Observed Tweet** \u2014 Twitter API error, tweet failed")
         sys.exit(1)
 
-    # Discord confirmation
+    # Discord confirmation — include reference_date and reply target for debugging
     mode = "reply thread" if is_reply else "standalone"
     post_discord(
-        f":white_check_mark: **WTI Observed Tweet posted** ({mode}) — {content['target_date']}\n"
+        f":white_check_mark: **WTI Observed Tweet posted** ({mode}) \u2014 ref={reference_date}\n"
+        f"Replied to predicted tweet: {reply_to or 'none (standalone)'}\n"
         f"https://x.com/DisneyStatsWhiz/status/{tweet_id}"
     )
     print("Done.")
