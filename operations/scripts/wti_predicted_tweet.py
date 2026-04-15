@@ -170,18 +170,22 @@ def upload_media(video_path):
         return None
 
     processing = resp.json().get("processing_info")
-    while processing and processing.get("state") == "pending":
+    elapsed = 0
+    while processing and processing.get("state") != "succeeded":
+        if processing.get("state") == "failed":
+            print(f"Media processing failed: {processing}", file=sys.stderr)
+            return None
+        if elapsed > 60:
+            print(f"Media processing timeout after {elapsed}s (state={processing.get('state')})", file=sys.stderr)
+            return None
         wait = processing.get("check_after_secs", 5)
-        print(f"Media processing... waiting {wait}s")
+        print(f"Media processing... waiting {wait}s (state={processing.get('state')})")
         time.sleep(wait)
+        elapsed += wait
         resp = requests.get(TWITTER_UPLOAD_API, auth=auth, params={
             "command": "STATUS", "media_id": media_id,
         }, timeout=15)
         processing = resp.json().get("processing_info")
-
-    if processing and processing.get("state") == "failed":
-        print(f"Media processing failed: {processing}", file=sys.stderr)
-        return None
 
     print(f"Media uploaded: {media_id}")
     return media_id
@@ -333,6 +337,16 @@ def main():
         return
 
     reference_date = content["target_date"]
+
+    # Idempotency guard (#468): skip if already posted for this reference_date
+    if STATE_FILE.exists():
+        try:
+            existing = json.loads(STATE_FILE.read_text())
+            if existing.get("predicted", {}).get(reference_date, {}).get("tweet_id"):
+                print(f"Already posted predicted tweet for {reference_date}, exiting.")
+                return
+        except (json.JSONDecodeError, KeyError):
+            pass
     tweet_text = format_tweet(content)
     print(f"\nTweet ({len(tweet_text)} chars, ref={reference_date}):\n{tweet_text}\n")
 
