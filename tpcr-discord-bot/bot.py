@@ -81,14 +81,14 @@ tree = app_commands.CommandTree(client)
 # Data paths
 # --- Data paths ---
 # Primary: shared DuckDB (populated by scraper + daily pipeline)
-DUCKDB_PATH = "/mnt/data/pipeline/tpcr_live.duckdb"
+DUCKDB_PATH = os.path.expanduser("~/hazeydata/pipeline") + "/tpcr_live.duckdb"
 
 # Fallback: direct file paths (used only if DuckDB is unavailable)
-WTI_PATH = "/mnt/data/pipeline/wti/wti.parquet"
-FORECASTS_PATH = "/mnt/data/pipeline/curves/forecast_parquet/all_forecasts.parquet"
-ENTITIES_PATH = "/mnt/data/pipeline/dimension_tables/dimentity.csv"
-STAGING_DIR = "/mnt/data/pipeline/staging/queue_times"
-FACT_PARQUET_DIR = "/mnt/data/pipeline/fact_tables/parquet"
+WTI_PATH = os.path.expanduser("~/hazeydata/pipeline") + "/wti/wti.parquet"
+FORECASTS_PATH = os.path.expanduser("~/hazeydata/pipeline") + "/curves/forecast_parquet/all_forecasts.parquet"
+ENTITIES_PATH = os.path.expanduser("~/hazeydata/pipeline") + "/dimension_tables/dimentity.csv"
+STAGING_DIR = os.path.expanduser("~/hazeydata/pipeline") + "/staging/queue_times"
+FACT_PARQUET_DIR = os.path.expanduser("~/hazeydata/pipeline") + "/fact_tables/parquet"
 
 # DuckDB availability flag
 _USE_DUCKDB = os.path.exists(DUCKDB_PATH)
@@ -432,7 +432,7 @@ def get_forecasts(park_code: str, target_date: date_type):
 def get_archived_forecasts(park_code: str, target_date: date_type):
     """Get forecast from archived forecast files (for today/past dates not in current forecast)."""
     try:
-        archive_dir = "/mnt/data/pipeline/accuracy/archive"
+        archive_dir = os.path.expanduser("~/hazeydata/pipeline") + "/accuracy/archive"
         if not os.path.exists(archive_dir):
             return pd.DataFrame()
         
@@ -738,7 +738,7 @@ async def on_ready():
     if LIVE_INFERENCE_AVAILABLE:
         try:
             print("🤖 Loading live inference model...")
-            live_inference_model = LiveInferenceModel(output_base=Path("/mnt/data/pipeline"))
+            live_inference_model = LiveInferenceModel(output_base=Path(os.path.expanduser("~/hazeydata/pipeline") ))
             print("✅ Live inference model loaded successfully")
         except Exception as e:
             print(f"⚠️ Failed to load live inference model: {e}")
@@ -1146,7 +1146,7 @@ async def best_day_command(interaction: discord.Interaction, park: str, timefram
         # 90+ day views: calendar image instead of text
         # Try pre-generated image first, fall back to live rendering
         try:
-            pre_gen_path = f"/mnt/data/pipeline/calendar_images/{park_code}_{timeframe}.png"
+            pre_gen_path = fos.path.expanduser("~/hazeydata/pipeline") + "/calendar_images/{park_code}_{timeframe}.png"
             if os.path.exists(pre_gen_path):
                 file = discord.File(pre_gen_path, filename="calendar.png")
                 print(f"📸 Serving pre-generated image: {pre_gen_path}")
@@ -1305,7 +1305,7 @@ def _wait_dot(minutes: int) -> str:
 
 
 # ── Park hours lookup for smarter "no data" messages ──
-DIMPARKHOURS_PATH = "/mnt/data/pipeline/dimension_tables/dimparkhours.csv"
+DIMPARKHOURS_PATH = os.path.expanduser("~/hazeydata/pipeline") + "/dimension_tables/dimparkhours.csv"
 
 # Park code → dimparkhours park code mapping
 _PARK_HOURS_CODE = {

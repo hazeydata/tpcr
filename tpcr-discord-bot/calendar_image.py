@@ -1,3 +1,4 @@
+import os
 """
 Monthly calendar image generator for 90+ day /best-day views.
 Renders HTML→PNG via Playwright with Benedictus color palette.
@@ -910,7 +911,7 @@ if __name__ == "__main__":
         end = today + timedelta(days=days)
         
         try:
-            con = duckdb.connect("/mnt/data/pipeline/tpcr_live.duckdb", read_only=True)
+            con = duckdb.connect(os.path.expanduser("~/hazeydata/pipeline") + "/tpcr_live.duckdb", read_only=True)
             rows = con.execute('''
                 SELECT park_date, wti 
                 FROM wti 
@@ -924,7 +925,7 @@ if __name__ == "__main__":
         except Exception:
             # Fallback to parquet
             con = duckdb.connect()
-            con.execute("CREATE VIEW wti AS SELECT * FROM read_parquet('/mnt/data/pipeline/wti/wti.parquet')")
+            con.execute("CREATE VIEW wti AS SELECT * FROM read_parquet('/Users/fredhazelton/hazeydata/pipeline/wti/wti.parquet')")
             rows = con.execute('''
                 SELECT park_date, wti 
                 FROM wti 

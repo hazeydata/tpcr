@@ -1,3 +1,4 @@
+import os
 """
 Ask Agent — AI-powered natural language query engine for TPCR Discord bot.
 
@@ -13,7 +14,7 @@ from datetime import datetime, date
 from pathlib import Path
 from typing import Optional
 
-DUCKDB_PATH = "/mnt/data/pipeline/tpcr_live.duckdb"
+DUCKDB_PATH = os.path.expanduser("~/hazeydata/pipeline") + "/tpcr_live.duckdb"
 
 # Failure patterns that trigger immediate self-healing
 _FAILURE_PATTERNS = [
@@ -79,7 +80,7 @@ def _trigger_self_heal(question: str, user_id: str, username: str, answer: str):
 SCHEMA_CONTEXT = """You are a theme park data analyst for the Theme Park Crowd Report (TPCR).
 You answer questions about theme park crowds, wait times, and visit planning using real forecast data.
 
-## Database: DuckDB at /mnt/data/pipeline/tpcr_live.duckdb (READ-ONLY)
+## Database: DuckDB at /Users/fredhazelton/hazeydata/pipeline/tpcr_live.duckdb (READ-ONLY)
 
 ### Tables
 
@@ -121,9 +122,9 @@ CRITICAL: If a query against a DuckDB table returns no results, ALWAYS retry usi
 corresponding parquet file with read_parquet(). The parquet files often contain a fuller
 date range (365+ days of forecasts) than the DuckDB tables.
 
-- WTI: `SELECT * FROM read_parquet('/mnt/data/pipeline/wti/wti.parquet') WHERE park_code = 'EP' AND park_date = '2026-10-01'`
-- Forecasts: `SELECT * FROM read_parquet('/mnt/data/pipeline/curves/forecast_parquet/all_forecasts.parquet') WHERE entity_code LIKE 'EP%' AND park_date = '2026-10-01'`
-- Fact tables (historical waits): `SELECT * FROM read_parquet('/mnt/data/pipeline/fact_tables/parquet/*.parquet') WHERE entity_code = 'MK01'`
+- WTI: `SELECT * FROM read_parquet('/Users/fredhazelton/hazeydata/pipeline/wti/wti.parquet') WHERE park_code = 'EP' AND park_date = '2026-10-01'`
+- Forecasts: `SELECT * FROM read_parquet('/Users/fredhazelton/hazeydata/pipeline/curves/forecast_parquet/all_forecasts.parquet') WHERE entity_code LIKE 'EP%' AND park_date = '2026-10-01'`
+- Fact tables (historical waits): `SELECT * FROM read_parquet('/Users/fredhazelton/hazeydata/pipeline/fact_tables/parquet/*.parquet') WHERE entity_code = 'MK01'`
 
 Always try the DuckDB table first (faster), then fall back to parquet if no results.
 
@@ -133,9 +134,9 @@ CRITICAL: If a query against a DuckDB table returns no results, ALWAYS retry usi
 corresponding parquet file with read_parquet(). The parquet files often contain a fuller
 date range (365+ days of forecasts) than the DuckDB tables.
 
-- WTI: `SELECT * FROM read_parquet('/mnt/data/pipeline/wti/wti.parquet') WHERE park_code = 'EP' AND park_date = '2026-10-01'`
-- Forecasts: `SELECT * FROM read_parquet('/mnt/data/pipeline/curves/forecast_parquet/all_forecasts.parquet') WHERE entity_code LIKE 'EP%' AND park_date = '2026-10-01'`
-- Fact tables (historical waits): `SELECT * FROM read_parquet('/mnt/data/pipeline/fact_tables/parquet/*.parquet') WHERE entity_code = 'MK01'`
+- WTI: `SELECT * FROM read_parquet('/Users/fredhazelton/hazeydata/pipeline/wti/wti.parquet') WHERE park_code = 'EP' AND park_date = '2026-10-01'`
+- Forecasts: `SELECT * FROM read_parquet('/Users/fredhazelton/hazeydata/pipeline/curves/forecast_parquet/all_forecasts.parquet') WHERE entity_code LIKE 'EP%' AND park_date = '2026-10-01'`
+- Fact tables (historical waits): `SELECT * FROM read_parquet('/Users/fredhazelton/hazeydata/pipeline/fact_tables/parquet/*.parquet') WHERE entity_code = 'MK01'`
 
 Always try the DuckDB table first (faster), then fall back to parquet if no results.
 

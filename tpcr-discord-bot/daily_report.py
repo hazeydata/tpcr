@@ -14,8 +14,8 @@ load_dotenv(os.path.expanduser("~/.env"))
 
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 CROWD_REPORTS_CHANNEL = "1478240066382860298"  # #crowd-reports (recreated Mar 2)
-DUCKDB_PATH = "/mnt/data/pipeline/tpcr_live.duckdb"
-WTI_PATH = "/mnt/data/pipeline/wti/wti.parquet"
+DUCKDB_PATH = os.path.expanduser("~/hazeydata/pipeline") + "/tpcr_live.duckdb"
+WTI_PATH = os.path.expanduser("~/hazeydata/pipeline") + "/wti/wti.parquet"
 _USE_DUCKDB = os.path.exists(DUCKDB_PATH)
 
 HEADERS = {
@@ -30,7 +30,7 @@ import json as _json
 from datetime import datetime as _dt, timezone as _tz
 from pathlib import Path as _Path
 
-PIPELINE_STATE = _Path("/mnt/data/pipeline/state/pipeline_state.json")
+PIPELINE_STATE = _Path(os.path.expanduser("~/hazeydata/pipeline") + "/state/pipeline_state.json")
 GATE_LOG = _Path("/home/wilma/theme-park-crowd-report/logs/daily_report_gate.log")
 
 WDW_PARKS = ["MK", "EP", "HS", "AK"]  # Must all have WTI scores
