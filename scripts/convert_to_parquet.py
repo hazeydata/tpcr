@@ -82,7 +82,10 @@ def main():
                         help="Input directory with month subdirectories")
     parser.add_argument("--output", default="/home/wilma/hazeydata/pipeline/fact_tables/parquet",
                         help="Output directory for Parquet files")
-    parser.add_argument("--workers", type=int, default=8, help="Number of parallel workers")
+    parser.add_argument("--workers", type=int, default=2, help="Number of parallel workers")
+    parser.add_argument("--recent-months", type=int, default=2,
+                        help="Only consider the N most recent month dirs (0 = all; full rebuild)")
+    parser.add_argument("--force", action="store_true", help="Reconvert even if parquet is up to date")
     
     args = parser.parse_args()
     logger = setup_logging()
@@ -92,7 +95,20 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Get all month directories
+    if not input_dir.is_dir():
+        logger.warning(f"Input dir {input_dir} missing; nothing to convert")
+        return
     month_dirs = sorted([d for d in input_dir.iterdir() if d.is_dir()])
+    if args.recent_months > 0:
+        month_dirs = month_dirs[-args.recent_months:]
+    if not args.force:
+        def stale(d):
+            out = output_dir / f"{d.name}.parquet"
+            if not out.exists():
+                return True
+            newest = max((f.stat().st_mtime for f in d.glob("*.csv")), default=0)
+            return newest > out.stat().st_mtime
+        month_dirs = [d for d in month_dirs if stale(d)]
     logger.info(f"Found {len(month_dirs)} month directories to convert")
     
     # Convert in parallel
@@ -125,7 +141,9 @@ def main():
     logger.info(f"Output: {output_dir}")
     
     # Show size comparison
-    csv_size = sum(f.stat().st_size for f in input_dir.rglob("*.csv"))
+    if not completed:
+        return
+    csv_size = sum(f.stat().st_size for d in month_dirs for f in d.glob("*.csv")) or 1
     parquet_size = sum(f.stat().st_size for f in output_dir.glob("*.parquet"))
     
     logger.info(f"\nSize comparison:")

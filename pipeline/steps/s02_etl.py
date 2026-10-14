@@ -89,8 +89,11 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
     if convert_script.exists():
         with log.timed("CSV→Parquet"):
             result = subprocess.run(
-                [sys.executable, str(convert_script)],
-                capture_output=True, text=True, timeout=300,
+                [sys.executable, str(convert_script),
+                 "--input", str(cfg.fact_tables_dir / "clean"),
+                 "--output", str(cfg.parquet_dir),
+                 "--recent-months", "2", "--workers", "2"],
+                capture_output=True, text=True, timeout=1800,
             )
             if result.returncode != 0:
                 raise RuntimeError(f"CSV→Parquet failed: {result.stderr[:500]}")
