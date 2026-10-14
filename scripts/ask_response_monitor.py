@@ -42,7 +42,7 @@ DUCKDB_PATH = "/mnt/data/pipeline/tpcr_live.duckdb"
 ALL_FORECASTS = "/mnt/data/pipeline/curves/forecast_parquet/all_forecasts.parquet"
 
 # Discord
-TPCR_BOT_COMMANDS_CHANNEL = "1478240248361128079"
+TPCR_BOT_COMMANDS_CHANNEL = os.getenv("TPCR_BOT_COMMANDS_CHANNEL", "1478240248361128079")
 DISCORD_API_BASE = "https://discord.com/api/v10"
 
 # Failure patterns — if a response contains any of these, it's flagged

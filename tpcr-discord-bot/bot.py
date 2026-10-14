@@ -1571,7 +1571,7 @@ try:
 except Exception as e:
     print(f"⚠️ Could not load Anthropic API key: {e}")
 
-BOT_COMMANDS_CHANNEL = 1478240248361128079  # #bot-commands (recreated Mar 2)
+BOT_COMMANDS_CHANNEL = int(os.getenv("TPCR_BOT_COMMANDS_CHANNEL", "1478240248361128079"))  # #bot-commands
 
 
 @tree.command(name="ask", description="Ask anything about theme park crowds, wait times, and visit planning")

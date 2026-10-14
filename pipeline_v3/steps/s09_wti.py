@@ -43,6 +43,9 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
 
     # ── Forecast WTI ──
     forecast_file = cfg.forecast_dir / "all_forecasts.parquet"
+    if not forecast_file.exists() and cfg.shadow:
+        prod_forecast = getattr(cfg, "_production_forecast_dir", None) or (cfg.output_base / "curves" / "forecast_parquet")
+        forecast_file = prod_forecast / "all_forecasts.parquet"
     if forecast_file.exists():
         with log.timed("forecast WTI"):
             results.append(_compute_forecast_wti(cfg, log, pc_sql, forecast_file))
