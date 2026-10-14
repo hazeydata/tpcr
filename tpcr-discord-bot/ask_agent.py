@@ -219,8 +219,8 @@ NOTE: "Universal Orlando" or "Universal Orlando Resort" means ALL THREE parks: U
 """
 
 # Usage tracking (simple JSON file)
-USAGE_FILE = Path("/home/wilma/theme-park-crowd-report/tpcr-discord-bot/ask_usage.json")
-QUESTION_LOG = Path("/home/wilma/theme-park-crowd-report/tpcr-discord-bot/ask_questions.jsonl")
+USAGE_FILE = Path(__file__).resolve().parent / "ask_usage.json"
+QUESTION_LOG = Path(__file__).resolve().parent / "ask_questions.jsonl"
 
 
 def _load_usage() -> dict:
@@ -249,7 +249,7 @@ def track_usage(user_id: str) -> tuple[int, int]:
     return count, -1  # No limit for now (free launch)
 
 
-def log_question(user_id: str, username: str, question: str, answer: str, duration_ms: int):
+def log_question(user_id: str, username: str, question: str, answer: str, duration_ms: int, model: str = "claude-sonnet-4-6"):
     """Append question + answer to JSONL log for analysis."""
     entry = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
@@ -258,6 +258,7 @@ def log_question(user_id: str, username: str, question: str, answer: str, durati
         "question": question,
         "answer": answer[:2000],
         "duration_ms": duration_ms,
+        "model": model,
     }
     with open(QUESTION_LOG, "a") as f:
         f.write(json.dumps(entry) + "\n")
@@ -326,7 +327,7 @@ async def ask_agent(question: str, user_id: str, api_key: str, username: str = "
     import time as _time
     _start = _time.monotonic()
 
-    client = anthropic.AsyncAnthropic(api_key=api_key)
+    client = anthropic.AsyncAnthropic(api_key=api_key, timeout=60.0, max_retries=1)
 
     today = date.today()
     system_prompt = SCHEMA_CONTEXT.format(today=today.isoformat(), today_dow=today.strftime("%A"))
@@ -350,6 +351,83 @@ async def ask_agent(question: str, user_id: str, api_key: str, username: str = "
 
     messages = [{"role": "user", "content": question}]
 
+    model_used = "claude-sonnet-4-6"
+    try:
+        answer = await _claude_loop(client, system_prompt, tools, messages)
+    except (anthropic.APIError, anthropic.APIConnectionError, anthropic.APITimeoutError, asyncio.TimeoutError) as e:
+        print(f"⚠️ /ask: Anthropic failed ({type(e).__name__}: {str(e)[:160]}) — falling back to Qwen")
+        model_used = QWEN_LABEL
+        try:
+            answer = await asyncio.to_thread(_qwen_loop, system_prompt, question)
+        except Exception as qe:
+            print(f"❌ /ask: Qwen fallback failed too: {qe}")
+            answer = None
+
+    if answer is not None:
+        if len(answer) > 1900:
+            answer = answer[:1900] + "..."
+        duration_ms = int((_time.monotonic() - _start) * 1000)
+        print(f"✅ /ask answered by {model_used} in {duration_ms} ms")
+        await asyncio.to_thread(log_question, user_id, username, question, answer, duration_ms, model_used)
+        if _is_bad_response(answer):
+            _trigger_self_heal(question, user_id, username, answer)
+        return answer
+
+    fallback = "I wasn't able to fully answer that question. Try rephrasing or asking something more specific!"
+    duration_ms = int((_time.monotonic() - _start) * 1000)
+    await asyncio.to_thread(log_question, user_id, username, question, fallback, duration_ms, model_used)
+    _trigger_self_heal(question, user_id, username, fallback)
+    return fallback
+
+
+QWEN_URL = os.environ.get("TPCR_QWEN_URL", "http://127.0.0.1:8080/v1/chat/completions")
+QWEN_MODEL = os.environ.get("TPCR_QWEN_MODEL", "/Users/fredhazelton/models/Qwen3.8-27B-8bit")
+QWEN_LABEL = "qwen-local"
+_QWEN_TOOLS = [{"type": "function", "function": {
+    "name": "run_query",
+    "description": "Execute a read-only SQL query against the TPCR DuckDB database. Use SELECT statements only. Returns results as formatted text.",
+    "parameters": {"type": "object", "properties": {"sql": {"type": "string", "description": "SQL SELECT query to execute"}}, "required": ["sql"]}}}]
+
+
+def _qwen_loop(system_prompt: str, question: str) -> Optional[str]:
+    """Same prompt + run_query tool flow as Claude, against local mlx_lm (OpenAI-compatible). Blocking; call via to_thread."""
+    import re
+    import requests
+    msgs = [{"role": "system", "content": system_prompt}, {"role": "user", "content": question}]
+    for _ in range(5):
+        r = requests.post(QWEN_URL, json={
+            "model": QWEN_MODEL, "messages": msgs, "tools": _QWEN_TOOLS,
+            "max_tokens": 700, "temperature": 0.2,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }, timeout=300)
+        r.raise_for_status()
+        m = r.json()["choices"][0]["message"]
+        content = m.get("content") or ""
+        calls = m.get("tool_calls") or []
+        if not calls:
+            for blk in re.findall(r"<tool_call>(.*?)</tool_call>", content, re.S):
+                try:
+                    j = json.loads(blk)
+                    calls.append({"id": f"c{len(msgs)}", "function": {"name": j["name"], "arguments": json.dumps(j["arguments"])}})
+                except Exception:
+                    pass
+        if not calls:
+            text = re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip()
+            return text or None
+        msgs.append({"role": "assistant", "content": content, "tool_calls": [
+            {"id": c.get("id", "x"), "type": "function", "function": c["function"]} for c in calls]})
+        for c in calls:
+            try:
+                sql = json.loads(c["function"]["arguments"]).get("sql", "")
+            except Exception:
+                sql = ""
+            su = sql.strip().upper()
+            result = run_duckdb_query(sql) if (su.startswith("SELECT") or su.startswith("WITH")) else "Error: Only SELECT queries are allowed."
+            msgs.append({"role": "tool", "tool_call_id": c.get("id", "x"), "content": result})
+    return None
+
+
+async def _claude_loop(client, system_prompt, tools, messages) -> Optional[str]:
     # Allow up to 5 tool-use rounds
     for _ in range(5):
         response = await client.messages.create(
@@ -388,24 +466,5 @@ async def ask_agent(question: str, user_id: str, api_key: str, username: str = "
         else:
             # Final text response
             text_parts = [b.text for b in response.content if hasattr(b, "text")]
-            answer = "\n".join(text_parts)
-
-            # Trim if too long for Discord
-            if len(answer) > 1900:
-                answer = answer[:1900] + "..."
-
-            duration_ms = int((_time.monotonic() - _start) * 1000)
-            await asyncio.to_thread(log_question, user_id, username, question, answer, duration_ms)
-
-            if _is_bad_response(answer):
-                _trigger_self_heal(question, user_id, username, answer)
-
-            return answer
-
-    fallback = "I wasn't able to fully answer that question. Try rephrasing or asking something more specific!"
-    duration_ms = int((_time.monotonic() - _start) * 1000)
-    await asyncio.to_thread(log_question, user_id, username, question, fallback, duration_ms)
-
-    _trigger_self_heal(question, user_id, username, fallback)
-
-    return fallback
+            return "\n".join(text_parts)
+    return None

@@ -31,7 +31,7 @@ from datetime import datetime as _dt, timezone as _tz
 from pathlib import Path as _Path
 
 PIPELINE_STATE = _Path(os.path.expanduser("~/hazeydata/pipeline") + "/state/pipeline_state.json")
-GATE_LOG = _Path("/home/wilma/theme-park-crowd-report/logs/daily_report_gate.log")
+GATE_LOG = _Path(__file__).resolve().parent.parent / "logs" / "daily_report_gate.log"
 
 WDW_PARKS = ["MK", "EP", "HS", "AK"]  # Must all have WTI scores
 
@@ -234,7 +234,7 @@ def main():
         desc_parts.append(picks_section)
 
     # --- Accuracy & Bias Correction section ---
-    accuracy_path = "/home/wilma/hazeydata/pipeline/accuracy/accuracy_summary.json"
+    accuracy_path = os.path.expanduser("~/hazeydata/pipeline/accuracy/accuracy_summary.json")
     try:
         import json
         with open(accuracy_path) as f:

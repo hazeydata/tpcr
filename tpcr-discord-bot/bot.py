@@ -1630,7 +1630,7 @@ async def about_command(interaction: discord.Interaction):
 # ── /ask — AI-powered natural language Q&A ──────────────────────────
 import json as _json
 
-FEEDBACK_LOG = Path("/home/wilma/theme-park-crowd-report/tpcr-discord-bot/ask_feedback.jsonl")
+FEEDBACK_LOG = Path(__file__).resolve().parent / "ask_feedback.jsonl"
 
 
 class AskFeedbackView(discord.ui.View):
@@ -1704,18 +1704,14 @@ BOT_COMMANDS_CHANNEL = 1478240248361128079  # #bot-commands (recreated Mar 2)
 async def ask_command(interaction: discord.Interaction, question: str):
     print(f"📥 /ask called: question='{question}' by {interaction.user}")
 
-    if not ANTHROPIC_API_KEY:
-        await interaction.response.send_message(
-            "❌ AI agent is not configured. Contact the admin.", ephemeral=True
-        )
-        return
+    # No Anthropic key -> ask_agent gets an auth error and falls back to local Qwen.
 
     # Defer — this will take a few seconds
     if not await safe_defer(interaction):
         return
 
     try:
-        answer = await ask_agent(question, str(interaction.user.id), ANTHROPIC_API_KEY, username=str(interaction.user))
+        answer = await ask_agent(question, str(interaction.user.id), ANTHROPIC_API_KEY or "missing-key", username=str(interaction.user))
 
         # Build embed
         embed = discord.Embed(
