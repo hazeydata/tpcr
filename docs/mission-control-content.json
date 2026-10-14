@@ -37,8 +37,8 @@
         {
             "emoji": "\ud83d\udd04",
             "event": "Conversion model retrain",
-            "date": "Jun 8",
-            "days_out": 3,
+            "date": "Oct 5",
+            "days_out": 2,
             "urgency": ""
         }
     ],
@@ -75,16 +75,16 @@
         }
     },
     "accuracy": {
-        "entity_mae": "8.3 min",
-        "entity_bias": "+0.3 min",
-        "overall_rmse": "9.2",
-        "wti_mae": "6.3",
-        "wti_bias": "-0.7",
-        "days_evaluated": 114
+        "entity_mae": "8.2 min",
+        "entity_bias": "+0.9 min",
+        "overall_rmse": "9.0",
+        "wti_mae": "6.0",
+        "wti_bias": "0.7",
+        "days_evaluated": 234
     },
     "ask_analytics": {
-        "total_questions": 113,
-        "unique_users": 22,
+        "total_questions": 187,
+        "unique_users": 26,
         "thumbs_up": 8,
         "thumbs_down": 0,
         "avg_response_ms": 0,
@@ -94,17 +94,17 @@
         "services": [
             {
                 "name": "tpcr-discord-bot",
-                "status": "unknown",
+                "status": "active",
                 "detail": "Discord bot"
             },
             {
                 "name": "chat-server",
-                "status": "unknown",
+                "status": "inactive",
                 "detail": "Stream overlay"
             },
             {
                 "name": "twitch-chat",
-                "status": "unknown",
+                "status": "inactive",
                 "detail": "Stream overlay"
             },
             {
@@ -113,12 +113,12 @@
                 "detail": "Live wait times"
             }
         ],
-        "disk_main_pct": 5,
-        "disk_data_pct": 31,
+        "disk_main_pct": 61,
+        "disk_data_pct": 58,
         "db_entities": 1713,
-        "db_forecasts": 42585503,
-        "db_live_waits": 131096459,
+        "db_forecasts": 34766477,
+        "db_live_waits": 141360237,
         "db_wti": 59255
     },
-    "last_updated": "2026-06-05T07:30:42.302238"
+    "last_updated": "2026-10-03T17:09:37.385353"
 }

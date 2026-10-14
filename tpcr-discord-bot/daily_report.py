@@ -6,7 +6,8 @@ Run via cron at 7:00 AM EST.
 import os
 import requests
 import duckdb
-from datetime import date
+from datetime import date, datetime
+import argparse
 from dotenv import load_dotenv
 
 load_dotenv(os.path.expanduser("~/.env"))
@@ -135,23 +136,36 @@ def get_wti(park_code: str, target_date: date) -> float:
     wti_code = WTI_CODE_MAP.get(park_code, park_code)
     try:
         if _USE_DUCKDB:
-            con = duckdb.connect(DUCKDB_PATH, read_only=True)
-            r = con.execute("SELECT wti FROM wti WHERE park_code = ? AND park_date = ? LIMIT 1",
-                           [wti_code, target_date]).fetchone()
-            con.close()
-            return float(r[0]) if r else None
-        r = duckdb.sql(f"""
+            try:
+                con = duckdb.connect(DUCKDB_PATH, read_only=True)
+                r = con.execute(
+                    "SELECT wti FROM wti WHERE park_code = ? AND park_date = ? LIMIT 1",
+                    [wti_code, target_date],
+                ).fetchone()
+                con.close()
+                if r is not None:
+                    return float(r[0])
+            except Exception:
+                pass
+        r = duckdb.sql(
+            f"""
             SELECT wti FROM read_parquet('{WTI_PATH}')
             WHERE park_code = '{wti_code}' AND park_date = '{target_date}'
             LIMIT 1
-        """).fetchone()
+            """
+        ).fetchone()
         return float(r[0]) if r else None
-    except:
+    except Exception:
         return None
 
-
 def main():
-    today = date.today()
+    parser = argparse.ArgumentParser(description="TPCR daily crowd report")
+    parser.add_argument("--date", help="YYYY-MM-DD (default: today)")
+    args = parser.parse_args()
+    if args.date:
+        today = datetime.strptime(args.date, "%Y-%m-%d").date()
+    else:
+        today = date.today()
     date_display = today.strftime("%A, %B %d, %Y")
 
     park_groups = [

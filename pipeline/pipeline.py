@@ -41,25 +41,85 @@ try:
 except ImportError:
     _HAS_PIPELINE_STATUS = False
 
-# Map step names to legacy step names used by pipeline_status.json
+# Map v4 step names → legacy step names for pipeline_status.json
 _LEGACY_STEP_MAP = {
-    "s01_sync": None,        # no legacy equivalent
+    "s01_sync": "s3_sync",
     "s02_etl": "etl",
     "s03_dimensions": "dimensions",
     "s04_aggregates": "aggregates",
-    "s05_conversion": "report",
-    "s06_synthetic": None,   # no legacy equivalent
+    "s05_conversion": "conversion",
+    "s06_synthetic": "synthetic",
     "s07_training": "training",
     "s08_forecast": "forecast",
     "s09_wti": "wti",
-    "s10_accuracy": None,    # no legacy equivalent
-    "s11_deploy": None,      # no legacy equivalent
-    "s12_validate": None,    # no legacy equivalent
-    "s14_content": None,     # no legacy equivalent
+    "s10_accuracy": "accuracy",
+    "s11_deploy": "deploy",
 }
 
 
-def main():
+def _write_pipeline_local_alert(
+    *,
+    cfg,
+    run_date: str,
+    metrics: PipelineMetrics,
+    metrics_path: Path,
+    failed: bool,
+) -> None:
+    """D1 #7: status != success → local file alert (no Discord dependency).
+
+    Always refreshes PIPELINE_STATUS.md. On failure, also writes
+    PIPELINE_ALERT_<date>.md and latest PIPELINE_ALERT.md pointer.
+    On success, clears the latest pointer so operators aren't left with a stale red flag.
+    """
+    logs = Path(cfg.logs_dir)
+    logs.mkdir(parents=True, exist_ok=True)
+
+    failed_steps = [
+        f"- **{name}**: {s.error or s.status}"
+        for name, s in metrics.steps.items()
+        if s.status == "failed"
+    ]
+    deploy_extra = ""
+    s11 = metrics.steps.get("s11_deploy")
+    if s11 and isinstance(s11.extra, dict) and s11.extra.get("deploy_assert"):
+        deploy_extra = "\n### deploy_assert\n```json\n" + json.dumps(
+            s11.extra["deploy_assert"], indent=2, default=str
+        ) + "\n```\n"
+
+    status_body = (
+        f"# Pipeline status — {run_date}\n\n"
+        f"- **status:** `{'failed' if failed else 'done'}`\n"
+        f"- **run_start:** {metrics.run_start}\n"
+        f"- **total_duration_sec:** {metrics.total_duration_sec}\n"
+        f"- **metrics:** `{metrics_path}`\n"
+        f"- **shadow:** {metrics.shadow_mode}\n\n"
+    )
+    if failed_steps:
+        status_body += "## Failed steps\n" + "\n".join(failed_steps) + "\n"
+    status_body += deploy_extra
+    status_body += (
+        "\n_Local alert only — Discord not required. "
+        "Operators: Michael / Hermes morning brief._\n"
+    )
+    (logs / "PIPELINE_STATUS.md").write_text(status_body)
+
+    latest = logs / "PIPELINE_ALERT.md"
+    if failed:
+        alert = logs / f"PIPELINE_ALERT_{run_date}.md"
+        alert.write_text(
+            f"# PIPELINE ALERT — {run_date}\n\n"
+            f"**status != success**\n\n"
+            + status_body
+        )
+        latest.write_text(alert.read_text())
+    elif latest.exists():
+        # success clears sticky latest alert
+        latest.write_text(
+            f"# PIPELINE_ALERT\n\n_cleared {run_date} — last full run status=done_\n"
+        )
+
+
+def main() -> int:
     parser = argparse.ArgumentParser(description="HazeyData Pipeline")
     parser.add_argument("--output-base", type=Path, default=None)
     parser.add_argument("--shadow", action="store_true", help="Shadow mode: compare, don't deploy")
@@ -138,8 +198,18 @@ def main():
                 continue
 
             result = module.run(cfg, step_log)
-            rows_out = result.get("rows", 0) if isinstance(result, dict) else 0
-            metrics.end_step(step_name, rows_out=rows_out)
+            if isinstance(result, dict):
+                rows_out = int(result.get("rows", 0) or 0)
+                # Fold step extras (e.g. s11 deploy_assert) into metrics JSON
+                extra = {
+                    k: v
+                    for k, v in result.items()
+                    if k not in ("rows",)
+                }
+            else:
+                rows_out = 0
+                extra = {}
+            metrics.end_step(step_name, rows_out=rows_out, **extra)
 
             # Update legacy pipeline_status.json
             if _HAS_PIPELINE_STATUS and not cfg.shadow:
@@ -188,6 +258,18 @@ def main():
         metrics_path = cfg.logs_dir / f"pipeline_metrics_{run_date}.json"
     metrics.save(metrics_path)
     log.info(f"Metrics saved: {metrics_path}")
+
+    # D1 #7 — local alert file when status != success (no Discord dependency)
+    try:
+        _write_pipeline_local_alert(
+            cfg=cfg,
+            run_date=run_date,
+            metrics=metrics,
+            metrics_path=metrics_path,
+            failed=failed,
+        )
+    except Exception as e:
+        log.warning(f"Could not write local pipeline alert: {e}")
 
     # Save all pipeline-level events
     log.save_events(log_events_path(cfg, run_date))

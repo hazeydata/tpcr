@@ -44,7 +44,14 @@ from forecast_image import generate_forecast_image
 logger = logging.getLogger("tpcr-bot")
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)-8s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 from calendar_image import generate_calendar_image
-from ask_agent import ask_agent
+import os
+from ask_agent import ask_agent as ask_agent_anthropic
+from ask_agent_ollama import ask_agent_ollama
+
+def ask_agent(*args, **kwargs):
+    if os.getenv("USE_OLLAMA") == "1":
+        return ask_agent_ollama(*args, **kwargs)
+    return ask_agent_anthropic(*args, **kwargs)
 
 # Add theme-park-crowd-report/src to sys.path for live inference model
 theme_park_src = os.path.expanduser("~/theme-park-crowd-report/src")

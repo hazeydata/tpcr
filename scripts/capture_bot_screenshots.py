@@ -651,7 +651,12 @@ if __name__ == "__main__":
         result = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=site_repo)
         if result.returncode != 0:
             subprocess.run(["git", "commit", "-m", "Update bot screenshots with live data"], cwd=site_repo, check=True)
-            subprocess.run(["git", "push"], cwd=site_repo, check=True)
+            # Prefer token helper (W6) — falls back to plain push if helper missing
+            helper = Path.home() / "bin" / "git-push-with-token.sh"
+            if helper.is_file():
+                subprocess.run(["bash", str(helper), str(site_repo), "origin", "HEAD"], check=True)
+            else:
+                subprocess.run(["git", "push"], cwd=site_repo, check=True)
             print("📤 Pushed updated screenshots to hazeydata.ai")
         else:
             print("📌 No screenshot changes to push")

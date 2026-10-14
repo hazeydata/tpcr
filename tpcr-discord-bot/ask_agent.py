@@ -1,10 +1,11 @@
 """
 Ask Agent — AI-powered natural language query engine for TPCR Discord bot.
 
-Uses Anthropic Claude (Haiku) with DuckDB tool access to answer
+Uses Anthropic Claude with DuckDB tool access to answer
 theme park wait time questions from Discord users.
 """
 
+import asyncio
 import json
 import duckdb
 import anthropic
@@ -113,6 +114,30 @@ You answer questions about theme park crowds, wait times, and visit planning usi
 - wait_time_type: VARCHAR
 - wait_time_minutes: INTEGER
 - park_date: DATE
+
+### Parquet Fallback (use when DuckDB tables return no data)
+
+CRITICAL: If a query against a DuckDB table returns no results, ALWAYS retry using the
+corresponding parquet file with read_parquet(). The parquet files often contain a fuller
+date range (365+ days of forecasts) than the DuckDB tables.
+
+- WTI: `SELECT * FROM read_parquet('/mnt/data/pipeline/wti/wti.parquet') WHERE park_code = 'EP' AND park_date = '2026-10-01'`
+- Forecasts: `SELECT * FROM read_parquet('/mnt/data/pipeline/curves/forecast_parquet/all_forecasts.parquet') WHERE entity_code LIKE 'EP%' AND park_date = '2026-10-01'`
+- Fact tables (historical waits): `SELECT * FROM read_parquet('/mnt/data/pipeline/fact_tables/parquet/*.parquet') WHERE entity_code = 'MK01'`
+
+Always try the DuckDB table first (faster), then fall back to parquet if no results.
+
+### Parquet Fallback (use when DuckDB tables return no data)
+
+CRITICAL: If a query against a DuckDB table returns no results, ALWAYS retry using the
+corresponding parquet file with read_parquet(). The parquet files often contain a fuller
+date range (365+ days of forecasts) than the DuckDB tables.
+
+- WTI: `SELECT * FROM read_parquet('/mnt/data/pipeline/wti/wti.parquet') WHERE park_code = 'EP' AND park_date = '2026-10-01'`
+- Forecasts: `SELECT * FROM read_parquet('/mnt/data/pipeline/curves/forecast_parquet/all_forecasts.parquet') WHERE entity_code LIKE 'EP%' AND park_date = '2026-10-01'`
+- Fact tables (historical waits): `SELECT * FROM read_parquet('/mnt/data/pipeline/fact_tables/parquet/*.parquet') WHERE entity_code = 'MK01'`
+
+Always try the DuckDB table first (faster), then fall back to parquet if no results.
 
 ## Park Code Reference
 - MK = Magic Kingdom (Walt Disney World)
@@ -290,15 +315,17 @@ def run_duckdb_query(sql: str, max_retries: int = 8) -> str:
 async def ask_agent(question: str, user_id: str, api_key: str, username: str = "unknown") -> str:
     """
     Process a natural language question about theme park data.
-    Uses Claude Haiku with DuckDB tool access.
+    Uses Claude with async DuckDB tool access.
+
+    All blocking work (Anthropic API, DuckDB queries, file I/O) is run
+    off the event loop so the Discord heartbeat is never starved.
     """
-    # Track usage
-    used, limit = track_usage(user_id)
+    await asyncio.to_thread(track_usage, user_id)
 
     import time as _time
     _start = _time.monotonic()
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = anthropic.AsyncAnthropic(api_key=api_key)
 
     today = date.today()
     system_prompt = SCHEMA_CONTEXT.format(today=today.isoformat(), today_dow=today.strftime("%A"))
@@ -324,8 +351,8 @@ async def ask_agent(question: str, user_id: str, api_key: str, username: str = "
 
     # Allow up to 5 tool-use rounds
     for _ in range(5):
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
+        response = await client.messages.create(
+            model="claude-sonnet-4-6",
             max_tokens=1500,
             system=system_prompt,
             tools=tools,
@@ -347,7 +374,7 @@ async def ask_agent(question: str, user_id: str, api_key: str, username: str = "
                     if not sql_upper.startswith("SELECT") and not sql_upper.startswith("WITH"):
                         result = "Error: Only SELECT queries are allowed."
                     else:
-                        result = run_duckdb_query(sql)
+                        result = await asyncio.to_thread(run_duckdb_query, sql)
 
                     tool_results.append({
                         "type": "tool_result",
@@ -367,9 +394,8 @@ async def ask_agent(question: str, user_id: str, api_key: str, username: str = "
                 answer = answer[:1900] + "..."
 
             duration_ms = int((_time.monotonic() - _start) * 1000)
-            log_question(user_id, username, question, answer, duration_ms)
+            await asyncio.to_thread(log_question, user_id, username, question, answer, duration_ms)
 
-            # Immediate self-heal on bad response
             if _is_bad_response(answer):
                 _trigger_self_heal(question, user_id, username, answer)
 
@@ -377,9 +403,8 @@ async def ask_agent(question: str, user_id: str, api_key: str, username: str = "
 
     fallback = "I wasn't able to fully answer that question. Try rephrasing or asking something more specific!"
     duration_ms = int((_time.monotonic() - _start) * 1000)
-    log_question(user_id, username, question, fallback, duration_ms)
+    await asyncio.to_thread(log_question, user_id, username, question, fallback, duration_ms)
 
-    # Fallback always triggers self-heal
     _trigger_self_heal(question, user_id, username, fallback)
 
     return fallback
