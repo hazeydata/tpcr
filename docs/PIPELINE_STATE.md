@@ -206,7 +206,53 @@ DASH_USER=admin DASH_PASSWORD=your-secret python dashboard/app.py
 
 ---
 
-## 7. Changes from default
+## 7. Known outages / disabled jobs
+
+### 7.1 Discord daily crowd report — DISABLED (Sept 9, 2026)
+
+| Field | Value |
+|-------|-------|
+| **Script** | `tpcr-discord-bot/daily_report.py` |
+| **What it does** | One-shot cron job: reads WTI from DuckDB, runs quality gate, posts embed to `#crowd-reports` (`1478240066382860298`) via Discord REST API |
+| **Last successful post** | **2026-09-07** |
+| **Sept 8 failure** | Quality gate correctly rejected: "Missing WTI for MK" — post skipped (working as designed) |
+| **Cron status** | **Commented out** on wilma-server crontab on 2026-09-09 by Paul — `# DISABLED 2026-09-09 by Paul — Fred: kill Discord nightly reviews/reports` |
+| **Original cron line** | `15 7 * * * ... daily_report.py` (7:15 AM ET) |
+| **Log** | `/tmp/daily_report.log` on wilma-server (mtime Sept 8 07:15) |
+| **Not the live bot** | This is separate from `bot.py` (see 7.2 below). `daily_report.py` is a cron one-shot; `bot.py` is a long-running systemd service handling slash commands. |
+
+**Fred decisions required:**
+1. Re-enable the cron line on wilma-server? (The quality gate will skip posts if pipeline data is stale or missing.)
+2. Investigate the Sept 8 "Missing WTI for MK" — was it a one-day pipeline gap, or is WTI generation still broken?
+3. Post a gap notice to `#announcements` per Domain 4 of `docs/TPCR_CUSTOMER_SERVICE_DESIGN_SPEC.md`?
+
+### 7.2 Live Discord bot (tpcr-discord-bot.service) — CRASH-LOOPING
+
+| Field | Value |
+|-------|-------|
+| **Script** | `tpcr-discord-bot/bot.py` |
+| **What it does** | Long-running systemd service: handles `/today`, `/crowd`, `/best-day`, `/now`, `/ask`, `/health`, `/about` slash commands |
+| **Service** | `tpcr-discord-bot` (systemd user service on wilma-server) |
+| **Error** | `discord.errors.LoginFailure: Improper token has been passed.` (HTTP 401 Unauthorized) |
+| **Restart count** | 55+ (crash-loop) |
+| **Token source** | `DISCORD_BOT_TOKEN` from `~/.env` on wilma-server |
+
+**Fred decisions required:**
+1. Regenerate the Discord bot token in the [Discord Developer Portal](https://discord.com/developers/applications) and update `~/.env` on wilma-server?
+2. Restart the service after token fix: `systemctl --user restart tpcr-discord-bot`
+
+### 7.3 Bot health-check cron — DISABLED
+
+| Field | Value |
+|-------|-------|
+| **Script** | `scripts/tpcr_bot_health_check.py` |
+| **Cron status** | Commented out on wilma-server |
+
+**Fred decision required:** Re-enable after bot token is fixed?
+
+---
+
+## 8. Changes from default (historical)
 
 - **Cron:** We use the **single daily master** at 6 AM (not the five separate jobs).
 - **Output base:** Set to **fred's Dropbox** path under home (not `/media/fred/...`).
