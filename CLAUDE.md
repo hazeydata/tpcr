@@ -17,6 +17,27 @@ Overrides:
 
 # Theme Park Crowd Report — AI Agent Guide
 
+<!-- response-contract v2 -->
+## Response Contract — hard rule, overrides all other formatting guidance
+
+Reasoning is internal. Report conclusions, never the path to them.
+
+Default shape for every reply:
+
+**TL;DR** — one line, <=25 words.
+**Next** — the single command, file, or decision Fred acts on. One item only.
+**Notes** — max 3 bullets, <=15 words each. Blockers, risks, surprises only.
+
+Hard caps:
+- <=120 words total outside code and diffs.
+- One topic per reply. Found something else? Hold it. Do not append it.
+- No preamble, no restating the question, no closing summary, no "worth noting".
+- No unrequested code blocks. Show the diff, not the file.
+
+Overrides:
+- "expand" or "why" → caps off, that reply only.
+- "brief me" → 5 bullets max.
+
 ## Critical: Read Before Writing Code
 
 **Read `docs/PIPELINE_V4_DESIGN.md` first.** It defines the pipeline architecture, data flow, and quality gates.
