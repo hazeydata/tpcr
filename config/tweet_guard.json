@@ -1,0 +1,4 @@
+{
+  "legacy_cron_patterns": ["wti_predicted_tweet\\.py", "wti_observed_tweet\\.py"],
+  "local_launchd_patterns": ["wti_predicted_tweet_local", "wti_observed_tweet_local"]
+}
