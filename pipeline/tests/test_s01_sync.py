@@ -164,16 +164,16 @@ class S01Sync(unittest.TestCase):
     def test_new_day_fetches_only_new_batch(self):
         out = self.tmp / "a"
         self.run_step(out)
-        key = "export/wait_times/wdw/2026-10-17/wdw00.csv"
-        (self.s3 / key).parent.mkdir(parents=True)
-        (self.s3 / key).write_text("entity,observed_at,wait\nwdw00,2026-10-17T08:00,12\n")
-        self.manifest[key] = "2026-10-17 05:00:00"
+        obj = "export/wait_times/wdw/2026-10-17/wdw00.csv"
+        (self.s3 / obj).parent.mkdir(parents=True)
+        (self.s3 / obj).write_text("entity,observed_at,wait\nwdw00,2026-10-17T08:00,12\n")
+        self.manifest[obj] = "2026-10-17 05:00:00"
         (self.s3 / "manifest.json").write_text(json.dumps(self.manifest))
         calls = self.tmp / "calls.log"
         rc, log = self.run_step(out, FAKE_AWS_LOG=str(calls))
         self.assertEqual(rc, 0, log)
         self.assertEqual(calls.read_text().splitlines().count("s3 sync"), 1)
-        self.assertTrue((out / "raw" / key).exists())
+        self.assertTrue((out / "raw" / obj).exists())
 
 
 class DownstreamGate(unittest.TestCase):
