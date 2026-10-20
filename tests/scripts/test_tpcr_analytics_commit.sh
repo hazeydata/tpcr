@@ -141,7 +141,7 @@ printf '%s\n' "\$*" >> "$W/argv.log"
 args=()
 for a in "\$@"; do
     if [ "\$a" = push ]; then
-        printf 'protocol=https\nhost=github.com\npath=hazeydata/tpcr.git\n\n' | "$GIT_BIN" "\${args[@]}" credential fill > "$W/cred.out" 2>&1
+        printf 'protocol=https\nhost=github.com\npath=hazeydata/tpcr.git\n\n' | "$GIT_BIN" "\${args[@]}" credential fill > "$W/cred.out" 2> "$W/cred.err"
         exit 1
     fi
     args+=("\$a")
@@ -150,8 +150,13 @@ exec "$GIT_BIN" "\$@"
 FAKE
 chmod +x "$W/fakebin/git"
 "$GIT_BIN" -C "$W/repo" remote set-url origin https://github.invalid/hazeydata/tpcr.git
+"$GIT_BIN" config --global credential.helper "!f() { echo called >> '$W/decoy.log'; }; f"
 PATH="$W/fakebin:$PATH" run -- sh -c 'echo "{\"v\":6}" > docs/analytics-data/a.json'
 check "push via https with failing transport exits 5" "$?" "5"
+"$GIT_BIN" config --global --unset credential.helper
+[ ! -e "$W/decoy.log" ] && ok "AC4 ambient credential helper never called" || bad "AC4 ambient credential helper never called"
+grep -qF "$FAKE_TOKEN" "$W/cred.err" && bad "AC4 helper stderr has no token" || ok "AC4 helper stderr has no token"
+check "AC4 helper stdout has token only on the password line" "$(grep -cF "$FAKE_TOKEN" "$W/cred.out")" "1"
 grep -q "^password=$FAKE_TOKEN\$" "$W/cred.out" && ok "AC4 credential helper supplies token from env" || bad "AC4 credential helper supplies token from env"
 leak=0
 for f in "$W/out" "$W/argv.log" "$W/repo/.git/config" "$HOME/.gitconfig"; do
