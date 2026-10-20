@@ -1,0 +1,2 @@
+0 16 * * * /opt/homebrew/bin/python3 /Users/fredhazelton/hazeydata/scripts/wti_predicted_tweet.py >> /tmp/p.log 2>&1
+30 8 * * * /opt/homebrew/bin/python3 /Users/fredhazelton/hazeydata/scripts/wti_observed_tweet.py >> /tmp/o.log 2>&1

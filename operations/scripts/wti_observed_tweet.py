@@ -24,6 +24,8 @@ from pathlib import Path
 import requests
 from requests_oauthlib import OAuth1
 
+from tweet_guard import enforce, preflight_legacy
+
 # --- Configuration ---
 SSH_HOST = "wilma@192.168.2.75"
 CONTENT_DIR = "/home/wilma/hazeydata/pipeline/content"
@@ -309,6 +311,7 @@ def post_discord(message):
 
 def main():
     load_env()
+    enforce(preflight_legacy)
 
     print(f"WTI Observed Tweet \u2014 {date.today().isoformat()}")
 

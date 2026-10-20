@@ -1,0 +1,3 @@
+16 8 * * * /Users/fredhazelton/hazeydata/scripts/tpcr_analytics_commit.sh
+# 0 16 * * * /opt/homebrew/bin/python3 /Users/fredhazelton/hazeydata/scripts/wti_predicted_tweet.py
+#30 8 * * * /opt/homebrew/bin/python3 /Users/fredhazelton/hazeydata/scripts/wti_observed_tweet.py
