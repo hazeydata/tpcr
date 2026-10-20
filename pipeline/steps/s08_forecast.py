@@ -37,6 +37,7 @@ from pipeline.core.db import read_connection
 from pipeline.core.logging import PipelineLogger
 from pipeline.core.park_codes import PARK_TIMEZONE, entity_to_park
 from pipeline.core.validation import ValidationError, require_file
+from pipeline.models import bias_guard
 
 # Feature columns by model type
 FEATURES_BASELINE = [
@@ -81,6 +82,9 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
         entity_list = _load_entity_list(cfg, log)
         oc_by_entity = _load_operating_calendar_indexed(cfg, log)
         fallback_ratios = _load_fallback_ratios(cfg, log)
+        guarded = bias_guard.guarded_entities(cfg.state_dir)
+        if guarded:
+            log.info(f"Bias guard: routing {len(guarded)} entities to fallback ({bias_guard.REASON}): {sorted(guarded)}")
 
     # Group entities by park
     park_entities: dict[str, list[str]] = {}
@@ -134,6 +138,7 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
                         entity_code, park_code, time_grid,
                         cfg.models_dir, agg_by_entity, park_open_mins,
                         fallback_ratios, oc_by_entity,
+                        entity_code in guarded,
                     )
                     if result is not None and len(result) > 0:
                         park_results.append(result)
@@ -226,6 +231,7 @@ def _forecast_entity_fast(
     park_open_mins: dict,
     fallback_ratios: dict,
     oc_by_entity: dict | None,
+    bias_guarded: bool = False,
 ) -> tuple[pd.DataFrame | None, str]:
     """Generate forecast for a single entity. O(1) lookups, no scanning.
 
@@ -282,6 +288,11 @@ def _forecast_entity_fast(
     v2_path = entity_dir / "model_julia_v2.json"
 
     fallback_ratio = fallback_ratios.get(entity_code, fallback_ratios.get("__global__", 0.678))
+
+    if bias_guarded:
+        df["predicted_actual"] = (df["posted_time"] * fallback_ratio).round().astype(int)
+        df["prediction_method"] = "fallback_ratio"
+        return df[["entity_code", "park_date", "time_slot", "predicted_actual", "prediction_method"]], bias_guard.REASON
 
     if baseline_path.exists() or legacy_v3_path.exists():
         model_path = baseline_path if baseline_path.exists() else legacy_v3_path
