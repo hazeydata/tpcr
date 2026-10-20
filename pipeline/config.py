@@ -34,6 +34,11 @@ class PipelineConfig:
     shadow_output_base: Path = field(default=None)
     prod_output_base: Path = field(default=None)  # Preserved for shadow reads
 
+    # === Sync ===
+    s01_sync_timeout_s: int = field(default_factory=lambda: int(os.environ.get("S01_SYNC_TIMEOUT_S", "1800")))
+    s3_bucket: str = "touringplans_stats"
+    s3_sync_sources: list[str] = field(default_factory=lambda: ["wait_times", "fastpass_times"])
+
     # === Forecast ===
     # v3.0: 365 days (reduced from 730 to save memory during OOM era)
     # v4.1: restored to 730 days — per-park chunking in s06 solved memory issues

@@ -33,6 +33,7 @@ from pipeline.core.logging import PipelineLogger
 from pipeline.core.metrics import PipelineMetrics
 from pipeline.core.paths import log_events_path
 from pipeline.steps import STEP_ORDER
+from pipeline.steps.s01_sync import EXIT_SYNC_PARTIAL, SyncPartial, downstream_blocked
 
 # Legacy bridge: keep pipeline_status.json updated for monitoring scripts
 try:
@@ -126,7 +127,15 @@ def main():
 
     # Execute steps
     failed = False
+    partial = False
     for step_name in steps:
+        if step_name != "s01_sync":
+            blocked = downstream_blocked(cfg)
+            if blocked:
+                log.warning(f"Skipping {step_name}: s01_sync status is {blocked}")
+                metrics.skip_step(step_name, blocked)
+                partial = True
+                continue
         step_log = PipelineLogger(step_name, cfg.logs_dir)
         metrics.start_step(step_name)
 
@@ -153,6 +162,12 @@ def main():
             # Save step events
             step_log.save_events(log_events_path(cfg, run_date))
 
+        except SyncPartial as e:
+            log.warning(f"Step {step_name} PARTIAL: {e}")
+            metrics.fail_step(step_name, str(e))
+            step_log.save_events(log_events_path(cfg, run_date))
+            partial = True
+
         except Exception as e:
             log.error(f"Step {step_name} FAILED: {e}")
             metrics.fail_step(step_name, str(e))
@@ -173,10 +188,10 @@ def main():
     # Finalize
     total = round(time.time() - start_time, 2)
     metrics.total_duration_sec = total
-    metrics.status = "failed" if failed else "done"
+    metrics.status = "failed" if failed else ("sync_partial" if partial else "done")
 
     log.info("=" * 60)
-    log.info(f"PIPELINE {'FAILED' if failed else 'COMPLETE'} in {total}s")
+    log.info(f"PIPELINE {metrics.status.upper()} in {total}s")
     log.info("=" * 60)
 
     # Save metrics — but DON'T overwrite the full-run metrics with a
@@ -192,7 +207,9 @@ def main():
     # Save all pipeline-level events
     log.save_events(log_events_path(cfg, run_date))
 
-    return 1 if failed else 0
+    if failed:
+        return 1
+    return EXIT_SYNC_PARTIAL if partial else 0
 
 
 if __name__ == "__main__":
