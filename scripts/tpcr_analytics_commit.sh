@@ -58,7 +58,7 @@ unpushed_count() {
     if g rev-parse -q --verify "refs/remotes/$REMOTE/$BRANCH" >/dev/null; then
         g rev-list --count "refs/remotes/$REMOTE/$BRANCH..HEAD"
     else
-        g rev-list --count HEAD
+        g rev-list --count HEAD --not --remotes="$REMOTE"
     fi
 }
 
