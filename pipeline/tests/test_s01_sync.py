@@ -176,6 +176,97 @@ class S01Sync(unittest.TestCase):
         self.assertTrue((out / "raw" / obj).exists())
 
 
+    def test_hung_fetch_is_cut_at_deadline(self):
+        out = self.tmp / "a"
+        t0 = time.monotonic()
+        rc, log = self.run_step(out, FAKE_AWS_DELAY="60", S01_SYNC_TIMEOUT_S="2")
+        elapsed = time.monotonic() - t0
+        self.assertEqual(rc, 75, log)
+        self.assertLess(elapsed, 20)
+        self.assertEqual(self.status(out)["status"], "sync_partial")
+
+
+class InProcess(unittest.TestCase):
+    def setUp(self):
+        sys.path.insert(0, str(REPO))
+        from pipeline.config import load_config
+        from pipeline.core.logging import PipelineLogger
+        from pipeline.steps import s01_sync
+        self.s01 = s01_sync
+        self.base = Path(tempfile.mkdtemp())
+        self.cfg = load_config(output_base=self.base)
+        self.cfg.s01_sync_timeout_s = 10
+        self.log = PipelineLogger("s01_sync_test")
+        self.clock = [1000.0]
+        self.calls = []
+
+    def patched(self, plan, fetch_cost=0.0):
+        from unittest import mock
+
+        def fetch(cfg, source, keys, deadline):
+            self.calls.append((source, list(keys)))
+            self.clock[0] += fetch_cost
+
+        return [
+            mock.patch.object(self.s01, "_plan", lambda cfg, deadline: plan),
+            mock.patch.object(self.s01, "_fetch", fetch),
+            mock.patch.object(self.s01.time, "monotonic", lambda: self.clock[0]),
+        ]
+
+    def run_with(self, patches):
+        for p in patches:
+            p.start()
+        try:
+            return self.s01.run(self.cfg, self.log)
+        finally:
+            for p in patches:
+                p.stop()
+
+    def test_no_new_batch_starts_after_deadline(self):
+        from collections import OrderedDict
+        plan = OrderedDict([
+            ("wait_times/2026-10-10", {"export/wait_times/wdw/a.csv": "s1"}),
+            ("wait_times/2026-10-11", {"export/wait_times/wdw/b.csv": "s2"}),
+            ("wait_times/2026-10-12", {"export/wait_times/wdw/c.csv": "s3"}),
+        ])
+        with self.assertRaises(self.s01.SyncPartial):
+            self.run_with(self.patched(plan, fetch_cost=12.0))
+        self.assertEqual(len(self.calls), 1)
+        ck = json.loads((self.base / "state" / "s01_sync_checkpoint.json").read_text())
+        self.assertEqual(list(ck), ["wait_times/2026-10-10"])
+        st = json.loads((self.base / "state" / "s01_sync_status.json").read_text())
+        self.assertEqual((st["status"], st["batches_done"], st["batches_total"]), ("sync_partial", 1, 3))
+
+    def test_partly_committed_batch_fetches_only_changed_keys(self):
+        from collections import OrderedDict
+        state = self.base / "state"
+        state.mkdir(parents=True)
+        batch = "wait_times/2026-10-10"
+        (state / "s01_sync_checkpoint.json").write_text(json.dumps({batch: {
+            "export/wait_times/wdw/a.csv": "s1",
+            "export/wait_times/wdw/b.csv": "s2",
+        }}))
+        plan = OrderedDict([(batch, {
+            "export/wait_times/wdw/a.csv": "s1",
+            "export/wait_times/wdw/b.csv": "s2-changed",
+            "export/wait_times/wdw/c.csv": "s3",
+        })])
+        self.run_with(self.patched(plan))
+        self.assertEqual(self.calls, [("wait_times", ["export/wait_times/wdw/b.csv", "export/wait_times/wdw/c.csv"])])
+
+
+    def test_fully_committed_batch_is_not_fetched(self):
+        from collections import OrderedDict
+        state = self.base / "state"
+        state.mkdir(parents=True)
+        batch = "wait_times/2026-10-10"
+        objects = {"export/wait_times/wdw/a.csv": "s1"}
+        (state / "s01_sync_checkpoint.json").write_text(json.dumps({batch: objects}))
+        res = self.run_with(self.patched(OrderedDict([(batch, dict(objects))])))
+        self.assertEqual(self.calls, [])
+        self.assertEqual(res["batches_fetched"], 0)
+
+
 class DownstreamGate(unittest.TestCase):
     def run_pipeline(self, base: Path, status):
         state = base / "state"
