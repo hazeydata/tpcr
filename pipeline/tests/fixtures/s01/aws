@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+import fnmatch
+import json
+import os
+import shutil
+import sys
+import time
+from pathlib import Path
+
+root = Path(os.environ["FAKE_S3_ROOT"])
+manifest = json.loads((root / "manifest.json").read_text())
+log = os.environ.get("FAKE_AWS_LOG")
+if log:
+    with open(log, "a") as f:
+        f.write(" ".join(sys.argv[1:3]) + "\n")
+args = sys.argv[1:]
+assert args[0] == "s3"
+
+
+def split(uri):
+    rest = uri[len("s3://"):]
+    bucket, _, prefix = rest.partition("/")
+    return bucket, prefix
+
+
+if args[1] == "ls":
+    _, prefix = split(args[2])
+    for key in sorted(manifest):
+        if key.startswith(prefix):
+            size = (root / key).stat().st_size
+            print(f"{manifest[key]} {size:>10} {key}")
+    sys.exit(0)
+
+if args[1] == "sync":
+    _, prefix = split(args[2])
+    dst = Path(args[3])
+    rest = args[4:]
+    filters = []
+    i = 0
+    while i < len(rest):
+        if rest[i] in ("--exclude", "--include"):
+            filters.append((rest[i], rest[i + 1]))
+            i += 2
+        else:
+            i += 1
+    time.sleep(float(os.environ.get("FAKE_AWS_DELAY", "0")))
+    for key in sorted(manifest):
+        if not key.startswith(prefix):
+            continue
+        rel = key[len(prefix):]
+        keep = True
+        for kind, pat in filters:
+            if fnmatch.fnmatch(rel, pat):
+                keep = kind == "--include"
+        if not keep:
+            continue
+        out = dst / rel
+        src = root / key
+        if out.exists() and out.stat().st_size == src.stat().st_size and out.stat().st_mtime >= src.stat().st_mtime:
+            continue
+        out.parent.mkdir(parents=True, exist_ok=True)
+        tmp = out.with_name(out.name + ".awstmp")
+        shutil.copyfile(src, tmp)
+        os.replace(tmp, out)
+    sys.exit(0)
+sys.exit(2)
