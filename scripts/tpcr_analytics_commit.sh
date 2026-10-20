@@ -12,12 +12,15 @@ would make.
 
 Env (names only, values never logged):
   TPCR_GIT_AUTHOR_NAME, TPCR_GIT_AUTHOR_EMAIL   commit identity (required)
+  TPCR_GIT_PUSH_TOKEN  https push token (required; read by a credential
+                       helper from the environment, never on argv or disk)
   TPCR_REPO     repo root (default: parent of this script's dir)
   TPCR_REMOTE   remote name (default: origin)
   TPCR_BRANCH   branch to push (default: current branch)
   TPCR_PYTHON   python for the default regen (default: python3)
 
 Exit: 0 ok or nothing to do; regen rc if regen failed; 3 config error;
+      6 TPCR_GIT_PUSH_TOKEN unset;
       4 commit failed; 5 push failed (local commit kept, pushed next run).
 USAGE
 }
@@ -50,6 +53,11 @@ BRANCH=${TPCR_BRANCH:-$(g symbolic-ref --short -q HEAD)}
 if [ -z "${TPCR_GIT_AUTHOR_NAME:-}" ] || [ -z "${TPCR_GIT_AUTHOR_EMAIL:-}" ]; then
     log "TPCR_GIT_AUTHOR_NAME and TPCR_GIT_AUTHOR_EMAIL must be set"
     exit 3
+fi
+
+if [ "$DRY_RUN" -eq 0 ] && [ -z "${TPCR_GIT_PUSH_TOKEN:-}" ]; then
+    log "TPCR_GIT_PUSH_TOKEN must be set"
+    exit 6
 fi
 
 MSG="Pipeline post-run: Analytics JSON updates $(date '+%Y-%m-%d')"
@@ -113,7 +121,9 @@ if [ "$n" -eq 0 ]; then
     log "nothing to push"
     exit 0
 fi
-if g push -q "$REMOTE" "HEAD:refs/heads/$BRANCH"; then
+if g -c credential.helper= \
+     -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$TPCR_GIT_PUSH_TOKEN"; }; f' \
+     push -q "$REMOTE" "HEAD:refs/heads/$BRANCH"; then
     log "pushed $n commit(s) to $REMOTE/$BRANCH"
     exit 0
 fi

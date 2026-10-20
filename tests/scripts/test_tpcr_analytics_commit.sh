@@ -33,6 +33,9 @@ setup() {
     "$GIT_BIN" -C "$W/repo" push -q -u origin main
 }
 
+FAKE_TOKEN="fixture-push-token-$$-not-real"
+export TPCR_GIT_PUSH_TOKEN="$FAKE_TOKEN"
+
 run() {
     TPCR_REPO="$W/repo" TPCR_GIT_AUTHOR_NAME="Analytics Bot" TPCR_GIT_AUTHOR_EMAIL="bot@example.invalid" \
         "$SH" "$W/repo/scripts/tpcr_analytics_commit.sh" "$@" >"$W/out" 2>&1
@@ -106,8 +109,58 @@ check "git shell-function wrapper does not break no-change path" "$?" "0"
 unset -f git
 
 setup
-TPCR_GIT_TOKEN=fixture-not-a-secret-value run -- sh -c 'echo "{\"v\":4}" > docs/analytics-data/a.json'
+TPCR_GIT_PUSH_TOKEN=fixture-not-a-secret-value run -- sh -c 'echo "{\"v\":4}" > docs/analytics-data/a.json'
 grep -q "fixture-not-a-secret-value" "$W/out" && bad "AC4 no env values in logs" || ok "AC4 no env values in logs"
+
+setup
+"$GIT_BIN" -C "$W/repo" add -A -- other.txt
+echo staged > "$W/repo/other.txt"
+"$GIT_BIN" -C "$W/repo" add other.txt
+run -- sh -c 'echo "{\"v\":5}" > docs/analytics-data/a.json'
+check "pre-staged non-analytics file not committed" "$("$GIT_BIN" -C "$W/repo" show --name-only --format= HEAD | tr '\n' ' ')" "docs/analytics-data/a.json "
+check "pre-staged file stays staged" "$("$GIT_BIN" -C "$W/repo" diff --cached --name-only)" "other.txt"
+
+setup
+run -- sh -c 'echo n > docs/analytics-data/only-new.json'
+check "regen adding only new files commits" "$?" "0"
+check "new-file-only commit made" "$(count)" "2"
+check "new-file-only commit content" "$("$GIT_BIN" -C "$W/repo" show --name-only --format= HEAD | tr '\n' ' ')" "docs/analytics-data/only-new.json "
+
+setup
+env -u TPCR_GIT_PUSH_TOKEN TPCR_REPO="$W/repo" TPCR_GIT_AUTHOR_NAME=a TPCR_GIT_AUTHOR_EMAIL=a@example.invalid \
+    "$SH" "$W/repo/scripts/tpcr_analytics_commit.sh" -- sh -c 'touch REGEN_RAN' >"$W/out" 2>&1
+check "missing token fails closed with 6" "$?" "6"
+[ ! -e "$W/repo/REGEN_RAN" ] && ok "missing token: regen not run" || bad "missing token: regen not run"
+check "missing token: no commit" "$(count)" "1"
+
+setup
+mkdir -p "$W/fakebin"
+cat > "$W/fakebin/git" <<FAKE
+#!/bin/bash
+printf '%s\n' "\$*" >> "$W/argv.log"
+args=()
+for a in "\$@"; do
+    if [ "\$a" = push ]; then
+        printf 'protocol=https\nhost=github.com\npath=hazeydata/tpcr.git\n\n' | "$GIT_BIN" "\${args[@]}" credential fill > "$W/cred.out" 2>&1
+        exit 1
+    fi
+    args+=("\$a")
+done
+exec "$GIT_BIN" "\$@"
+FAKE
+chmod +x "$W/fakebin/git"
+"$GIT_BIN" -C "$W/repo" remote set-url origin https://github.invalid/hazeydata/tpcr.git
+PATH="$W/fakebin:$PATH" run -- sh -c 'echo "{\"v\":6}" > docs/analytics-data/a.json'
+check "push via https with failing transport exits 5" "$?" "5"
+grep -q "^password=$FAKE_TOKEN\$" "$W/cred.out" && ok "AC4 credential helper supplies token from env" || bad "AC4 credential helper supplies token from env"
+leak=0
+for f in "$W/out" "$W/argv.log" "$W/repo/.git/config" "$HOME/.gitconfig"; do
+    grep -qF "$FAKE_TOKEN" "$f" 2>/dev/null && { leak=1; echo "token found in $f"; }
+done
+check "AC4 token absent from output, argv, .git/config, gitconfig" "$leak" "0"
+grep -qF "$FAKE_TOKEN" "$W/repo/.git/FETCH_HEAD" "$W/repo/.git/logs/HEAD" 2>/dev/null && bad "AC4 token absent from git logs" || ok "AC4 token absent from git logs"
+"$GIT_BIN" -C "$W/repo" remote get-url origin | grep -qF "$FAKE_TOKEN" && bad "AC4 token not in remote URL" || ok "AC4 token not in remote URL"
+grep -qF "$FAKE_TOKEN" "$SRC" && bad "token literal in script" || ok "no token literal in script"
 
 rm -rf "$W"
 echo "passed=$PASSES failed=$FAILS"
