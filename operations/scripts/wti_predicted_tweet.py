@@ -23,6 +23,7 @@ from pathlib import Path
 import requests
 from requests_oauthlib import OAuth1
 
+import tweet_note
 from tweet_guard import enforce, preflight_legacy
 
 # --- Configuration ---
@@ -368,6 +369,9 @@ def main():
         sys.exit(1)
 
     save_state(tweet_id, reference_date)
+    note = tweet_note.cap(tweet_note.note_lines(content["parks"]))
+    if note:
+        tweet_note.save_draft(STATE_FILE, reference_date, tweet_id, note)
 
     post_discord(
         f":white_check_mark: **WTI Predicted Tweet posted** \u2014 ref={reference_date}\n"

@@ -77,7 +77,7 @@ def errors(wti, slot):
 
 
 def window_stats(err, as_of, w):
-    d = err[(err["park_date"] >= as_of - timedelta(days=w)) & (err["park_date"] <= as_of)]
+    d = err[(err["park_date"] > as_of - timedelta(days=w)) & (err["park_date"] <= as_of)]
     g = d.assign(abs_error=d["error"].abs()).groupby(["level", "key"], sort=True)
     s = g.agg(n=("error", "size"), mean_bias=("error", "mean"), median_bias=("error", "median"), mae=("abs_error", "mean")).reset_index()
     s["window_days"] = w

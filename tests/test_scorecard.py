@@ -24,6 +24,9 @@ import scorecard as sc
 import tweet_note
 import weekly
 
+sys.modules.setdefault("requests_oauthlib", type(sys)("requests_oauthlib")).OAuth1 = object
+import wti_predicted_tweet as wpt
+
 AS_OF = date(2026, 10, 12)
 
 
@@ -78,7 +81,8 @@ class PhaseA(Env):
         self.write(rows, slot_rows("AK86", [1.0] * 40))
         with mock.patch("sys.stderr", new=io.StringIO()) as err:
             self.assertEqual(self.run_sc()[0], 1)
-        self.assertIn("wti_error", err.getvalue())
+        self.assertIn("wti_accuracy: missing required column(s): wti_error", err.getvalue())
+        self.assertNotIn("KeyError", err.getvalue())
         self.assertFalse(self.out.exists())
 
     def test_ac2_dedup_keeps_latest(self):
@@ -95,8 +99,9 @@ class PhaseA(Env):
         self.run_sc()
         c = self.card().set_index(["key", "window_days"])
         ak = c.loc[("AK", 90)]
-        e = pd.Series([10.0, 12.0, -1.0, 14.0] * 30)[:91]
-        self.assertEqual(ak["n"], 91)
+        e = pd.Series([10.0, 12.0, -1.0, 14.0] * 30)[:90]
+        self.assertEqual(ak["n"], 90)
+        self.assertEqual(c.loc[("AK", 30), "n"], 30)
         self.assertAlmostEqual(ak["mean_bias"], e.mean())
         self.assertAlmostEqual(ak["median_bias"], e.median())
         self.assertAlmostEqual(ak["mae"], e.abs().mean())
@@ -264,20 +269,35 @@ DELETE_RE = re.compile(r"unlink|remove|rmtree")
 class PhaseE(Env):
     def test_ac15_writes_only_under_scorecard_dir(self):
         self.standard()
-        before = {p: p.stat().st_mtime_ns for p in self.acc.iterdir()}
-        real_open = open
+        snap = lambda: {p: p.stat().st_mtime_ns for p in self.tmp.rglob("*") if self.out not in p.parents and p != self.out}
+        before = snap()
         writes = []
+        real = {"open": open, "write_text": Path.write_text, "write_bytes": Path.write_bytes, "replace": os.replace, "rename": os.rename}
 
-        def spy(f, mode="r", *a, **k):
+        def spy_open(f, mode="r", *a, **k):
             if any(c in mode for c in "wax+"):
                 writes.append(Path(f))
-            return real_open(f, mode, *a, **k)
+            return real["open"](f, mode, *a, **k)
 
-        with mock.patch("builtins.open", spy):
+        def spy_path(name):
+            def f(self_, *a, **k):
+                writes.append(Path(self_))
+                return real[name](self_, *a, **k)
+            return f
+
+        def spy_move(name):
+            def f(src, dst, *a, **k):
+                writes.extend([Path(src), Path(dst)])
+                return real[name](src, dst, *a, **k)
+            return f
+
+        with mock.patch("builtins.open", spy_open), mock.patch.object(Path, "write_text", spy_path("write_text")), \
+                mock.patch.object(Path, "write_bytes", spy_path("write_bytes")), mock.patch("os.replace", spy_move("replace")), \
+                mock.patch("os.rename", spy_move("rename")):
             self.run_sc()
         self.assertTrue(writes)
-        self.assertTrue(all(self.out in w.parents for w in writes))
-        self.assertEqual(before, {p: p.stat().st_mtime_ns for p in self.acc.iterdir()})
+        self.assertEqual([w for w in writes if self.out not in w.parents], [])
+        self.assertEqual(before, snap())
         for f in SC.glob("*.py"):
             self.assertIsNone(SAFETY_RE.search(f.read_text()), f)
 
@@ -323,6 +343,9 @@ class PhaseF(Env):
         self.assertTrue((self.out / "alerts" / "alert_2026-10-12.eml.txt").exists())
 
     def test_ac18_deterministic_content(self):
+        tds = {"key": "TDS", "level": "park", "reason": "drift", "value": 6.0, "threshold": 5.0, "window_days": 30}
+        flags = [tds] + json.loads(self.status().read_text())["flags"]
+        self.assertEqual([f["key"] for f in drift_alert.alert_flags({"flags": flags})], ["AK86", "AK", "TDS"])
         p = self.status()
         self.alert(p, "--dry-run")
         self.alert(p, "--dry-run")
@@ -359,6 +382,14 @@ def systematic(*parks, as_of="2026-10-12", ok=True):
 PARKS = [{"park_code": "AK", "park_name": "Animal Kingdom"}, {"park_code": "HS", "park_name": "Hollywood Studios"},
          {"park_code": "MK", "park_name": "Magic Kingdom"}, {"park_code": "EP", "park_name": "EPCOT"}]
 
+FORECAST = {"target_date": "2026-10-13", "parks": [
+    {"park_code": "MK", "park_name": "Magic Kingdom", "wti": 38.2}, {"park_code": "EP", "park_name": "EPCOT", "wti": 12.4},
+    {"park_code": "HS", "park_name": "Hollywood Studios", "wti": 27.0}, {"park_code": "AK", "park_name": "Animal Kingdom", "wti": 19.6}]}
+MAIN_FORECAST_TEXT = ("Walt Disney World Crowd Forecast \u2014 2026-10-13\n\n\U0001f7e2 EPCOT: 12 min avg wait\n"
+                      "\U0001f7e1 Animal Kingdom: 20 min avg wait\n\U0001f7e0 Hollywood Studios: 27 min avg wait\n"
+                      "\U0001f534 Magic Kingdom: 38 min avg wait\n\nLower WTI = shorter waits. Plan your day accordingly!\n"
+                      "#WDW #DisneyWorld #WaitTimes")
+
 
 class PhaseG(Env):
     def notes(self, status, today=AS_OF, variant=None):
@@ -393,11 +424,53 @@ class PhaseG(Env):
         self.assertIn("WARNING", log)
         self.assertIn("We're working on it.", lines[0])
         self.assertNotIn("working on it", Path(tweet_note.__file__).read_text())
-        longest = max(PARKS, key=lambda p: len(p["park_name"]))["park_name"]
-        for v in ("standard", "campy"):
-            for d in ("high", "low"):
-                self.assertLessEqual(len(self.notes(systematic(("HS", d)), variant=v)[0][0]), 280)
-        self.assertEqual(longest, "Hollywood Studios")
+        worst = systematic(*[(p["park_code"], "high") for p in PARKS])
+        lines = self.notes(worst, variant="campy")[0]
+        text = tweet_note.cap(lines)
+        self.assertGreater(len("\n".join(lines)), 280)
+        self.assertLessEqual(len(text), 280)
+        self.assertEqual(text, "\n".join(lines[:len(text.split("\n"))]))
+        self.assertEqual(tweet_note.cap(lines), text)
+        self.assertEqual(tweet_note.cap(["x" * 281]), "")
+
+    def run_forecast(self, status):
+        self.out.mkdir(exist_ok=True)
+        (self.out / "status.json").write_text(json.dumps(status))
+        state = Path(tempfile.mkdtemp(dir=self.tmp)) / "tweet_state.json"
+        post = mock.Mock(return_value="111")
+        creds = {k: "x" for k in ("TWITTER_CONSUMER_KEY", "TWITTER_CONSUMER_SECRET", "TWITTER_ACCESS_TOKEN", "TWITTER_ACCESS_TOKEN_SECRET")}
+        with mock.patch.multiple(wpt, STATE_FILE=state, load_env=mock.DEFAULT, enforce=mock.DEFAULT, post_discord=mock.DEFAULT,
+                                 render_video_on_wilma=mock.Mock(return_value=None), load_content=mock.Mock(return_value=FORECAST),
+                                 post_tweet=post), \
+                mock.patch.dict(os.environ, creds), mock.patch.object(tweet_note, "date", type("D", (date,), {"today": classmethod(lambda c: AS_OF)})), \
+                redirect_stdout(io.StringIO()):
+            wpt.main()
+        return post, state
+
+    def test_ac23_forecast_unchanged_and_reply_drafted(self):
+        self.assertEqual(wpt.format_tweet(FORECAST), MAIN_FORECAST_TEXT)
+        post, state = self.run_forecast(systematic(("AK", "high")))
+        post.assert_called_once_with(MAIN_FORECAST_TEXT, media_id=None)
+        draft = json.loads(state.read_text())["note_drafts"]["2026-10-13"]
+        self.assertEqual(draft, {"text": "Note: our Animal Kingdom forecasts have been running high lately. We're working on it.",
+                                 "in_reply_to": "111", "status": "draft"})
+        _, state = self.run_forecast(systematic())
+        self.assertNotIn("note_drafts", json.loads(state.read_text()))
+
+    def test_ac24_approve_posts_once(self):
+        post, state = self.run_forecast(systematic(("AK", "high")))
+        reply = mock.Mock(return_value="222")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(tweet_note.approve(state, "2026-10-13", reply), "222")
+            self.assertIsNone(tweet_note.approve(state, "2026-10-13", reply))
+            self.assertIsNone(tweet_note.approve(state, "2026-10-14", reply))
+        reply.assert_called_once_with(json.loads(state.read_text())["note_drafts"]["2026-10-13"]["text"], reply_to="111")
+        self.assertEqual(json.loads(state.read_text())["note_drafts"]["2026-10-13"]["status"], "posted")
+        failed = mock.Mock(return_value=None)
+        tweet_note.save_draft(state, "2026-10-15", "333", "n")
+        with redirect_stdout(io.StringIO()):
+            self.assertIsNone(tweet_note.approve(state, "2026-10-15", failed))
+        self.assertEqual(json.loads(state.read_text())["note_drafts"]["2026-10-15"]["status"], "draft")
 
     def test_ac25_final_wording(self):
         for v, tail in (("standard", "We're working on it."), ("campy", "The bot team is working on it.")):
