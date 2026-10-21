@@ -81,6 +81,7 @@ def test_request_shape():
     assert body["tools"][0]["function"]["name"] == "run_query"
     assert "sql" in body["tools"][0]["function"]["parameters"]["properties"]
     assert "stream" not in body or body["stream"] is False
+    assert body["max_tokens"] == 1500
 
 
 @pytest.mark.skipif(any(k in os.environ for k in ("QWEN_BASE_URL", "QWEN_MODEL", "QWEN_TIMEOUT")),
@@ -117,9 +118,18 @@ def test_tool_loop_appends_tool_message_and_finishes():
     assert second[-1] == {"role": "tool", "tool_call_id": "call_1", "content": "42 rows"}
 
 
-def test_non_select_rejected():
+@pytest.mark.parametrize("sql", [
+    "DROP TABLE wti",
+    "INSERT INTO wti VALUES (1)",
+    "UPDATE wti SET x = 1",
+    "DELETE FROM wti",
+    "CREATE TABLE t AS SELECT 1",
+    "ATTACH 'other.db' AS other",
+    "COPY wti TO 'out.csv'",
+])
+def test_non_select_rejected(sql):
     payloads = []
-    replies = [chat_reply(tool_calls=[tool_call("DROP TABLE wti")]), chat_reply("ok")]
+    replies = [chat_reply(tool_calls=[tool_call(sql)]), chat_reply("ok")]
 
     async def post(payload):
         payloads.append(json.loads(json.dumps(payload)))
@@ -154,6 +164,23 @@ def test_retry_without_tools_on_4xx():
     assert "tools" in payloads[0] and "tools" not in payloads[1]
 
 
+def test_4xx_retries_exactly_once_without_tools():
+    payloads = []
+
+    async def post(payload):
+        payloads.append(json.loads(json.dumps(payload)))
+        if len(payloads) == 1:
+            raise aa.QwenHTTPError(400, "bad request")
+        return chat_reply("recovered")
+
+    with patch("ask_agent._post_chat", post):
+        answer = run(aa.ask_agent("q", "u"))
+    assert answer == "recovered"
+    assert len(payloads) == 2
+    assert "tools" in payloads[0]
+    assert "tools" not in payloads[1]
+
+
 def test_no_retry_on_server_error_without_tools_hint():
     post = AsyncMock(side_effect=aa.QwenHTTPError(500, "boom"))
     with patch("ask_agent._post_chat", post):
@@ -172,6 +199,14 @@ def test_think_blocks_stripped():
 # ---------------------------------------------------------------- 32K cap
 
 LIMIT = aa.CONTEXT_LIMIT
+
+
+def test_limits_are_literal_values():
+    assert aa.CONTEXT_LIMIT == 32768
+    assert aa.MAX_TOKENS == 1500
+    params = inspect.signature(aa.trim_messages).parameters
+    assert params["limit"].default == 32768
+    assert params["max_tokens"].default == 1500
 
 
 def total(msgs, tools=True):
@@ -424,8 +459,8 @@ def test_ask_falls_back_to_followup_send_if_edit_fails(bot):
 
 
 @pytest.mark.parametrize("exc", [
-    asyncio.TimeoutError("read timed out at 10.0.0.5:8080"),
-    ConnectionError("connection refused 10.0.0.5:8080"),
+    asyncio.TimeoutError("read timed out at 127.0.0.1:8080"),
+    ConnectionError("connection refused 127.0.0.1:8080"),
     aa.QwenHTTPError(500, "Traceback: secret stack"),
     RuntimeError("secret-internal-detail"),
 ])
@@ -439,7 +474,7 @@ def test_errors_show_only_friendly_message(bot, exc, caplog):
     visible = user_visible(events)
     assert bot.FRIENDLY_ERROR == "Sorry, I couldn't answer that right now. Please try again in a bit."
     assert bot.FRIENDLY_ERROR in visible
-    for leak in ("secret", "10.0.0.5", "timed out", "refused", "Traceback", "HTTP 500"):
+    for leak in ("secret", "127.0.0.1", "timed out", "refused", "Traceback", "HTTP 500"):
         assert leak not in visible
     # full details only in server logs
     assert any(r.exc_info for r in caplog.records)
