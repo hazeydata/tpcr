@@ -147,51 +147,19 @@ QUEUE_TIMES_PARK_MAP: Dict[int, str] = {
 # DUCKDB DUAL-WRITE (live_waits for bot + dashboard)
 # =============================================================================
 
-# Constraint-free upsert: works whether or not live_waits / data_freshness have PKs.
-# The CSV path is bound as a parameter (?) for LIVE_WAITS_INSERT_SQL.
-LIVE_WAITS_INSERT_SQL = """
-    INSERT INTO live_waits (entity_code, observed_at, wait_time_type, wait_time_minutes, park_date)
-    SELECT s.entity_code, s.observed_at, s.wait_time_type, s.wait_time_minutes, s.park_date
-    FROM (
-        SELECT entity_code, observed_at::TIMESTAMPTZ AS observed_at, wait_time_type,
-               wait_time_minutes::INTEGER AS wait_time_minutes, park_date::DATE AS park_date
-        FROM read_csv_auto(?)
-        QUALIFY row_number() OVER (
-            PARTITION BY entity_code, observed_at::TIMESTAMPTZ, wait_time_type
-            ORDER BY wait_time_minutes DESC
-        ) = 1
-    ) s
-    WHERE NOT EXISTS (
-        SELECT 1 FROM live_waits lw
-        WHERE lw.entity_code = s.entity_code
-          AND lw.observed_at = s.observed_at
-          AND lw.wait_time_type = s.wait_time_type
-    )
-"""
-FRESHNESS_DELETE_SQL = "DELETE FROM data_freshness WHERE source = 'scraper'"
-FRESHNESS_INSERT_SQL = """
-    INSERT INTO data_freshness (source, last_updated, row_count, notes)
-    VALUES ('scraper', CURRENT_TIMESTAMP, (SELECT COUNT(*) FROM live_waits), 'queue-times')
-"""
-
+# Writes go through live_duckdb_writes (constraint-free: works whether or not
+# live_waits / data_freshness have PKs); the subprocess runs write_scraper_batch.
 # Body of the script run via `python -c` (see _live_write_script).
-_LIVE_WRITE_SCRIPT_BODY = """try:
+_LIVE_WRITE_SCRIPT_BODY = """sys.path.insert(0, SRC_DIR)
+try:
+    import live_duckdb_writes
     con = duckdb.connect(DB_PATH)
     try:
-        con.execute("BEGIN")
-        con.execute(LIVE_WAITS_INSERT_SQL, [TMP_PATH])
-        con.execute(FRESHNESS_DELETE_SQL)
-        con.execute(FRESHNESS_INSERT_SQL)
-        con.execute("COMMIT")
-    except Exception:
-        try:
-            con.execute("ROLLBACK")
-        except Exception:
-            pass
-        raise
+        dropped = live_duckdb_writes.write_scraper_batch(con, TMP_PATH)
     finally:
         con.close()
     os.unlink(TMP_PATH)
+    print("DROPPED:" + str(dropped))
     print("OK")
 except Exception as e:
     print("ERR:" + str(e), file=sys.stderr)
@@ -200,14 +168,12 @@ except Exception as e:
 
 
 def _live_write_script(db_path, tmp_path) -> str:
-    """Build the `python -c` script; paths and SQL are embedded as repr() literals."""
+    """Build the `python -c` script; paths are embedded as repr() literals."""
     return (
         "import duckdb, os, sys\n"
         f"DB_PATH = {str(db_path)!r}\n"
         f"TMP_PATH = {str(tmp_path)!r}\n"
-        f"LIVE_WAITS_INSERT_SQL = {LIVE_WAITS_INSERT_SQL!r}\n"
-        f"FRESHNESS_DELETE_SQL = {FRESHNESS_DELETE_SQL!r}\n"
-        f"FRESHNESS_INSERT_SQL = {FRESHNESS_INSERT_SQL!r}\n"
+        f"SRC_DIR = {str(Path(__file__).resolve().parent)!r}\n"
         + _LIVE_WRITE_SCRIPT_BODY
     )
 
@@ -268,6 +234,12 @@ def _write_to_live_duckdb(
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode == 0 and "OK" in result.stdout:
+                m = re.search(r"DROPPED:(\d+)", result.stdout)
+                if m and int(m.group(1)) > 0:
+                    logger.warning(
+                        f"live_waits: dropped {m.group(1)} row(s) with NULL/empty "
+                        "entity_code, observed_at or wait_time_type"
+                    )
                 logger.debug(f"Wrote {len(df)} rows to live_waits (subprocess)")
                 return True
             raise RuntimeError(result.stderr[:300] if result.stderr else "subprocess failed")

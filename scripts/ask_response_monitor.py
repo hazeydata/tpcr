@@ -23,6 +23,12 @@ import requests
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+# Make src/ importable (shared live DuckDB write helpers)
+_SRC_DIR = str(Path(__file__).resolve().parent.parent / "src")
+if _SRC_DIR not in sys.path:
+    sys.path.insert(0, _SRC_DIR)
+from live_duckdb_writes import replace_data_freshness  # noqa: E402
+
 # Load env from ~/.env if not already set
 _env_file = Path.home() / ".env"
 if _env_file.exists():
@@ -257,10 +263,9 @@ def attempt_fix(diagnosis):
                 """)
                 
                 after = con.execute("SELECT COUNT(*) FROM forecasts").fetchone()[0]
-                con.execute("""
-                    INSERT OR REPLACE INTO data_freshness (source, last_updated, row_count, notes)
-                    VALUES ('forecasts', CURRENT_TIMESTAMP, (SELECT COUNT(*) FROM forecasts), 'auto-fix-reload')
-                """)
+                replace_data_freshness(
+                    con, "forecasts", "auto-fix-reload", count_table="forecasts"
+                )
                 con.close()
                 
                 fix_result = {
