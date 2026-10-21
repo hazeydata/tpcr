@@ -36,6 +36,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+WDW_PARK_CODES = ("MK", "EP", "HS", "AK")
+
+
+def _wdw_parks(content: dict) -> list:
+    """Step 14 emits all parks; these tweets cover Walt Disney World only."""
+    return [p for p in content.get("parks", []) if p.get("park_code") in WDW_PARK_CODES]
+
+
 def load_content_json(target_date: str) -> dict | None:
     """Load and validate Step 14 observed content JSON."""
     content_file = CONTENT_DIR / f"observed_{target_date}.json"
@@ -88,7 +96,7 @@ def update_remotion_data(content: dict) -> bool:
     try:
         # Build Remotion-compatible data structure
         parks_data = []
-        for park in content.get("parks", []):
+        for park in _wdw_parks(content):
             # Get emoji and label for WTI score
             wti = park["wti"]
             
