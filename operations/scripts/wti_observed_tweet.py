@@ -181,6 +181,16 @@ def upload_media(video_path):
     return media_id
 
 
+WDW_PARK_CODES = ("MK", "EP", "HS", "AK")
+
+
+def _wdw_only(content):
+    """Step 14 emits all parks; these tweets cover Walt Disney World only."""
+    content = dict(content)
+    content["parks"] = [p for p in content.get("parks", []) if p.get("park_code") in WDW_PARK_CODES]
+    return content
+
+
 def load_content():
     """Load yesterday's observed content JSON from wilma."""
     yesterday = (date.today() - timedelta(days=1)).isoformat()
@@ -191,7 +201,7 @@ def load_content():
         try:
             data = json.loads(raw)
             if data.get("status") in ("ready", "released"):
-                return data
+                return _wdw_only(data)
             print(f"Content for {yesterday} is held: {data.get('held_reasons')}")
         except json.JSONDecodeError:
             print(f"Invalid JSON in {path}")

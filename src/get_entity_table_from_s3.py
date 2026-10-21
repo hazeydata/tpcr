@@ -56,6 +56,7 @@ import pandas as pd
 from botocore.config import Config
 from botocore.exceptions import ClientError, ResponseStreamingError
 
+from live_duckdb_writes import replace_data_freshness
 from utils import get_output_base
 from utils.park_code import park_code_sql
 
@@ -229,13 +230,7 @@ def _refresh_entities_duckdb(
             FROM read_csv_auto('{dim_str}')
         """)
         n = con.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
-        con.execute(
-            """
-            INSERT OR REPLACE INTO data_freshness (source, last_updated, row_count, notes)
-            VALUES ('entities', CURRENT_TIMESTAMP, ?, 'dimension_fetch')
-            """,
-            [n],
-        )
+        replace_data_freshness(con, "entities", "dimension_fetch", row_count=n)
         con.close()
         logger.info(f"Refreshed {n:,} entities in tpcr_live.duckdb")
     except Exception as e:
