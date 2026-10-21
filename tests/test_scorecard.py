@@ -1,4 +1,6 @@
+import ast
 import hashlib
+import importlib
 import inspect
 import io
 import json
@@ -639,6 +641,62 @@ class WindowOverride(Env):
         self.assertEqual(sc.WINDOWS, (7, 30, 90))
         with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
             sc.main(["--as-of", AS_OF.isoformat(), "--window-days", "91"])
+
+
+class WindowsTestOnly(Env):
+    SRC = SC / "scorecard.py"
+
+    def test_no_windows_kwarg_in_run_or_main(self):
+        tree = ast.parse(self.SRC.read_text())
+        seen = {}
+        for fn in (n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in ("run", "main")):
+            for c in (n for n in ast.walk(fn) if isinstance(n, ast.Call)):
+                if isinstance(c.func, ast.Name) and c.func.id == "scorecard":
+                    seen.setdefault(fn.name, []).append(c)
+                    self.assertNotIn("windows", [k.arg for k in c.keywords])
+                    self.assertTrue(all(k.arg for k in c.keywords))
+                    self.assertLessEqual(len(c.args), 2)
+        self.assertTrue(seen.get("run"))
+
+    def test_env_vars_do_not_change_windows(self):
+        env = {"TPCR_SCORECARD_WINDOWS": "1,2,3", "SCORECARD_WINDOWS": "1,2,3", "TPCR_WINDOWS": "1,2,3"}
+        self.addCleanup(importlib.reload, sc)
+        with mock.patch.dict(os.environ, env):
+            importlib.reload(sc)
+            self.assertEqual(sc.WINDOWS, (7, 30, 90))
+
+    def test_run_ignores_env_and_config_files(self):
+        self.standard()
+        os.environ["TPCR_SCORECARD_WINDOWS"] = "1,2,3"
+        opened = []
+        real_open, real_read, real_popen = open, Path.read_text, Path.open
+
+        def spy_open(f, *a, **k):
+            opened.append(str(f))
+            return real_open(f, *a, **k)
+
+        def spy_read(self_, *a, **k):
+            opened.append(str(self_))
+            return real_read(self_, *a, **k)
+
+        def spy_path_open(self_, *a, **k):
+            opened.append(str(self_))
+            return real_popen(self_, *a, **k)
+
+        with mock.patch.object(sc, "scorecard", wraps=sc.scorecard) as spy, \
+                mock.patch("builtins.open", spy_open), mock.patch.object(Path, "read_text", spy_read), \
+                mock.patch.object(Path, "open", spy_path_open), redirect_stdout(io.StringIO()):
+            sc.run(AS_OF, self.acc, self.out, False)
+        self.assertTrue(spy.called)
+        for call in spy.call_args_list:
+            self.assertEqual(call.kwargs.get("windows", (7, 30, 90)), (7, 30, 90))
+        self.assertEqual(set(self.card()["window_days"]), {7, 30, 90})
+        self.assertEqual([p for p in opened if "config" in p.lower() and p.endswith(".json")], [])
+
+    def test_source_has_no_config_reference(self):
+        src = self.SRC.read_text().lower()
+        self.assertNotIn("scorecard.json", src)
+        self.assertNotIn("config", src)
 
 
 if __name__ == "__main__":
