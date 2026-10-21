@@ -153,7 +153,7 @@ class S14ContentTests(unittest.TestCase):
 def _stub_modules():
     """Fake third-party/network modules so tweet scripts import without side effects."""
     stubs = {}
-    for name in ("tweepy", "requests", "requests_oauthlib", "tweet_guard"):
+    for name in ("tweepy", "requests", "requests_oauthlib", "tweet_guard", "tweet_note"):
         stubs[name] = types.ModuleType(name)
     stubs["requests_oauthlib"].OAuth1 = object
     stubs["tweet_guard"].enforce = lambda *a, **k: None

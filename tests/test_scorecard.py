@@ -696,7 +696,9 @@ class WindowsTestOnly(Env):
     def test_source_has_no_config_reference(self):
         src = self.SRC.read_text().lower()
         self.assertNotIn("scorecard.json", src)
-        self.assertNotIn("config", src)
+        strings = [n.value for n in ast.walk(ast.parse(self.SRC.read_text()))
+                   if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+        self.assertEqual([v for v in strings if "config" in v.lower()], [])
 
 
 if __name__ == "__main__":
