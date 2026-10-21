@@ -22,6 +22,7 @@ import pandas as pd
 # Ensure src is on path
 if str(Path(__file__).parent.parent / "src") not in sys.path:
     sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+from live_duckdb_writes import insert_new_live_waits, replace_data_freshness
 from utils import get_output_base
 from utils.park_code import park_code_sql
 
@@ -176,18 +177,16 @@ def init(db_path: Path, output_base: Path, logger) -> bool:
             csv_pattern = str(staging_dir / "**" / "*.csv").replace("\\", "/")
             logger.info(f"Backfilling live_waits from {len(csv_files)} CSV files...")
             try:
-                con.execute(f"""
-                    INSERT OR IGNORE INTO live_waits 
-                        (entity_code, observed_at, wait_time_type, wait_time_minutes, park_date)
-                    SELECT 
+                insert_new_live_waits(con, f"""
+                    SELECT
                         entity_code,
-                        observed_at::TIMESTAMPTZ,
-                        COALESCE(wait_time_type, 'POSTED'),
-                        wait_time_minutes::INTEGER,
-                        observed_at::DATE
+                        observed_at,
+                        COALESCE(wait_time_type, 'POSTED') AS wait_time_type,
+                        wait_time_minutes,
+                        TRY_CAST(observed_at AS DATE) AS park_date
                     FROM read_csv_auto('{csv_pattern}')
                     WHERE wait_time_minutes > 0
-                """)
+                """, logger=logger)
                 n = con.execute("SELECT COUNT(*) FROM live_waits").fetchone()[0]
                 logger.info(f"  live_waits: {n:,} rows")
             except Exception as e:
@@ -305,23 +304,12 @@ def init(db_path: Path, output_base: Path, logger) -> bool:
         logger.info("  forecasts: parquet not found (skipped)")
 
     # --- Initial data_freshness ---
-    con.execute("""
-        INSERT OR REPLACE INTO data_freshness (source, last_updated, row_count, notes)
-        SELECT 'scraper', COALESCE(MAX(inserted_at), CURRENT_TIMESTAMP), COUNT(*), 'init'
-        FROM live_waits
-    """)
-    con.execute("""
-        INSERT OR REPLACE INTO data_freshness (source, last_updated, row_count, notes)
-        SELECT 'wti', CURRENT_TIMESTAMP, (SELECT COUNT(*) FROM wti), 'init'
-    """)
-    con.execute("""
-        INSERT OR REPLACE INTO data_freshness (source, last_updated, row_count, notes)
-        SELECT 'forecasts', CURRENT_TIMESTAMP, (SELECT COUNT(*) FROM forecasts), 'init'
-    """)
-    con.execute("""
-        INSERT OR REPLACE INTO data_freshness (source, last_updated, row_count, notes)
-        SELECT 'entities', CURRENT_TIMESTAMP, (SELECT COUNT(*) FROM entities), 'init'
-    """)
+    replace_data_freshness(
+        con, "scraper", "init", count_table="live_waits", last_updated_column="inserted_at"
+    )
+    replace_data_freshness(con, "wti", "init", count_table="wti")
+    replace_data_freshness(con, "forecasts", "init", count_table="forecasts")
+    replace_data_freshness(con, "entities", "init", count_table="entities")
 
     con.close()
 

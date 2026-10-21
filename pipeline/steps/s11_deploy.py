@@ -13,6 +13,7 @@ import pandas as pd
 from pipeline.config import PipelineConfig
 from pipeline.core.db import write_connection
 from pipeline.core.logging import PipelineLogger
+from src.live_duckdb_writes import replace_data_freshness
 
 
 def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
@@ -47,10 +48,7 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
                            COALESCE(source, 'forecast'), CURRENT_TIMESTAMP
                     FROM _wti
                 """)
-                con.execute("""
-                    INSERT OR REPLACE INTO data_freshness (source, last_updated, row_count, notes)
-                    VALUES ('wti', CURRENT_TIMESTAMP, (SELECT COUNT(*) FROM wti), 'pipeline')
-                """)
+                replace_data_freshness(con, "wti", "pipeline", count_table="wti")
             log.info(f"WTI deployed: {len(wti_df):,} rows")
     else:
         log.warning("No WTI file to deploy")
@@ -84,10 +82,7 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
                            CURRENT_TIMESTAMP
                     FROM _fc
                 """)
-                con.execute("""
-                    INSERT OR REPLACE INTO data_freshness (source, last_updated, row_count, notes)
-                    VALUES ('forecasts', CURRENT_TIMESTAMP, (SELECT COUNT(*) FROM forecasts), 'pipeline')
-                """)
+                replace_data_freshness(con, "forecasts", "pipeline", count_table="forecasts")
             log.info(f"Forecasts deployed: {len(fc_df):,} rows")
             del fc_df
     else:
