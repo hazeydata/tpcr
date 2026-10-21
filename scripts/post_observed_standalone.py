@@ -24,6 +24,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+WDW_PARK_CODES = ("MK", "EP", "HS", "AK")
+
+
+def _wdw_parks(content: dict) -> list:
+    """Step 14 emits all parks; these tweets cover Walt Disney World only."""
+    return [p for p in content.get("parks", []) if p.get("park_code") in WDW_PARK_CODES]
+
+
 def load_content_json(target_date: str) -> dict | None:
     """Load and validate observed content JSON."""
     content_file = CONTENT_DIR / f"observed_{target_date}.json"
@@ -128,7 +136,7 @@ def main():
         
         # Print summary of posted data
         logger.info("Posted WTI data:")
-        for park in content.get("parks", []):
+        for park in _wdw_parks(content):
             logger.info(f"  {park['park_name']}: {park['wti']}")
             
     else:

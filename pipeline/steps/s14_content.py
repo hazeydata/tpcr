@@ -4,8 +4,8 @@ Generates Twitter content JSONs for WTI predictions and observations.
 Includes quality gate that validates data before marking content "ready".
 
 Workflow:
-1. Extract predicted WTI for tomorrow (WDW 4 parks)
-2. Extract observed WTI for yesterday (WDW 4 parks)
+1. Extract predicted WTI for tomorrow (all configured parks)
+2. Extract observed WTI for yesterday (all configured parks)
 3. Run quality gate on both datasets (5 checks)
 4. Write content JSONs with status: "ready" or "held"
 5. Post Discord warnings for held content
@@ -29,12 +29,29 @@ from pipeline.core.db import read_connection
 from pipeline.core.logging import PipelineLogger
 
 
-# WDW park configuration
-WDW_PARKS = {
+# Display names for every park in cfg.parks (fallback to the park code)
+PARK_NAMES = {
     "MK": "Magic Kingdom",
-    "EP": "EPCOT", 
+    "EP": "EPCOT",
     "HS": "Hollywood Studios",
-    "AK": "Animal Kingdom"
+    "AK": "Animal Kingdom",
+    "DL": "Disneyland",
+    "CA": "Disney California Adventure",
+    "UF": "Universal Studios Florida",
+    "IA": "Islands of Adventure",
+    "EU": "Epic Universe",
+    "UH": "Universal Studios Hollywood",
+    "TDL": "Tokyo Disneyland",
+    "TDS": "Tokyo DisneySea",
+}
+
+# Resort groups used by the peer-outlier check (parks are compared within a resort only)
+RESORT_GROUPS = {
+    "WDW": ["MK", "EP", "HS", "AK"],
+    "DLR": ["DL", "CA"],
+    "UOR": ["UF", "IA", "EU"],
+    "UH": ["UH"],
+    "TDR": ["TDL", "TDS"],
 }
 
 # Quality gate thresholds (relaxed 2026-03-30 — Barney directive)
@@ -45,14 +62,30 @@ PEER_OUTLIER_THRESHOLD = 0.90  # 90% (was 60%)
 DAY_JUMP_THRESHOLD = 25.0      # 25 WTI points (was 15)
 
 
+def _active_parks(cfg: PipelineConfig) -> List[str]:
+    """Parks to report on, in cfg.parks order, excluding cfg.ignore_parks."""
+    ignored = set(cfg.ignore_parks)
+    return [p for p in cfg.parks if p not in ignored]
+
+
+def _sql_in_list(codes: List[str]) -> str:
+    """Build a safely quoted SQL IN list body from park codes."""
+    return ", ".join("'" + str(c).replace("'", "''") + "'" for c in codes)
+
+
 def _extract_wti_data(cfg: PipelineConfig, log: PipelineLogger, target_date: str, source: str) -> Dict[str, float] | None:
-    """Extract WTI data for WDW parks on target date."""
+    """Extract WTI data for all configured parks on target date."""
     wti_path = cfg.wti_dir / "wti.parquet"
     
     if not wti_path.exists():
         log.error(f"WTI file not found: {wti_path}")
         return None
     
+    parks = _active_parks(cfg)
+    if not parks:
+        log.error("No parks configured for content generation")
+        return None
+
     try:
         with read_connection() as con:
             query = f"""
@@ -60,7 +93,7 @@ def _extract_wti_data(cfg: PipelineConfig, log: PipelineLogger, target_date: str
                 FROM read_parquet('{wti_path}')
                 WHERE park_date::DATE = '{target_date}'::DATE
                 AND source = '{source}'
-                AND park_code IN ('MK', 'EP', 'HS', 'AK')
+                AND park_code IN ({_sql_in_list(parks)})
             """
             df = con.execute(query).df()
             
@@ -79,18 +112,14 @@ def _extract_wti_data(cfg: PipelineConfig, log: PipelineLogger, target_date: str
         return None
 
 
-def _check_completeness(wti_data: Dict[str, float]) -> List[str]:
-    """Check 1: All 4 WDW parks must be present."""
+def _check_completeness(wti_data: Dict[str, float], cfg: PipelineConfig) -> List[str]:
+    """Check 1: Every configured park must be present."""
     failures = []
-    missing_parks = []
-    
-    for park_code in WDW_PARKS.keys():
+
+    for park_code in _active_parks(cfg):
         if park_code not in wti_data or wti_data[park_code] is None:
-            missing_parks.append(park_code)
-    
-    if missing_parks:
-        failures.append(f"INCOMPLETE: Missing parks: {missing_parks}")
-    
+            failures.append(f"INCOMPLETE: {park_code} missing")
+
     return failures
 
 
@@ -105,27 +134,38 @@ def _check_absolute_bounds(wti_data: Dict[str, float]) -> List[str]:
     return failures
 
 
+def _resort_of(park_code: str) -> str | None:
+    for resort, codes in RESORT_GROUPS.items():
+        if park_code in codes:
+            return resort
+    return None
+
+
 def _check_peer_outlier(wti_data: Dict[str, float]) -> List[str]:
-    """Check 3: No park should deviate >90% from peer mean."""
+    """Check 3: No park should deviate >90% from the mean of its resort peers."""
     failures = []
     
-    if len(wti_data) < 4:
-        return failures  # Skip if incomplete data
-    
     for park_code, wti in wti_data.items():
-        # Calculate mean of the other 3 parks
-        other_wtis = [v for k, v in wti_data.items() if k != park_code]
-        if len(other_wtis) < 3:
+        resort = _resort_of(park_code)
+        if resort is None:
             continue
+        other_wtis = [
+            wti_data[k] for k in RESORT_GROUPS[resort]
+            if k != park_code and wti_data.get(k) is not None
+        ]
+        if not other_wtis:
+            continue  # No peers in this resort
         
         peer_mean = sum(other_wtis) / len(other_wtis)
+        if peer_mean <= 0:
+            continue
         deviation = abs(wti - peer_mean) / peer_mean
         
         if deviation > PEER_OUTLIER_THRESHOLD:
             direction = "below" if wti < peer_mean else "above"
             failures.append(
                 f"PEER_OUTLIER: {park_code} wti {wti} is {deviation:.0%} {direction} "
-                f"peer mean {peer_mean:.1f} (threshold: {PEER_OUTLIER_THRESHOLD:.0%})"
+                f"{resort} peer mean {peer_mean:.1f} (threshold: {PEER_OUTLIER_THRESHOLD:.0%})"
             )
     
     return failures
@@ -196,12 +236,37 @@ def _check_staleness(cfg: PipelineConfig, run_date: str) -> List[str]:
     return failures
 
 
-def _run_quality_gate(wti_data: Dict[str, float], cfg: PipelineConfig, target_date: str, is_predicted: bool, run_date: str) -> Tuple[bool, List[str]]:
-    """Run all quality gate checks. Returns (passed, failure_reasons)."""
+def _failure_park(failure: str) -> str | None:
+    """Park code a per-park failure refers to ("KIND: PARK ..."), or None if global."""
+    kind, _, rest = failure.partition(": ")
+    if kind not in ("INCOMPLETE", "OUT_OF_BOUNDS", "PEER_OUTLIER", "DAY_JUMP") or not rest:
+        return None
+    return rest.split()[0]
+
+
+def _split_failures(failures: List[str]) -> Tuple[List[str], List[str]]:
+    """Split failures into (blocking, warnings). Only WDW or global failures block."""
+    wdw = set(RESORT_GROUPS["WDW"])
+    blocking, warnings = [], []
+    for failure in failures:
+        park = _failure_park(failure)
+        if park is not None and park not in wdw:
+            warnings.append(failure)
+        else:
+            blocking.append(failure)
+    return blocking, warnings
+
+
+def _run_quality_gate(wti_data: Dict[str, float], cfg: PipelineConfig, target_date: str, is_predicted: bool, run_date: str) -> Tuple[bool, List[str], List[str]]:
+    """Run all quality gate checks. Returns (passed, blocking_failures, warnings).
+
+    Only WDW park failures (and global ones like staleness) block; failures
+    for other parks are returned as warnings.
+    """
     failures = []
     
     # Check 1: Completeness
-    failures.extend(_check_completeness(wti_data))
+    failures.extend(_check_completeness(wti_data, cfg))
     
     # Check 2: Absolute bounds
     failures.extend(_check_absolute_bounds(wti_data))
@@ -216,19 +281,20 @@ def _run_quality_gate(wti_data: Dict[str, float], cfg: PipelineConfig, target_da
     # Check 5: Staleness
     failures.extend(_check_staleness(cfg, run_date))
     
-    passed = len(failures) == 0
-    return passed, failures
+    blocking, warnings = _split_failures(failures)
+    return len(blocking) == 0, blocking, warnings
 
 
 def _create_content_json(content_type: str, target_date: str, wti_data: Dict[str, float], 
-                        status: str, held_reasons: List[str], run_time: str) -> Dict[str, Any]:
+                        status: str, held_reasons: List[str], run_time: str,
+                        cfg: PipelineConfig, warnings: List[str] | None = None) -> Dict[str, Any]:
     """Create the content JSON structure."""
     parks_data = []
-    for park_code in ["MK", "EP", "HS", "AK"]:  # Consistent ordering
+    for park_code in _active_parks(cfg):  # Consistent ordering (cfg.parks order)
         if park_code in wti_data:
             parks_data.append({
                 "park_code": park_code,
-                "park_name": WDW_PARKS[park_code],
+                "park_name": PARK_NAMES.get(park_code, park_code),
                 "wti": round(wti_data[park_code], 1)
             })
     
@@ -236,6 +302,7 @@ def _create_content_json(content_type: str, target_date: str, wti_data: Dict[str
         "type": content_type,
         "status": status,
         "held_reasons": held_reasons,
+        "warnings": warnings or [],
         "target_date": target_date,
         "generated_at": run_time,
         "generated_by": "s14_content v1.1",
@@ -281,14 +348,14 @@ def run(cfg: PipelineConfig, log: PipelineLogger):
     
     if predicted_wti:
         # Run quality gate
-        passed, failures = _run_quality_gate(predicted_wti, cfg, tomorrow, is_predicted=True, run_date=run_date)
+        passed, failures, warnings = _run_quality_gate(predicted_wti, cfg, tomorrow, is_predicted=True, run_date=run_date)
         status = "ready" if passed else "held"
         
         if not passed:
             _post_discord_warning(cfg, log, "predicted", tomorrow, failures)
         
         # Create JSON
-        content_json = _create_content_json("predicted", tomorrow, predicted_wti, status, failures, run_time)
+        content_json = _create_content_json("predicted", tomorrow, predicted_wti, status, failures, run_time, cfg, warnings)
         
         # Write file
         output_file = content_dir / f"predicted_{tomorrow}.json"
@@ -298,6 +365,8 @@ def run(cfg: PipelineConfig, log: PipelineLogger):
         log.info(f"Predicted content for {tomorrow}: {status} ({len(predicted_wti)} parks)")
         if failures:
             log.warning(f"Predicted quality gate failures: {'; '.join(failures)}")
+        if warnings:
+            log.warning(f"Predicted quality gate warnings (non-WDW, not held): {'; '.join(warnings)}")
     
     else:
         log.error(f"No predicted WTI data available for {tomorrow}")
@@ -308,14 +377,14 @@ def run(cfg: PipelineConfig, log: PipelineLogger):
     
     if observed_wti:
         # Run quality gate (not predicted, so no day-jump check)
-        passed, failures = _run_quality_gate(observed_wti, cfg, yesterday, is_predicted=False, run_date=run_date)
+        passed, failures, warnings = _run_quality_gate(observed_wti, cfg, yesterday, is_predicted=False, run_date=run_date)
         status = "ready" if passed else "held"
         
         if not passed:
             _post_discord_warning(cfg, log, "observed", yesterday, failures)
         
         # Create JSON
-        content_json = _create_content_json("observed", yesterday, observed_wti, status, failures, run_time)
+        content_json = _create_content_json("observed", yesterday, observed_wti, status, failures, run_time, cfg, warnings)
         
         # Write file
         output_file = content_dir / f"observed_{yesterday}.json"
@@ -325,6 +394,8 @@ def run(cfg: PipelineConfig, log: PipelineLogger):
         log.info(f"Observed content for {yesterday}: {status} ({len(observed_wti)} parks)")
         if failures:
             log.warning(f"Observed quality gate failures: {'; '.join(failures)}")
+        if warnings:
+            log.warning(f"Observed quality gate warnings (non-WDW, not held): {'; '.join(warnings)}")
     
     else:
         log.warning(f"No observed WTI data available for {yesterday}")
