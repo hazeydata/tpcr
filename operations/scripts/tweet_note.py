@@ -1,5 +1,9 @@
+import fcntl
+import hashlib
 import json
 import os
+import sys
+from contextlib import contextmanager
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -47,7 +51,24 @@ def cap(lines, limit=280):
     lines = list(lines)
     while lines and len("\n".join(lines)) > limit:
         lines.pop()
+    if not lines:
+        print(f"ERROR: note_too_long: no note line fits in {limit} characters", file=sys.stderr)
+        return None
     return "\n".join(lines)
+
+
+def digest(text, in_reply_to):
+    return hashlib.sha256((text + in_reply_to).encode()).hexdigest()
+
+
+@contextmanager
+def locked(state_file):
+    with open(f"{state_file}.lock", "a") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
 
 
 def _load(state_file):
@@ -55,28 +76,56 @@ def _load(state_file):
     return json.loads(p.read_text()) if p.exists() else {}
 
 
+def _save(state_file, state):
+    tmp = Path(f"{state_file}.tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    os.replace(tmp, state_file)
+
+
 def save_draft(state_file, reference_date, in_reply_to, text):
-    state = _load(state_file)
-    drafts = state.setdefault("note_drafts", {})
-    if reference_date in drafts:
+    if not in_reply_to or not text:
+        print(f"ERROR: note draft for {reference_date} needs text and in_reply_to", file=sys.stderr)
+        return None
+    with locked(state_file):
+        state = _load(state_file)
+        drafts = state.setdefault("note_drafts", {})
+        if reference_date in drafts:
+            return drafts[reference_date]
+        drafts[reference_date] = {"text": text, "in_reply_to": in_reply_to, "sha256": digest(text, in_reply_to), "status": "draft"}
+        _save(state_file, state)
         return drafts[reference_date]
-    drafts[reference_date] = {"text": text, "in_reply_to": in_reply_to, "status": "draft"}
-    Path(state_file).write_text(json.dumps(state, indent=2))
-    return drafts[reference_date]
+
+
+def refusal(d, reference_date):
+    if not d:
+        return f"no note draft for {reference_date}"
+    if d.get("status") in ("posting", "unknown"):
+        return f"note draft for {reference_date} is {d.get('status')!r}: check X manually for a reply under tweet {d.get('in_reply_to')} before doing anything"
+    if d.get("status") != "draft":
+        return f"note draft for {reference_date} is {d.get('status')!r}, not 'draft'"
+    if not isinstance(d.get("in_reply_to"), str) or not d["in_reply_to"]:
+        return f"note draft for {reference_date} has no in_reply_to; refusing to post standalone"
+    if not isinstance(d.get("text"), str) or d.get("sha256") != digest(d["text"], d["in_reply_to"]):
+        return f"note draft for {reference_date} failed its integrity check"
+    return None
 
 
 def approve(state_file, reference_date, post):
-    state = _load(state_file)
-    d = state.get("note_drafts", {}).get(reference_date)
-    if not d or d["status"] != "draft":
-        print(f"no pending note draft for {reference_date}")
-        return None
-    d["status"] = "posting"
-    Path(state_file).write_text(json.dumps(state, indent=2))
-    tweet_id = post(d["text"], reply_to=d["in_reply_to"])
-    d["status"], d["tweet_id"] = ("posted", tweet_id) if tweet_id else ("draft", None)
-    Path(state_file).write_text(json.dumps(state, indent=2))
-    return tweet_id
+    with locked(state_file):
+        state = _load(state_file)
+        d = state.get("note_drafts", {}).get(reference_date)
+        why = refusal(d, reference_date)
+        if why:
+            print(f"REFUSED: {why}", file=sys.stderr)
+            return None
+        d["status"] = "posting"
+        _save(state_file, state)
+        tweet_id = post(d["text"], reply_to=d["in_reply_to"])
+        d["status"], d["tweet_id"] = ("posted", tweet_id) if tweet_id else ("unknown", None)
+        _save(state_file, state)
+        if not tweet_id:
+            print(f"REFUSED: {refusal(d, reference_date)}", file=sys.stderr)
+        return tweet_id
 
 
 def main(argv):
@@ -89,5 +138,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    import sys
     sys.exit(main(sys.argv[1:]))

@@ -1,3 +1,4 @@
+import hashlib
 import io
 import json
 import os
@@ -5,6 +6,8 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from datetime import date, timedelta
@@ -431,7 +434,11 @@ class PhaseG(Env):
         self.assertLessEqual(len(text), 280)
         self.assertEqual(text, "\n".join(lines[:len(text.split("\n"))]))
         self.assertEqual(tweet_note.cap(lines), text)
-        self.assertEqual(tweet_note.cap(["x" * 281]), "")
+        self.assertEqual(tweet_note.cap(["x" * 140, "y" * 139]), "x" * 140 + "\n" + "y" * 139)
+        self.assertEqual(tweet_note.cap(["x" * 140, "y" * 140, "z"]), "x" * 140)
+        with mock.patch("sys.stderr", new=io.StringIO()) as err:
+            self.assertIsNone(tweet_note.cap(["x" * 281, "y"]))
+        self.assertIn("note_too_long", err.getvalue())
 
     def run_forecast(self, status):
         self.out.mkdir(exist_ok=True)
@@ -452,25 +459,92 @@ class PhaseG(Env):
         post, state = self.run_forecast(systematic(("AK", "high")))
         post.assert_called_once_with(MAIN_FORECAST_TEXT, media_id=None)
         draft = json.loads(state.read_text())["note_drafts"]["2026-10-13"]
-        self.assertEqual(draft, {"text": "Note: our Animal Kingdom forecasts have been running high lately. We're working on it.",
-                                 "in_reply_to": "111", "status": "draft"})
+        text = "Note: our Animal Kingdom forecasts have been running high lately. We're working on it."
+        self.assertEqual(draft, {"text": text, "in_reply_to": "111", "status": "draft",
+                                 "sha256": hashlib.sha256((text + "111").encode()).hexdigest()})
         _, state = self.run_forecast(systematic())
         self.assertNotIn("note_drafts", json.loads(state.read_text()))
 
     def test_ac24_approve_posts_once(self):
         post, state = self.run_forecast(systematic(("AK", "high")))
         reply = mock.Mock(return_value="222")
-        with redirect_stdout(io.StringIO()):
+        with mock.patch("sys.stderr", new=io.StringIO()):
             self.assertEqual(tweet_note.approve(state, "2026-10-13", reply), "222")
             self.assertIsNone(tweet_note.approve(state, "2026-10-13", reply))
             self.assertIsNone(tweet_note.approve(state, "2026-10-14", reply))
-        reply.assert_called_once_with(json.loads(state.read_text())["note_drafts"]["2026-10-13"]["text"], reply_to="111")
-        self.assertEqual(json.loads(state.read_text())["note_drafts"]["2026-10-13"]["status"], "posted")
-        failed = mock.Mock(return_value=None)
-        tweet_note.save_draft(state, "2026-10-15", "333", "n")
-        with redirect_stdout(io.StringIO()):
-            self.assertIsNone(tweet_note.approve(state, "2026-10-15", failed))
-        self.assertEqual(json.loads(state.read_text())["note_drafts"]["2026-10-15"]["status"], "draft")
+        reply.assert_called_once_with(self.draft(state)["text"], reply_to="111")
+        self.assertEqual(self.draft(state)["status"], "posted")
+        state = self.fresh()
+        with mock.patch("os.replace", wraps=os.replace) as rep, mock.patch("sys.stderr", new=io.StringIO()):
+            tweet_note.approve(state, "2026-10-13", reply)
+        self.assertEqual(rep.call_args_list[-1].args, (Path(f"{state}.tmp"), state))
+        self.assertFalse(Path(f"{state}.tmp").exists())
+
+    def draft(self, state, day="2026-10-13"):
+        return json.loads(Path(state).read_text())["note_drafts"][day]
+
+    def fresh(self, text="n", reply_to="111"):
+        state = Path(tempfile.mkdtemp(dir=self.tmp)) / "tweet_state.json"
+        tweet_note.save_draft(state, "2026-10-13", reply_to, text)
+        return state
+
+    def refused(self, state, post):
+        with mock.patch("sys.stderr", new=io.StringIO()) as err:
+            self.assertIsNone(tweet_note.approve(state, "2026-10-13", post))
+        return err.getvalue()
+
+    def test_ac24_concurrent_approve_posts_once(self):
+        state = self.fresh()
+        barrier = threading.Barrier(4)
+        post = mock.Mock(return_value="222")
+
+        def go():
+            barrier.wait()
+            tweet_note.approve(state, "2026-10-13", post)
+
+        real_load = tweet_note._load
+        slow = lambda f: (real_load(f), time.sleep(0.2))[0]
+        with mock.patch("sys.stderr", new=io.StringIO()), mock.patch.object(tweet_note, "_load", slow):
+            ts = [threading.Thread(target=go) for _ in range(4)]
+            [t.start() for t in ts]
+            [t.join() for t in ts]
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(self.draft(state)["status"], "posted")
+
+    def test_ac24_tampered_or_missing_reply_refused(self):
+        post = mock.Mock(return_value="222")
+        state = self.fresh()
+        st = json.loads(state.read_text())
+        st["note_drafts"]["2026-10-13"]["text"] = "tampered"
+        state.write_text(json.dumps(st))
+        self.assertIn("integrity", self.refused(state, post))
+        for bad in (None, "", "drop"):
+            state = self.fresh()
+            st = json.loads(state.read_text())
+            d = st["note_drafts"]["2026-10-13"]
+            d.pop("in_reply_to") if bad == "drop" else d.update(in_reply_to=bad)
+            state.write_text(json.dumps(st))
+            self.assertIn("standalone", self.refused(state, post))
+        for bad in (None, ""):
+            with mock.patch("sys.stderr", new=io.StringIO()):
+                self.assertIsNone(tweet_note.save_draft(self.tmp / "x.json", "2026-10-13", bad, "n"))
+        self.assertFalse((self.tmp / "x.json").exists())
+        post.assert_not_called()
+
+    def test_ac24_crash_or_unknown_needs_human(self):
+        state = self.fresh()
+        with self.assertRaises(RuntimeError):
+            tweet_note.approve(state, "2026-10-13", mock.Mock(side_effect=RuntimeError("crash")))
+        self.assertEqual(self.draft(state)["status"], "posting")
+        post = mock.Mock(return_value="222")
+        self.assertIn("check X manually", self.refused(state, post))
+        state = self.fresh()
+        none = mock.Mock(return_value=None)
+        self.assertIn("check X manually", self.refused(state, none))
+        self.assertEqual(self.draft(state)["status"], "unknown")
+        self.assertIn("check X manually", self.refused(state, post))
+        none.assert_called_once()
+        post.assert_not_called()
 
     def test_ac25_final_wording(self):
         for v, tail in (("standard", "We're working on it."), ("campy", "The bot team is working on it.")):
