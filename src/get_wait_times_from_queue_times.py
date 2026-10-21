@@ -202,6 +202,7 @@ def _write_to_live_duckdb(
         return False
 
     # Prepare data
+    raw_count = len(df)
     try:
         df = df.copy()
         df["park_date"] = derive_park_date(df["observed_at"], park_tz)
@@ -235,9 +236,10 @@ def _write_to_live_duckdb(
             )
             if result.returncode == 0 and "OK" in result.stdout:
                 m = re.search(r"DROPPED:(\d+)", result.stdout)
-                if m and int(m.group(1)) > 0:
+                total_dropped = (raw_count - len(df)) + (int(m.group(1)) if m else 0)
+                if total_dropped > 0:
                     logger.warning(
-                        f"live_waits: dropped {m.group(1)} row(s) with NULL/empty "
+                        f"live_waits: dropped {total_dropped} row(s) with NULL/empty "
                         "entity_code, observed_at or wait_time_type"
                     )
                 logger.debug(f"Wrote {len(df)} rows to live_waits (subprocess)")

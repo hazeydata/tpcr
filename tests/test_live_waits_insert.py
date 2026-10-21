@@ -184,6 +184,13 @@ class _Base:
         self.assertEqual(dropped, 0)
         self.assertEqual(self.query("SELECT wait_time_minutes FROM live_waits"), [(10,)])
 
+    def test_duplicate_keys_in_batch_keep_highest_wait(self):
+        self.insert_csv([
+            ("MK01", T1, "POSTED", 30, "2024-01-15"),
+            ("MK01", T1, "POSTED", 50, "2024-01-15"),
+        ])
+        self.assertEqual(self.query("SELECT wait_time_minutes FROM live_waits"), [(50,)])
+
     def test_existence_check_uses_full_key(self):
         """A row sharing only part of the key with an existing row is still new."""
         self.seed_state()  # (MK01, T1, POSTED)
@@ -261,6 +268,25 @@ class _Base:
         with self.assertLogs(LOGGER, level="WARNING"):
             self.assertTrue(self.write(df))
         self.assertEqual(self.counts(), (2, 0, 1))
+
+    def test_scraper_path_counts_every_dropped_row(self):
+        """Bad observed_at is dropped in Python, the rest by the helper; all 5 are logged."""
+        def lenient_park_date(series, tz):
+            return pd.to_datetime(series, utc=True, errors="coerce").dt.tz_convert(tz).dt.date
+
+        df = _df([
+            ("MK01", T1, "POSTED", 30),
+            ("MK02", "not-a-date", "POSTED", 31),
+            (None, T1, "POSTED", 32),
+            ("", T1, "POSTED", 33),
+            ("MK03", T1, None, 34),
+            ("MK04", T1, "", 35),
+        ])
+        with mock.patch.object(qt, "derive_park_date", lenient_park_date):
+            with self.assertLogs(LOGGER, level="WARNING") as cm:
+                self.assertTrue(self.write(df))
+        self.assertTrue(any("dropped 5" in m for m in cm.output))
+        self.assertEqual(self.counts()[0], 1)
 
     # -- atomicity -----------------------------------------------------------
     def _batch_csv(self):
