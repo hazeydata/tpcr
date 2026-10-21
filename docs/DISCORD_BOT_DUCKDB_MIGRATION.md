@@ -255,6 +255,8 @@ cp ~/tpcr-discord-bot/daily_report.py ~/theme-park-crowd-report/tpcr-discord-bot
 
 # Historical (Wilma, systemd user service). The bot now runs on the Mac Mini under
 # launchd (com.hazeydata.tpcr-bot); see tpcr-discord-bot/README.md "Host".
+# Unit name and level here are historical and not live-verified; to disable the
+# old Wilma bot, follow the rule in tpcr-discord-bot/README.md (steps 1-2).
 # Update systemd service to point to new location
 # ExecStart: WorkingDirectory=/home/wilma/theme-park-crowd-report/tpcr-discord-bot
 ```
@@ -431,7 +433,7 @@ db = duckdb.connect(DUCKDB_PATH, read_only=True)
 | `tpcr-discord-bot/forecast_image.py` | **MOVE** | Same |
 | `tpcr-discord-bot/daily_report.py` | **MOVE** | Same |
 | `dashboard/api.py` | **MODIFY** | Replace file reads with DuckDB |
-| `/etc/systemd/system/tpcr-discord-bot.service` | **MODIFY** | Update WorkingDirectory |
+| `/etc/systemd/system/tpcr-discord-bot.service` | **MODIFY** | Update WorkingDirectory (historical: Wilma; name and level not live-verified, see `tpcr-discord-bot/README.md` steps 1-2) |
 | `/etc/systemd/system/queue-times-loop-wilma.service` | No change | Already points to main repo (historical: Wilma host, not the current bot host) |
 
 ---
