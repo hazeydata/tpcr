@@ -253,6 +253,8 @@ cp ~/tpcr-discord-bot/bot.py ~/theme-park-crowd-report/tpcr-discord-bot/bot.py
 cp ~/tpcr-discord-bot/forecast_image.py ~/theme-park-crowd-report/tpcr-discord-bot/forecast_image.py
 cp ~/tpcr-discord-bot/daily_report.py ~/theme-park-crowd-report/tpcr-discord-bot/daily_report.py
 
+# Historical (Wilma, systemd user service). The bot now runs on the Mac Mini under
+# launchd (com.hazeydata.tpcr-bot); see tpcr-discord-bot/README.md "Host".
 # Update systemd service to point to new location
 # ExecStart: WorkingDirectory=/home/wilma/theme-park-crowd-report/tpcr-discord-bot
 ```
@@ -392,7 +394,7 @@ db = duckdb.connect(DUCKDB_PATH, read_only=True)
 ## Migration Steps (Execution Order)
 
 1. **[x] Create init script** — `scripts/init_live_duckdb.py` (schema + backfill)
-2. **[ ] Run init** — creates DuckDB with all existing data (run on wilma-server after pipeline)
+2. **[ ] Run init** — creates DuckDB with all existing data (run on wilma-server after pipeline) _(historical: Wilma host; the bot now runs on the Mac Mini under launchd `com.hazeydata.tpcr-bot`)_
 3. **[x] Update scraper** — dual-write (CSV + DuckDB) for safety
 4. **[ ] Verify** — check DuckDB has fresh data after a few scraper cycles
 5. **[x] Update pipeline** — WTI, forecasts, entities write to DuckDB after parquet
@@ -430,7 +432,7 @@ db = duckdb.connect(DUCKDB_PATH, read_only=True)
 | `tpcr-discord-bot/daily_report.py` | **MOVE** | Same |
 | `dashboard/api.py` | **MODIFY** | Replace file reads with DuckDB |
 | `/etc/systemd/system/tpcr-discord-bot.service` | **MODIFY** | Update WorkingDirectory |
-| `/etc/systemd/system/queue-times-loop-wilma.service` | No change | Already points to main repo |
+| `/etc/systemd/system/queue-times-loop-wilma.service` | No change | Already points to main repo (historical: Wilma host, not the current bot host) |
 
 ---
 
