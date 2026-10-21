@@ -32,3 +32,6 @@ dash-auth>=2.0.0
 
 # RAM detection for training parallelism (train_batch_entities --workers 0)
 psutil>=5.9.0
+
+# Async HTTP client for local Qwen server (/ask)
+httpx>=0.27.0

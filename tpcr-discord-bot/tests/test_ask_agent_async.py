@@ -37,35 +37,26 @@ def test_ask_agent_contains_await_expressions():
     pytest.fail("ask_agent async function not found in ask_agent.py")
 
 
-def test_ask_agent_uses_async_anthropic_client():
-    """Must use AsyncAnthropic, not the sync Anthropic client."""
+def test_ask_agent_uses_async_http_client():
+    """Must use the async httpx client, not a blocking one."""
     agent_path = Path(__file__).parent.parent / "ask_agent.py"
     source = agent_path.read_text()
 
-    assert "AsyncAnthropic" in source, (
-        "ask_agent should use anthropic.AsyncAnthropic for non-blocking API calls"
+    assert "httpx.AsyncClient" in source, (
+        "ask_agent should use httpx.AsyncClient for non-blocking API calls"
     )
+    assert "anthropic" not in source
 
 
 def test_ask_agent_does_not_block_event_loop():
     """Simulate ask_agent and verify the event loop remains responsive."""
-    import anthropic
 
-    mock_text_block = MagicMock()
-    mock_text_block.type = "text"
-    mock_text_block.text = "Magic Kingdom is expected to be moderately busy."
-
-    mock_response = MagicMock()
-    mock_response.stop_reason = "end_of_turn"
-    mock_response.content = [mock_text_block]
-
-    async def fake_create(**kwargs):
+    async def fake_post_chat(payload):
         await asyncio.sleep(0.05)
-        return mock_response
-
-    mock_client_instance = MagicMock()
-    mock_client_instance.messages = MagicMock()
-    mock_client_instance.messages.create = fake_create
+        return {"choices": [{"message": {
+            "role": "assistant",
+            "content": "Magic Kingdom is expected to be moderately busy.",
+        }}]}
 
     heartbeat_count = 0
 
@@ -79,17 +70,14 @@ def test_ask_agent_does_not_block_event_loop():
         nonlocal heartbeat_count
         heartbeat_task = asyncio.create_task(heartbeat())
 
-        with patch("ask_agent.anthropic") as mock_anthropic, \
+        with patch("ask_agent._post_chat", fake_post_chat), \
              patch("ask_agent.track_usage", return_value=(1, -1)), \
              patch("ask_agent.log_question"):
-
-            mock_anthropic.AsyncAnthropic.return_value = mock_client_instance
 
             from ask_agent import ask_agent
             answer = await ask_agent(
                 "How busy is MK tomorrow?",
                 "user123",
-                "fake-api-key",
                 username="testuser",
             )
 
