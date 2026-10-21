@@ -1,14 +1,17 @@
 """
 Ask Agent — AI-powered natural language query engine for TPCR Discord bot.
 
-Uses Anthropic Claude with DuckDB tool access to answer
+Uses a local OpenAI-compatible Qwen server (mlx_lm) with DuckDB tool access to answer
 theme park wait time questions from Discord users.
 """
 
 import asyncio
 import json
+import logging
+import os
+import re
 import duckdb
-import anthropic
+import httpx
 from datetime import datetime, date
 from pathlib import Path
 from typing import Optional
@@ -300,82 +303,226 @@ def run_duckdb_query(sql: str, max_retries: int = 8) -> str:
     return "Our database is momentarily busy — try your question again in a minute! The data refreshes constantly and things should clear up quickly. 🎢"
 
 
-async def ask_agent(question: str, user_id: str, api_key: str, username: str = "unknown") -> str:
+logger = logging.getLogger("tpcr-bot")
+
+QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "http://localhost:8080")
+QWEN_MODEL = os.getenv("QWEN_MODEL", "Qwen3.8-27B-8bit")
+QWEN_TIMEOUT = float(os.getenv("QWEN_TIMEOUT", "300"))
+
+CONTEXT_LIMIT = 32768  # server context window (tokens)
+MAX_TOKENS = 1500  # reserved for the completion
+_CHARS_PER_TOKEN = 3  # conservative: real text averages ~4
+_MSG_OVERHEAD = 8  # per-message role/format tokens
+_TOOLS_RESERVE = 200  # tool schema is sent with every request
+_TRUNC_NOTE = "\n...[truncated]"
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "run_query",
+            "description": "Execute a read-only SQL query against the TPCR DuckDB database. Use SELECT statements only. Returns results as formatted text.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sql": {"type": "string", "description": "SQL SELECT query to execute"}
+                },
+                "required": ["sql"],
+            },
+        },
+    }
+]
+
+
+class QwenHTTPError(Exception):
+    """Non-2xx response from the Qwen server."""
+
+    def __init__(self, status: int, body: str = ""):
+        super().__init__(f"HTTP {status}: {body[:300]}")
+        self.status = status
+        self.body = body
+
+
+def estimate_tokens(text: str) -> int:
+    """Conservative token estimate (len/3 chars per token, rounded up)."""
+    return -(-len(text or "") // _CHARS_PER_TOKEN)
+
+
+def _msg_text(msg: dict) -> str:
+    text = msg.get("content") or ""
+    if msg.get("tool_calls"):
+        text += json.dumps(msg["tool_calls"])
+    return text
+
+
+def estimate_messages_tokens(messages: list[dict]) -> int:
+    return sum(estimate_tokens(_msg_text(m)) + _MSG_OVERHEAD for m in messages)
+
+
+def _truncate(text: str, max_tokens: int) -> str:
+    max_chars = max(0, max_tokens * _CHARS_PER_TOKEN - len(_TRUNC_NOTE))
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + _TRUNC_NOTE
+
+
+def trim_messages(
+    messages: list[dict],
+    max_tokens: int = MAX_TOKENS,
+    limit: int = CONTEXT_LIMIT,
+    with_tools: bool = True,
+) -> list[dict]:
+    """Return a copy of messages that fits in limit once max_tokens is reserved.
+
+    messages[0] is the system prompt; the latest user message is always kept.
+    Oldest history/tool messages are dropped first, then the biggest remaining
+    pieces (tool results, then the system prompt) are truncated.
+    """
+    budget = limit - max_tokens - (_TOOLS_RESERVE if with_tools else 0)
+    msgs = [dict(m) for m in messages]
+    if estimate_messages_tokens(msgs) <= budget:
+        return msgs
+
+    def total() -> int:
+        return estimate_messages_tokens(msgs)
+
+    last_user = max((i for i, m in enumerate(msgs) if m.get("role") == "user"), default=None)
+    keep = {i for i in (0 if msgs[0].get("role") == "system" else None, last_user) if i is not None}
+    keep_ids = {id(msgs[i]) for i in keep}
+
+    # Drop oldest history/tool messages first (an assistant tool_calls message
+    # goes together with its tool results so no orphans are left behind)
+    k = 0
+    while total() > budget and k < len(msgs):
+        if id(msgs[k]) in keep_ids:
+            k += 1
+            continue
+        end = k + 1
+        if msgs[k].get("tool_calls"):
+            while end < len(msgs) and msgs[end].get("role") == "tool" and id(msgs[end]) not in keep_ids:
+                end += 1
+        del msgs[k:end]
+    while msgs and msgs[0].get("role") == "tool":  # orphaned tool result
+        msgs.pop(0)
+
+    # Still too big: truncate tool results, then the user prompt, then the system prompt
+    def shrink(m: dict):
+        over = total() - budget
+        if over > 0:
+            content = m.get("content") or ""
+            m["content"] = _truncate(content, max(50, estimate_tokens(content) - over))
+
+    for m in msgs:
+        if m.get("role") == "tool":
+            shrink(m)
+    for role in ("user", "system"):
+        for m in reversed(msgs):
+            if m.get("role") == role:
+                shrink(m)
+                break
+    return msgs
+
+
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def strip_think(text: str) -> str:
+    """Remove <think>...</think> blocks (and an unterminated trailing one)."""
+    text = _THINK_RE.sub("", text or "")
+    text = re.sub(r"<think>.*\Z", "", text, flags=re.DOTALL)
+    return text.replace("</think>", "").strip()
+
+
+async def _post_chat(payload: dict) -> dict:
+    """POST to the OpenAI-compatible chat completions endpoint."""
+    url = f"{QWEN_BASE_URL.rstrip('/')}/v1/chat/completions"
+    async with httpx.AsyncClient(timeout=QWEN_TIMEOUT) as client:
+        resp = await client.post(url, json=payload)
+    if resp.status_code >= 400:
+        raise QwenHTTPError(resp.status_code, resp.text)
+    return resp.json()
+
+
+async def _chat(messages: list[dict], use_tools: bool) -> dict:
+    payload = {
+        "model": QWEN_MODEL,
+        "messages": trim_messages(messages, MAX_TOKENS, CONTEXT_LIMIT, with_tools=use_tools),
+        "max_tokens": MAX_TOKENS,
+    }
+    if use_tools:
+        payload["tools"] = TOOLS
+    return await _post_chat(payload)
+
+
+async def ask_agent(question: str, user_id: str, api_key: str | None = None, username: str = "unknown") -> str:
     """
     Process a natural language question about theme park data.
-    Uses Claude with async DuckDB tool access.
+    Uses a local Qwen server (OpenAI-compatible) with async DuckDB tool access.
 
-    All blocking work (Anthropic API, DuckDB queries, file I/O) is run
-    off the event loop so the Discord heartbeat is never starved.
+    api_key is accepted for backwards compatibility and ignored.
+    All blocking work (DuckDB queries, file I/O) is run off the event loop so
+    the Discord heartbeat is never starved.
     """
     await asyncio.to_thread(track_usage, user_id)
 
     import time as _time
     _start = _time.monotonic()
 
-    client = anthropic.AsyncAnthropic(api_key=api_key)
-
     today = date.today()
     system_prompt = SCHEMA_CONTEXT.format(today=today.isoformat(), today_dow=today.strftime("%A"))
 
-    tools = [
-        {
-            "name": "run_query",
-            "description": "Execute a read-only SQL query against the TPCR DuckDB database. Use SELECT statements only. Returns results as formatted text.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "sql": {
-                        "type": "string",
-                        "description": "SQL SELECT query to execute"
-                    }
-                },
-                "required": ["sql"]
-            }
-        }
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": question},
     ]
-
-    messages = [{"role": "user", "content": question}]
+    use_tools = True
 
     # Allow up to 5 tool-use rounds
     for _ in range(5):
-        response = await client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1500,
-            system=system_prompt,
-            tools=tools,
-            messages=messages,
-        )
+        try:
+            data = await _chat(messages, use_tools)
+        except QwenHTTPError as e:
+            # Server may not support tools: retry once without them
+            if use_tools and (400 <= e.status < 500 or "tool" in e.body.lower()):
+                logger.warning("Qwen rejected tools request (%s); retrying without tools", e)
+                use_tools = False
+                data = await _chat(messages, use_tools)
+            else:
+                raise
 
-        # Check if we need to handle tool use
-        if response.stop_reason == "tool_use":
-            # Process all tool calls
-            tool_results = []
-            assistant_content = response.content
+        message = data["choices"][0]["message"]
+        tool_calls = message.get("tool_calls") if use_tools else None
 
-            for block in response.content:
-                if block.type == "tool_use":
-                    sql = block.input.get("sql", "")
+        if tool_calls:
+            messages.append({
+                "role": "assistant",
+                "content": message.get("content") or "",
+                "tool_calls": tool_calls,
+            })
+            for call in tool_calls:
+                fn = call.get("function", {})
+                try:
+                    args = fn.get("arguments") or "{}"
+                    args = json.loads(args) if isinstance(args, str) else args
+                    sql = args.get("sql", "")
+                except (ValueError, AttributeError):
+                    sql = ""
 
-                    # Safety: reject non-SELECT queries
-                    sql_upper = sql.strip().upper()
-                    if not sql_upper.startswith("SELECT") and not sql_upper.startswith("WITH"):
-                        result = "Error: Only SELECT queries are allowed."
-                    else:
-                        result = await asyncio.to_thread(run_duckdb_query, sql)
+                # Safety: reject non-SELECT queries
+                sql_upper = sql.strip().upper()
+                if not sql_upper.startswith("SELECT") and not sql_upper.startswith("WITH"):
+                    result = "Error: Only SELECT queries are allowed."
+                else:
+                    result = await asyncio.to_thread(run_duckdb_query, sql)
 
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result
-                    })
-
-            messages.append({"role": "assistant", "content": assistant_content})
-            messages.append({"role": "user", "content": tool_results})
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.get("id", ""),
+                    "content": result,
+                })
         else:
             # Final text response
-            text_parts = [b.text for b in response.content if hasattr(b, "text")]
-            answer = "\n".join(text_parts)
+            answer = strip_think(message.get("content") or "")
 
             # Trim if too long for Discord
             if len(answer) > 1900:

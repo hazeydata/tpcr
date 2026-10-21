@@ -1692,23 +1692,23 @@ except Exception as e:
 BOT_COMMANDS_CHANNEL = 1478240248361128079  # #bot-commands (recreated Mar 2)
 
 
+FRIENDLY_ERROR = "Sorry, I couldn't answer that right now. Please try again in a bit."
+
+
 @tree.command(name="ask", description="Ask anything about theme park crowds, wait times, and visit planning")
 @app_commands.describe(question="Your question (e.g., 'What's the best day to visit Magic Kingdom this month?')")
 async def ask_command(interaction: discord.Interaction, question: str):
     print(f"📥 /ask called: question='{question}' by {interaction.user}")
 
-    if not ANTHROPIC_API_KEY:
-        await interaction.response.send_message(
-            "❌ AI agent is not configured. Contact the admin.", ephemeral=True
-        )
-        return
-
-    # Defer — this will take a few seconds
+    # Ack immediately: defer, then post a placeholder we edit with the answer
     if not await safe_defer(interaction):
         return
 
+    placeholder = None
     try:
-        answer = await ask_agent(question, str(interaction.user.id), ANTHROPIC_API_KEY, username=str(interaction.user))
+        placeholder = await interaction.followup.send("Thinking…", wait=True)
+
+        answer = await ask_agent(question, str(interaction.user.id), username=str(interaction.user))
 
         # Build embed
         embed = discord.Embed(
@@ -1719,14 +1719,26 @@ async def ask_command(interaction: discord.Interaction, question: str):
         embed.set_footer(text="AI-powered • Data may not be 100% accurate • hazeydata.ai")
 
         view = AskFeedbackView(question, str(interaction.user.id), str(interaction.user))
-        await interaction.followup.send(embed=embed, view=view)
+        try:
+            await placeholder.edit(content=None, embed=embed, view=view)
+        except Exception:
+            logger.warning("/ask placeholder edit failed; sending new message", exc_info=True)
+            await interaction.followup.send(embed=embed, view=view)
 
-    except Exception as e:
-        print(f"❌ /ask error: {e}")
-        await interaction.followup.send(
-            f"❌ Sorry, I hit an error processing that question. Try rephrasing!\n`{str(e)[:100]}`",
-            ephemeral=True
-        )
+    except Exception:
+        # Full details server-side only; users never see raw exception text
+        logger.error("/ask failed", exc_info=True)
+        try:
+            if placeholder is not None:
+                await placeholder.edit(content=FRIENDLY_ERROR, embed=None, view=None)
+            else:
+                await interaction.followup.send(FRIENDLY_ERROR, ephemeral=True)
+        except Exception:
+            logger.error("/ask could not deliver error message", exc_info=True)
+            try:
+                await interaction.followup.send(FRIENDLY_ERROR, ephemeral=True)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
