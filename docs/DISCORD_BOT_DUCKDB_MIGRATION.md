@@ -253,6 +253,8 @@ cp ~/tpcr-discord-bot/bot.py ~/theme-park-crowd-report/tpcr-discord-bot/bot.py
 cp ~/tpcr-discord-bot/forecast_image.py ~/theme-park-crowd-report/tpcr-discord-bot/forecast_image.py
 cp ~/tpcr-discord-bot/daily_report.py ~/theme-park-crowd-report/tpcr-discord-bot/daily_report.py
 
+# Historical (Wilma, systemd user service). The bot now runs on the Mac Mini under
+# launchd (com.hazeydata.tpcr-bot); see tpcr-discord-bot/README.md "Host".
 # Update systemd service to point to new location
 # ExecStart: WorkingDirectory=/home/wilma/theme-park-crowd-report/tpcr-discord-bot
 ```
