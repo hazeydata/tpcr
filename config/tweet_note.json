@@ -1,0 +1,10 @@
+{
+  "standard": {
+    "high": "Note: our {park_name} forecasts have been running high lately. We're working on it.",
+    "low": "Note: our {park_name} forecasts have been running low lately. We're working on it."
+  },
+  "campy": {
+    "high": "Note: our {park_name} forecasts have been running high lately. The bot team is working on it.",
+    "low": "Note: our {park_name} forecasts have been running low lately. The bot team is working on it."
+  }
+}

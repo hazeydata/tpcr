@@ -1,0 +1,411 @@
+import io
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+from datetime import date, timedelta
+from pathlib import Path
+from unittest import mock
+
+import pandas as pd
+
+ROOT = Path(__file__).resolve().parents[1]
+SC = ROOT / "operations" / "scorecard"
+sys.path.insert(0, str(SC))
+sys.path.insert(0, str(ROOT / "operations" / "scripts"))
+
+import backtest
+import drift_alert
+import scorecard as sc
+import tweet_note
+import weekly
+
+AS_OF = date(2026, 10, 12)
+
+
+def days(n, end=AS_OF):
+    return [end - timedelta(days=i) for i in range(n)]
+
+
+def wti_rows(park, errs, end=AS_OF, fc=30.0, ev="2026-10-13"):
+    return [{"park_code": park, "park_date": d.isoformat(), "forecast_wti": fc, "actual_wti": fc - e, "wti_error": e,
+             "wti_abs_error": abs(e), "evaluation_date": ev} for d, e in zip(days(len(errs), end), errs)]
+
+
+def slot_rows(entity, errs, end=AS_OF, ev="2026-10-13"):
+    return [{"entity_code": entity, "park_date": d.isoformat(), "time_slot": f"{h:02d}:00", "forecast_wait": 50.0,
+             "actual_wait": 50.0 - e, "signed_error": e, "evaluation_date": ev}
+            for d in days(len(errs) // 4, end) for h, e in zip(range(9, 13), errs)]
+
+
+class Env(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.acc, self.out = self.tmp / "acc", self.tmp / "out"
+        self.acc.mkdir()
+        p = mock.patch.dict(os.environ)
+        p.start()
+        for k in [k for k in os.environ if k.startswith("TPCR_")]:
+            os.environ.pop(k, None)
+        os.environ.update({"TPCR_ACCURACY_DIR": str(self.acc), "TPCR_SCORECARD_DIR": str(self.out)})
+        self.addCleanup(p.stop)
+
+    def write(self, wti, slot):
+        pd.DataFrame(wti).to_parquet(self.acc / "wti_accuracy.parquet", index=False)
+        pd.DataFrame(slot).to_parquet(self.acc / "slot_accuracy.parquet", index=False)
+
+    def standard(self):
+        self.write(wti_rows("AK", [11.0] * 90) + wti_rows("MK", [4.0, -4.0] * 45) + wti_rows("TDS", [-12.6] * 87),
+                   slot_rows("AK86", [47.0] * 120) + slot_rows("AK01", [30.0] * 8) + slot_rows("MK10", [1.0, -1.0] * 60))
+
+    def run_sc(self, *args):
+        with redirect_stdout(io.StringIO()) as buf:
+            code = sc.main(["--as-of", AS_OF.isoformat(), *args])
+        return code, buf.getvalue()
+
+    def card(self):
+        return pd.read_parquet(self.out / f"scorecard_{AS_OF}.parquet")
+
+
+class PhaseA(Env):
+    def test_ac1_missing_column_exits_1(self):
+        rows = wti_rows("AK", [1.0] * 30)
+        [r.pop("wti_error") for r in rows]
+        self.write(rows, slot_rows("AK86", [1.0] * 40))
+        with mock.patch("sys.stderr", new=io.StringIO()) as err:
+            self.assertEqual(self.run_sc()[0], 1)
+        self.assertIn("wti_error", err.getvalue())
+        self.assertFalse(self.out.exists())
+
+    def test_ac2_dedup_keeps_latest(self):
+        self.write(wti_rows("AK", [99.0] * 30, ev="2026-10-01") + wti_rows("AK", [2.0] * 30, ev="2026-10-13"),
+                   slot_rows("AK86", [99.0] * 40, ev="2026-10-01") + slot_rows("AK86", [3.0] * 40, ev="2026-10-13"))
+        self.run_sc()
+        c = self.card().set_index(["key", "window_days"])
+        self.assertEqual(c.loc[("AK", 30), "mean_bias"], 2.0)
+        self.assertEqual(c.loc[("AK", 30), "n"], 30)
+        self.assertEqual(c.loc[("AK86", 7), "mean_bias"], 3.0)
+
+    def test_ac3_window_metrics(self):
+        self.write(wti_rows("AK", [10.0, 12.0, -1.0, 14.0] * 30), slot_rows("AK86", [47.2] * 400))
+        self.run_sc()
+        c = self.card().set_index(["key", "window_days"])
+        ak = c.loc[("AK", 90)]
+        e = pd.Series([10.0, 12.0, -1.0, 14.0] * 30)[:91]
+        self.assertEqual(ak["n"], 91)
+        self.assertAlmostEqual(ak["mean_bias"], e.mean())
+        self.assertAlmostEqual(ak["median_bias"], e.median())
+        self.assertAlmostEqual(ak["mae"], e.abs().mean())
+        self.assertAlmostEqual(ak["mae_over_abs_bias"], e.abs().mean() / abs(e.mean()))
+        self.assertAlmostEqual(c.loc[("AK86", 90), "mean_bias"], 47.2)
+        self.assertEqual(set(c.reset_index()["window_days"]), {7, 30, 90})
+
+    def test_ac4_deterministic(self):
+        self.standard()
+        self.run_sc()
+        self.run_sc()
+        for ext in (".parquet", ".md"):
+            a = (self.out / f"scorecard_{AS_OF}{ext}").read_bytes()
+            self.assertEqual(a, (self.out / f"scorecard_{AS_OF}_r2{ext}").read_bytes())
+
+
+class PhaseB(Env):
+    def test_ac5_drift_and_shared_thresholds(self):
+        self.write(wti_rows("AK", [6.0, 4.0, 12.0, -2.0] * 23) + wti_rows("TDS", [6.0, 4.0, 12.0, -2.0] * 23),
+                   slot_rows("AK86", [16.0, 20.0, 30.0, -6.0] * 30) + slot_rows("TDS12", [16.0, 20.0, 30.0, -6.0] * 30))
+        self.run_sc()
+        c = self.card().set_index(["key", "window_days"])
+        for k in ("AK", "TDS", "AK86", "TDS12"):
+            self.assertEqual(c.loc[(k, 30), "flag"], "drift", k)
+        t = sc.thresholds()
+        self.assertEqual((t["park"], t["entity"], t["min_n"]), (5, 15, 20))
+        with mock.patch.dict(os.environ, {"TPCR_DRIFT_PARK_BIAS_MIN": "6"}):
+            self.assertEqual(sc.flag({"n": 30, "window_days": 30, "mean_bias": 5.5, "mae": 9, "level": "park"}, sc.thresholds()), "none")
+        self.assertNotIn("TDS", Path(sc.__file__).read_text())
+
+    def test_ac6_systematic(self):
+        self.standard()
+        self.run_sc()
+        c = self.card().set_index(["key", "window_days"])
+        self.assertEqual(c.loc[("AK", 30), "flag"], "systematic")
+        self.assertEqual(c.loc[("AK86", 30), "flag"], "systematic")
+        self.assertEqual(c.loc[("MK", 30), "flag"], "none")
+        s = json.loads((self.out / "status.json").read_text())
+        self.assertEqual([(p["park"], p["direction"], p["since"]) for p in s["systematic_parks"]],
+                         [("AK", "high", "2026-10-12"), ("TDS", "low", "2026-10-12")])
+
+    def test_ac7_low_n_never_drift(self):
+        self.standard()
+        self.run_sc()
+        c = self.card().set_index(["key", "window_days"])
+        self.assertEqual(c.loc[("AK01", 30), "flag"], "low_n")
+        s = json.loads((self.out / "status.json").read_text())
+        self.assertNotIn("AK01", [f["key"] for f in s["flags"]])
+
+    def test_ac8_backtest_first_flag_dates(self):
+        cross = date(2026, 6, 1)
+        errs = [0.5] * 60 + [20.0] * 130
+        self.write(wti_rows("AK", list(reversed(errs)), end=date(2026, 10, 1)),
+                   slot_rows("AK86", list(reversed([1.0, -1.0] * 120 + [50.0] * 520)), end=date(2026, 10, 1)))
+        acc = self.acc
+        err = sc.errors(sc.load(acc / "wti_accuracy.parquet", "wti_accuracy"), sc.load(acc / "slot_accuracy.parquet", "slot_accuracy"))
+        first = backtest.backtest(err, date(2026, 5, 20), date(2026, 7, 1))
+        ak = min(d for (l, k, _), d in first.items() if k == "AK")
+        self.assertLessEqual((ak - cross).days, 14)
+        self.assertIn(("entity", "AK86", "systematic"), first)
+        with redirect_stdout(io.StringIO()) as buf:
+            backtest.main(["--start", "2026-06-01", "--end", "2026-06-20"])
+        self.assertRegex(buf.getvalue(), r"park\tAK\t\w+\t2026-06-\d\d")
+
+
+class PhaseC(Env):
+    def test_ac9_stale_and_missing(self):
+        self.write(wti_rows("AK", [1.0] * 30, end=AS_OF - timedelta(days=3)), slot_rows("AK86", [1.0] * 40))
+        self.assertEqual(self.run_sc()[0], 75)
+        s = json.loads((self.out / "status.json").read_text())
+        self.assertEqual((s["ok"], s["reason"]), (False, "inputs_stale"))
+        self.assertEqual(list(self.out.glob("scorecard_*")), [])
+        (self.acc / "slot_accuracy.parquet").unlink()
+        self.assertEqual(self.run_sc()[0], 75)
+
+    def test_ac10_atomic_status(self):
+        self.standard()
+        with mock.patch("os.replace", wraps=os.replace) as rep:
+            self.run_sc()
+        rep.assert_called_once()
+        self.assertEqual(Path(rep.call_args[0][1]).name, "status.json")
+        self.assertFalse((self.out / "status.json.tmp").exists())
+        s = json.loads((self.out / "status.json").read_text())
+        self.assertTrue((self.out / s["scorecard"]).exists())
+
+    def test_ac11_chained_after_eval_success(self):
+        sh = str(SC / "run_after_accuracy.sh")
+        env = {**os.environ, "TPCR_AS_OF": AS_OF.isoformat()}
+        self.assertEqual(subprocess.run([sh, "false"], env=env).returncode, 1)
+        self.assertFalse((self.out / "status.json").exists())
+        r = subprocess.run([sh, "true"], env=env, capture_output=True)
+        self.assertEqual(r.returncode, 75)
+        self.assertTrue((self.out / "status.json").exists())
+
+
+TWEETED = {"2026-10-01": (33, 15), "2026-10-02": (36, 21), "2026-10-03": (35, 25), "2026-10-04": (32, 25),
+           "2026-10-05": (32, 24), "2026-10-06": (32, 20), "2026-10-07": (31, 13)}
+
+
+class PhaseD(Env):
+    def week(self, parks=("MK", "EP", "HS", "AK"), skip=None):
+        rows = []
+        for p in parks:
+            for d, (f, a) in TWEETED.items():
+                if (p, d) != skip:
+                    rows.append({"park_code": p, "park_date": d, "forecast_wti": float(f), "actual_wti": float(a),
+                                 "wti_error": float(f - a), "evaluation_date": "2026-10-08"})
+        rows.append({**rows[0], "forecast_wti": 99.0, "wti_error": 99.0, "evaluation_date": "2026-10-01"})
+        self.write(rows, slot_rows("AK86", [1.0] * 40))
+        with redirect_stdout(io.StringIO()):
+            weekly.main(["--start", "2026-10-01", "--end", "2026-10-07"])
+        return json.loads((self.out / "weekly_2026-10-01_2026-10-07.json").read_text())
+
+    def test_ac12_reproduces_tweeted_pairs(self):
+        w = self.week()
+        ak = w["parks"]["AK"]
+        self.assertEqual({d["date"]: (d["forecast"], d["actual"]) for d in ak["days"]}, {k: (float(f), float(a)) for k, (f, a) in TWEETED.items()})
+        self.assertEqual(ak["n_days"], 7)
+        self.assertEqual(ak["biggest"]["date"], "2026-10-01")
+        self.assertEqual(ak["closest"]["date"], "2026-10-04")
+        self.assertAlmostEqual(ak["avg_abs_miss"], 12.57, places=2)
+        self.assertTrue(w["complete"])
+
+    def test_ac13_incomplete_week(self):
+        w = self.week(skip=("EP", "2026-10-03"))
+        self.assertFalse(w["complete"])
+        self.assertEqual(w["missing_dates"], {"EP": ["2026-10-03"]})
+
+    def test_ac14_grade_park_table(self):
+        cases = [(20 - 19, "hit"), (28 - 17, "miss"), (31 - 13, "miss"), (7, "none"),
+                 (5, "hit"), (5.01, "none"), (10, "none"), (10.01, "miss")]
+        for e, g in cases:
+            self.assertEqual(sc.grade_park(e), g, e)
+            self.assertEqual(sc.grade_park(-e), g, -e)
+        ak = self.week()["parks"]["AK"]
+        self.assertEqual((ak["hits"], ak["misses"], ak["no_mark"]), (0, 4, 3))
+
+    def test_ac14a_mae_goal(self):
+        self.write(wti_rows("AK", [8.0, -8.0] * 15) + wti_rows("MK", [8.01, -8.01] * 15), slot_rows("AK86", [1.0] * 40))
+        self.run_sc()
+        c = self.card()
+        p = c[(c["level"] == "park") & (c["window_days"] == 30)].set_index("key")
+        self.assertIs(bool(p.loc["AK", "goal_met"]), True)
+        self.assertIs(bool(p.loc["MK", "goal_met"]), False)
+        self.assertTrue((p["mae_goal_min"] == 8).all())
+        e = c[c["level"] == "entity"]
+        self.assertTrue(e["goal_met"].isna().all() and e["mae_goal_min"].isna().all())
+
+    def test_ac14b_no_ride_grades(self):
+        self.standard()
+        self.run_sc()
+        self.assertFalse({"grade", "hits", "misses", "no_mark"} & set(self.card().columns))
+        w = self.week()
+        self.assertEqual(set(w["parks"]), {"MK", "EP", "HS", "AK"})
+        with self.assertRaises(sc.NotCalibrated):
+            sc.grade_ride(15.0, 105.0, 0.3)
+        for f in ("scorecard.py", "weekly.py", "backtest.py"):
+            self.assertNotIn("grade_ride(", (SC / f).read_text().replace("def grade_ride(", ""))
+
+
+SAFETY_RE = re.compile(r"\b(ssh|scp|requests|tweepy|smtplib|socket|urllib|http)\b")
+DELETE_RE = re.compile(r"unlink|remove|rmtree")
+
+
+class PhaseE(Env):
+    def test_ac15_writes_only_under_scorecard_dir(self):
+        self.standard()
+        before = {p: p.stat().st_mtime_ns for p in self.acc.iterdir()}
+        real_open = open
+        writes = []
+
+        def spy(f, mode="r", *a, **k):
+            if any(c in mode for c in "wax+"):
+                writes.append(Path(f))
+            return real_open(f, mode, *a, **k)
+
+        with mock.patch("builtins.open", spy):
+            self.run_sc()
+        self.assertTrue(writes)
+        self.assertTrue(all(self.out in w.parents for w in writes))
+        self.assertEqual(before, {p: p.stat().st_mtime_ns for p in self.acc.iterdir()})
+        for f in SC.glob("*.py"):
+            self.assertIsNone(SAFETY_RE.search(f.read_text()), f)
+
+    def test_ac16_dry_run_writes_nothing(self):
+        self.standard()
+        code, out = self.run_sc("--dry-run")
+        self.assertEqual(code, 3)
+        self.assertIn("# TPCR accuracy scorecard 2026-10-12", out)
+        self.assertIn('"reason": "systematic"', out)
+        self.assertFalse(self.out.exists())
+
+
+GOLDEN = """Subject: TPCR drift: 2 flag(s) as of 2026-10-12
+To: fred@hazeydata.ai
+
+AK86 entity systematic value=47.0 threshold=15.0 window=30
+AK park systematic value=11.0 threshold=5.0 window=30
+
+scorecard: scorecard_2026-10-12.parquet
+"""
+
+
+class PhaseF(Env):
+    def status(self, **kw):
+        s = {"as_of": "2026-10-12", "ok": True, "scorecard": "scorecard_2026-10-12.parquet", "systematic_parks": [],
+             "flags": [{"key": "AK", "level": "park", "reason": "systematic", "value": 11.0, "threshold": 5.0, "window_days": 30},
+                       {"key": "AK86", "level": "entity", "reason": "systematic", "value": 47.0, "threshold": 15.0, "window_days": 30}]}
+        s.update(kw)
+        p = self.tmp / "status.json"
+        p.write_text(json.dumps(s))
+        return p
+
+    def alert(self, p, *args):
+        with redirect_stdout(io.StringIO()) as buf:
+            code = drift_alert.main(["--status", str(p), *args])
+        return code, buf.getvalue()
+
+    def test_ac17_only_when_flagged(self):
+        self.assertEqual(self.alert(self.status(flags=[]))[1], "no_alert\n")
+        self.assertFalse((self.out / "alerts").exists())
+        stale = [{"key": "inputs", "level": "input", "reason": "inputs_stale", "value": "2026-10-08", "threshold": "2026-10-10", "window_days": 0}]
+        self.alert(self.status(ok=False, reason="inputs_stale", flags=stale), "--dry-run")
+        self.assertTrue((self.out / "alerts" / "alert_2026-10-12.eml.txt").exists())
+
+    def test_ac18_deterministic_content(self):
+        p = self.status()
+        self.alert(p, "--dry-run")
+        self.alert(p, "--dry-run")
+        a = (self.out / "alerts" / "alert_2026-10-12.eml.txt").read_text()
+        self.assertEqual(a, GOLDEN)
+        self.assertEqual(a, (self.out / "alerts" / "alert_2026-10-12_r2.eml.txt").read_text())
+
+    def test_ac19_no_send_without_approval(self):
+        with mock.patch("smtplib.SMTP") as smtp, mock.patch("smtplib.SMTP_SSL") as ssl:
+            code, out = self.alert(self.status())
+        self.assertEqual(code, 0)
+        self.assertIn("awaiting_approval", out)
+        self.assertEqual(smtp.call_count + ssl.call_count, 0)
+
+    def test_ac20_dry_run_no_mail_connection(self):
+        with mock.patch("socket.socket") as sock:
+            self.alert(self.status(), "--dry-run")
+        sock.assert_not_called()
+        self.assertIsNone(SAFETY_RE.search((SC / "drift_alert.py").read_text()))
+        self.assertEqual((self.out / "alerts" / "alert_2026-10-12.eml.txt").read_text(), GOLDEN)
+
+    def test_ac21_recipient_default_and_no_secrets(self):
+        self.assertEqual(drift_alert.recipient(), "fred@hazeydata.ai")
+        with mock.patch.dict(os.environ, {"TPCR_DRIFT_ALERT_TO": "override-recipient"}):
+            self.assertEqual(drift_alert.recipient(), "override-recipient")
+        src = (SC / "drift_alert.py").read_text()
+        self.assertNotRegex(src, r"(?i)password|secret|token")
+
+
+def systematic(*parks, as_of="2026-10-12", ok=True):
+    return {"as_of": as_of, "ok": ok, "systematic_parks": [{"park": p, "direction": d, "window_days": 30, "mean_bias": 1.0, "since": as_of} for p, d in parks]}
+
+
+PARKS = [{"park_code": "AK", "park_name": "Animal Kingdom"}, {"park_code": "HS", "park_name": "Hollywood Studios"},
+         {"park_code": "MK", "park_name": "Magic Kingdom"}, {"park_code": "EP", "park_name": "EPCOT"}]
+
+
+class PhaseG(Env):
+    def notes(self, status, today=AS_OF, variant=None):
+        self.out.mkdir(exist_ok=True)
+        (self.out / "status.json").write_text(json.dumps(status) if status else "")
+        env = {"TPCR_TWEET_NOTE_VARIANT": variant} if variant else {}
+        with mock.patch.dict(os.environ, env), redirect_stdout(io.StringIO()) as buf:
+            lines = tweet_note.note_lines(PARKS, today)
+        return lines, buf.getvalue()
+
+    def test_ac22_retention_no_prune(self):
+        for f in list(SC.glob("*.py")) + [ROOT / "operations" / "scripts" / "tweet_note.py"]:
+            self.assertIsNone(DELETE_RE.search(f.read_text()), f)
+        self.standard()
+        self.run_sc()
+        first = (self.out / f"scorecard_{AS_OF}.md").read_bytes()
+        self.run_sc()
+        self.assertEqual((self.out / f"scorecard_{AS_OF}.md").read_bytes(), first)
+        self.assertTrue((self.out / f"scorecard_{AS_OF}_r2.parquet").exists())
+
+    def test_ac23_note_per_flagged_park(self):
+        self.assertEqual(self.notes(systematic())[0], [])
+        self.assertEqual(self.notes(systematic(("AK", "high")))[0],
+                         ["Note: our Animal Kingdom forecasts have been running high lately. We're working on it."])
+        lines, _ = self.notes(systematic(("AK", "high"), ("AK", "high"), ("TDS", "low")))
+        self.assertEqual(len(lines), 1)
+        for st in (None, systematic(("AK", "high"), as_of="2026-10-09"), systematic(("AK", "high"), ok=False)):
+            self.assertEqual(self.notes(st), ([], "status_unavailable\n"))
+
+    def test_ac24_variant_config_and_length(self):
+        lines, log = self.notes(systematic(("AK", "high")), variant="bogus")
+        self.assertIn("WARNING", log)
+        self.assertIn("We're working on it.", lines[0])
+        self.assertNotIn("working on it", Path(tweet_note.__file__).read_text())
+        longest = max(PARKS, key=lambda p: len(p["park_name"]))["park_name"]
+        for v in ("standard", "campy"):
+            for d in ("high", "low"):
+                self.assertLessEqual(len(self.notes(systematic(("HS", d)), variant=v)[0][0]), 280)
+        self.assertEqual(longest, "Hollywood Studios")
+
+    def test_ac25_final_wording(self):
+        for v, tail in (("standard", "We're working on it."), ("campy", "The bot team is working on it.")):
+            for d in ("high", "low"):
+                line = self.notes(systematic(("HS", d)), variant=v)[0][0]
+                self.assertEqual(line, f"Note: our Hollywood Studios forecasts have been running {d} lately. {tail}")
+                self.assertIsNone(re.search(r"\d|WTI|accura", line))
+
+
+if __name__ == "__main__":
+    unittest.main()
