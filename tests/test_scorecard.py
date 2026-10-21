@@ -493,6 +493,52 @@ class PhaseG(Env):
             self.assertIsNone(tweet_note.approve(state, "2026-10-13", post))
         return err.getvalue()
 
+    def test_ac24_save_state_during_approve_posts_once(self):
+        state = self.fresh()
+        started = threading.Event()
+
+        def slow_post(text, reply_to=None):
+            started.set()
+            time.sleep(0.3)
+            return "222"
+
+        post = mock.Mock(side_effect=slow_post)
+        with mock.patch.object(wpt, "STATE_FILE", state), redirect_stdout(io.StringIO()), \
+                mock.patch("sys.stderr", new=io.StringIO()):
+            t = threading.Thread(target=tweet_note.approve, args=(state, "2026-10-13", post))
+            t.start()
+            started.wait()
+            wpt.save_state("111", "2026-10-13")
+            t.join()
+            self.assertEqual(json.loads(state.read_text())["predicted"]["2026-10-13"]["tweet_id"], "111")
+            self.assertEqual(self.draft(state)["status"], "posted")
+            tweet_note.approve(state, "2026-10-13", post)
+            with mock.patch("os.replace", wraps=os.replace) as rep:
+                wpt.save_state("111", "2026-10-13")
+            rep.assert_called_once_with(Path(f"{state}.tmp"), state)
+        self.assertEqual(post.call_count, 1)
+        self.assertEqual(self.draft(state)["status"], "posted")
+
+    def test_ac24_lock_on_separate_lock_file(self):
+        state = self.fresh()
+        real = tweet_note.fcntl.flock
+        calls = []
+
+        def spy(f, op):
+            fd = f if isinstance(f, int) else f.fileno()
+            path = f.name if hasattr(f, "name") else os.readlink(f"/proc/self/fd/{fd}")
+            if op == tweet_note.fcntl.LOCK_EX:
+                calls.append((str(path), os.fstat(fd).st_ino))
+            return real(f, op)
+
+        with mock.patch.object(tweet_note.fcntl, "flock", spy), redirect_stdout(io.StringIO()):
+            tweet_note.approve(state, "2026-10-13", mock.Mock(return_value="222"))
+        lock = Path(str(state) + ".lock")
+        self.assertTrue(calls)
+        for path, ino in calls:
+            self.assertEqual(path, str(lock))
+            self.assertEqual(ino, lock.stat().st_ino)
+
     def test_ac24_concurrent_approve_posts_once(self):
         state = self.fresh()
         barrier = threading.Barrier(4)

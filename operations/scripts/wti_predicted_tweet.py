@@ -276,37 +276,38 @@ def save_state(tweet_id, reference_date):
       }
     """
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    state = {}
-    if STATE_FILE.exists():
-        try:
-            state = json.loads(STATE_FILE.read_text())
-        except json.JSONDecodeError:
-            pass
+    with tweet_note.locked(STATE_FILE):
+        state = {}
+        if STATE_FILE.exists():
+            try:
+                state = json.loads(STATE_FILE.read_text())
+            except json.JSONDecodeError:
+                pass
 
-    if "predicted" not in state:
-        state["predicted"] = {}
+        if "predicted" not in state:
+            state["predicted"] = {}
 
-    posted_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        posted_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
-    # Key by reference_date so observed script can look up the right thread
-    state["predicted"][reference_date] = {
-        "tweet_id": tweet_id,
-        "posted_at": posted_at,
-    }
+        # Key by reference_date so observed script can look up the right thread
+        state["predicted"][reference_date] = {
+            "tweet_id": tweet_id,
+            "posted_at": posted_at,
+        }
 
-    # Keep last_predicted for backwards compat
-    state["last_predicted"] = {
-        "tweet_id": tweet_id,
-        "reference_date": reference_date,
-        "target_date": reference_date,
-        "posted_at": posted_at,
-    }
+        # Keep last_predicted for backwards compat
+        state["last_predicted"] = {
+            "tweet_id": tweet_id,
+            "reference_date": reference_date,
+            "target_date": reference_date,
+            "posted_at": posted_at,
+        }
 
-    # Prune entries older than 14 days
-    cutoff = (date.today() - timedelta(days=14)).isoformat()
-    state["predicted"] = {k: v for k, v in state["predicted"].items() if k >= cutoff}
+        # Prune entries older than 14 days
+        cutoff = (date.today() - timedelta(days=14)).isoformat()
+        state["predicted"] = {k: v for k, v in state["predicted"].items() if k >= cutoff}
 
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+        tweet_note._save(STATE_FILE, state)
     print(f"State saved: reference_date={reference_date}, tweet_id={tweet_id}")
 
 
