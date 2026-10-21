@@ -92,10 +92,10 @@ def flag(row, t):
     return "systematic" if row["mae"] <= 1.1 * abs(row["mean_bias"]) else "drift"
 
 
-def scorecard(err, as_of):
+def scorecard(err, as_of, *, windows=WINDOWS):  # windows override is test-only (spec R11: W-day window = park_date in [as_of-(W-1), as_of] inclusive)
     t = thresholds()
     rows = []
-    for w in WINDOWS:
+    for w in windows:
         s = window_stats(err, as_of, w)
         prev = window_stats(err, as_of - timedelta(days=7), w)[["level", "key", "mean_bias"]].rename(columns={"mean_bias": "prev_mean_bias"})
         rows.append(s.merge(prev, on=["level", "key"], how="left"))

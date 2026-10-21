@@ -1,4 +1,5 @@
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -598,6 +599,46 @@ class PhaseG(Env):
                 line = self.notes(systematic(("HS", d)), variant=v)[0][0]
                 self.assertEqual(line, f"Note: our Hollywood Studios forecasts have been running {d} lately. {tail}")
                 self.assertIsNone(re.search(r"\d|WTI|accura", line))
+
+
+class WindowOverride(Env):
+    def setUp(self):
+        super().setUp()
+        rows = [{"level": "park", "key": "MK", "park_date": d, "error": 1.0} for d in days(120)]
+        rows.append({"level": "park", "key": "MK", "park_date": AS_OF + timedelta(days=1), "error": 1.0})
+        self.err = pd.DataFrame(rows)
+
+    def dates(self, w):
+        s = sc.window_stats(self.err, AS_OF, w)
+        return int(s["n"].iloc[0])
+
+    def test_window_lengths(self):
+        self.assertEqual(self.dates(90), 90)
+        self.assertEqual(self.dates(91), 91)
+
+    def test_boundary_days(self):
+        def has(day, w):
+            return len(sc.window_stats(self.err[self.err["park_date"] == day], AS_OF, w)) == 1
+        self.assertTrue(has(AS_OF - timedelta(days=89), 90))
+        self.assertFalse(has(AS_OF - timedelta(days=90), 90))
+        self.assertTrue(has(AS_OF - timedelta(days=90), 91))
+        self.assertFalse(has(AS_OF + timedelta(days=1), 91))
+
+    def test_scorecard_windows(self):
+        df = sc.scorecard(self.err, AS_OF, windows=(91,))
+        self.assertEqual(list(df["window_days"]), [91])
+        self.assertEqual(list(df["n"]), [91])
+        df = sc.scorecard(self.err, AS_OF)
+        self.assertEqual(list(df["window_days"]), [7, 30, 90])
+        self.assertEqual(list(df["n"]), [7, 30, 90])
+
+    def test_windows_is_keyword_only_and_not_exposed(self):
+        p = inspect.signature(sc.scorecard).parameters["windows"]
+        self.assertEqual(p.kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertEqual(p.default, sc.WINDOWS)
+        self.assertEqual(sc.WINDOWS, (7, 30, 90))
+        with mock.patch("sys.stderr", io.StringIO()), self.assertRaises(SystemExit):
+            sc.main(["--as-of", AS_OF.isoformat(), "--window-days", "91"])
 
 
 if __name__ == "__main__":
