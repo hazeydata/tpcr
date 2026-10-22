@@ -48,6 +48,7 @@ from calendar_image import generate_calendar_image
 # (ask_agent also reads them at call time; this is defense in depth).
 load_dotenv(os.path.expanduser("~/.env"))
 from ask_agent import ask_agent, data_path, _duckdb_path
+data_path()
 
 # Add theme-park-crowd-report/src to sys.path for live inference model
 theme_park_src = os.path.expanduser("~/theme-park-crowd-report/src")
@@ -1736,7 +1737,7 @@ async def ask_command(interaction: discord.Interaction, question: str):
     try:
         placeholder = await interaction.followup.send("Thinking…", wait=True)
 
-        answer = await ask_agent(question, str(interaction.user.id), username=str(interaction.user))
+        answer = await ask_agent(question, str(interaction.user.id), api_key=ANTHROPIC_API_KEY, username=str(interaction.user))
 
         # Build embed
         embed = discord.Embed(

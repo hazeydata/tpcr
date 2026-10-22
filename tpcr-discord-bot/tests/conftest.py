@@ -23,6 +23,12 @@ def pytest_configure(config):
 
 
 @pytest.fixture(autouse=True)
+def _ask_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("TPCR_DATA_ROOT", str(tmp_path))
+    monkeypatch.setenv("TPCR_ASK_PROVIDER", "qwen")
+
+
+@pytest.fixture(autouse=True)
 def _alarm_backstop():
     """Backstop only: abort any single test that hangs for 20s (POSIX; needs SIGALRM)."""
     import signal

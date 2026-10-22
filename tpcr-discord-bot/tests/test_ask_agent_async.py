@@ -45,7 +45,19 @@ def test_ask_agent_uses_async_http_client():
     assert "httpx.AsyncClient" in source, (
         "ask_agent should use httpx.AsyncClient for non-blocking API calls"
     )
-    assert "anthropic" not in source
+    assert "requests.post" not in source
+    tree = ast.parse(source)
+    assert not any(
+        isinstance(n, ast.Import) and any(a.name == "anthropic" for a in n.names)
+        for n in tree.body
+    )
+    guarded = [
+        n for n in tree.body
+        if isinstance(n, ast.Try)
+        and any(isinstance(h.type, ast.Name) and h.type.id == "ImportError" for h in n.handlers)
+        and any(isinstance(b, ast.Import) and any(a.name == "anthropic" for a in b.names) for b in n.body)
+    ]
+    assert guarded
 
 
 def test_ask_agent_does_not_block_event_loop():

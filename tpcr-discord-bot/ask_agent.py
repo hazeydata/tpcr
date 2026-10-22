@@ -22,8 +22,6 @@ from typing import Optional
 # env vars are read at call time (see _duckdb_path/_usage_file/_question_log),
 # never at import time.
 DATA_ROOT_ENV = "TPCR_DATA_ROOT"
-DATA_ROOT = "/mnt/data/pipeline"
-DUCKDB_PATH = DATA_ROOT + "/tpcr_live.duckdb"
 DUCKDB_PATH_ENV = "TPCR_DUCKDB_PATH"
 USAGE_FILE_ENV = "TPCR_ASK_USAGE_FILE"
 QUESTION_LOG_ENV = "TPCR_ASK_QUESTION_LOG"
@@ -130,15 +128,17 @@ You answer questions about theme park crowds, wait times, and visit planning usi
 
 ### Parquet Fallback (use when DuckDB tables return no data)
 
-CRITICAL: If a query against a DuckDB table returns no results, ALWAYS retry using the
-corresponding parquet file with read_parquet(). The parquet files often contain a fuller
+If a query against a DuckDB table returns no results, retry with the corresponding parquet
+file using read_parquet() at most once per question. The parquet files often contain a fuller
 date range (365+ days of forecasts) than the DuckDB tables.
 
 - WTI: `SELECT * FROM read_parquet('{data_root}/wti/wti.parquet') WHERE park_code = 'EP' AND park_date = '2026-10-01'`
 - Forecasts: `SELECT * FROM read_parquet('{data_root}/curves/forecast_parquet/all_forecasts.parquet') WHERE entity_code LIKE 'EP%' AND park_date = '2026-10-01'`
-- Fact tables (historical waits): `SELECT * FROM read_parquet('{data_root}/fact_tables/parquet/*.parquet') WHERE entity_code = 'MK01'`
+- Fact tables (historical waits): `SELECT round(avg(wait_time_minutes),1) FROM read_parquet('{data_root}/fact_tables/parquet/*.parquet') WHERE entity_code = 'MK141' AND wait_time_type = 'POSTED' AND park_date = '2026-10-17'`
 
-Always try the DuckDB table first (faster), then fall back to parquet if no results.
+Fact-table parquet schema: park_date is VARCHAR and may contain 'NaT'; compare it as a string (park_date = '2026-10-17') or TRY_CAST(park_date AS DATE) and exclude park_date = 'NaT'. observed_at is VARCHAR; prefer observed_at_ts (TIMESTAMPTZ).
+
+Always try the DuckDB table first (faster), then fall back to parquet once if no results.
 
 ## Park Code Reference
 - MK = Magic Kingdom (Walt Disney World)
@@ -168,6 +168,10 @@ NOTE: "Universal Orlando" or "Universal Orlando Resort" means ALL THREE parks: U
 ## Guidelines
 - Today's date is {today} ({today_dow}).
 - CRITICAL: When displaying dates, ALWAYS use dayname() or strftime(park_date, '%A') in your SQL to get the correct day-of-week name from the database. NEVER guess day names — LLMs frequently get them wrong for future dates.
+- "Posted" wait means wait_time_type = 'POSTED' (uppercase; 'ACTUAL' is user-reported). Only the entities table uses lowercase values; compare entities.wait_time_type with LOWER().
+- If a query for the asked date returns no rows (after at most one parquet retry), run SELECT min(park_date), max(park_date) on that table and answer plainly that there is no data for that date, giving the available date range. Do not give up silently.
+- Match attractions with entity_name ILIKE '%...%' rather than equality.
+- Resolve relative dates like "last Saturday" relative to {today} ({today_dow}) and use the explicit date in queries.
 - Use the `run_query` tool to query the database. Always use read-only queries (SELECT only).
 - When comparing dates, show WTI values and explain what they mean.
 - For "best day to visit" questions, query WTI and sort by lowest.
@@ -230,12 +234,15 @@ def _env_path(var: str, default):
 
 
 def data_path(*parts: str) -> str:
-    """Path under TPCR_DATA_ROOT (default DATA_ROOT); no parts gives the root itself."""
-    return os.path.join(str(_env_path(DATA_ROOT_ENV, DATA_ROOT)), *parts)
+    """Path under TPCR_DATA_ROOT; no parts gives the root itself."""
+    root = _env_path(DATA_ROOT_ENV, "")
+    if not root:
+        raise RuntimeError(f"{DATA_ROOT_ENV} is not set; set it to the pipeline root (e.g. ~/hazeydata/pipeline on the Mini)")
+    return os.path.join(str(root), *parts)
 
 
 def _duckdb_path() -> str:
-    return str(_env_path(DUCKDB_PATH_ENV, data_path("tpcr_live.duckdb")))
+    return str(_env_path(DUCKDB_PATH_ENV, "") or data_path("tpcr_live.duckdb"))
 
 
 def _usage_file() -> Path:
@@ -287,19 +294,19 @@ def _track_usage(user_id: str) -> tuple[int, int]:
     return count, -1  # No limit for now (free launch)
 
 
-def log_question(user_id: str, username: str, question: str, answer: str, duration_ms: int):
+def log_question(user_id: str, username: str, question: str, answer: str, duration_ms: int, model: str | None = None):
     """Append question + answer to JSONL log for analysis.
 
     Never raises: a question-log problem is logged and must not break /ask.
     """
     try:
-        _log_question(user_id, username, question, answer, duration_ms)
+        _log_question(user_id, username, question, answer, duration_ms, model)
     except Exception as e:
         logger.error("ask question log failed (%s=%s): %s: %s",
                      QUESTION_LOG_ENV, _question_log(), type(e).__name__, e)
 
 
-def _log_question(user_id: str, username: str, question: str, answer: str, duration_ms: int):
+def _log_question(user_id: str, username: str, question: str, answer: str, duration_ms: int, model: str | None = None):
     entry = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "user_id": str(user_id),
@@ -307,7 +314,7 @@ def _log_question(user_id: str, username: str, question: str, answer: str, durat
         "question": question,
         "answer": answer[:2000],
         "duration_ms": duration_ms,
-        "model": _qwen_config()[1],
+        "model": model or _qwen_config()[1],
     }
     path = _question_log()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -332,7 +339,7 @@ def run_duckdb_query(sql: str, max_retries: int = 8) -> str:
             con.close()
 
             if not result:
-                return "No results found."
+                return NO_RESULTS_MSG
 
             # Format as readable text (not full table — keep it compact)
             lines = [" | ".join(columns)]
@@ -365,6 +372,19 @@ def run_duckdb_query(sql: str, max_retries: int = 8) -> str:
             return QUERY_GLITCH_MSG
 
     return QUERY_BUSY_MSG
+
+
+NO_RESULTS_MSG = "No results found."
+
+
+def date_range_sql() -> str:
+    parquet = data_path("fact_tables", "parquet", "*.parquet")
+    return (
+        "SELECT min(d) AS min_date, max(d) AS max_date FROM ("
+        "SELECT park_date AS d FROM live_waits UNION ALL "
+        f"SELECT TRY_CAST(park_date AS DATE) FROM read_parquet('{parquet}') "
+        "WHERE park_date <> 'NaT')"
+    )
 
 
 QUERY_GLITCH_MSG = "I hit a temporary glitch querying the data — please try your question again in a moment. If it keeps happening, let us know in #feedback!"
@@ -575,12 +595,59 @@ async def _chat(messages: list[dict], use_tools: bool) -> dict:
     return await _post_chat(payload)
 
 
+try:
+    import anthropic as _anthropic
+    _CLAUDE_ERRORS = tuple(
+        e for e in (getattr(_anthropic, n, None) for n in ("APIError", "APIConnectionError", "APITimeoutError")) if e
+    ) + (asyncio.TimeoutError, ConnectionError, ImportError)
+except ImportError:
+    _CLAUDE_ERRORS = (asyncio.TimeoutError, ConnectionError, ImportError)
+
+CLAUDE_MODEL = "claude-sonnet-4-6"
+CLAUDE_TOOLS = [
+    {
+        "name": "run_query",
+        "description": TOOLS[0]["function"]["description"],
+        "input_schema": TOOLS[0]["function"]["parameters"],
+    }
+]
+
+
+async def _claude_loop(api_key: str, system_prompt: str, question: str) -> str | None:
+    import anthropic
+
+    client = anthropic.AsyncAnthropic(api_key=api_key, timeout=60.0, max_retries=1)
+    messages = [{"role": "user", "content": question}]
+    for round_num in range(1, 6):
+        resp = await client.messages.create(
+            model=CLAUDE_MODEL, max_tokens=1500, system=system_prompt, messages=messages, tools=CLAUDE_TOOLS,
+        )
+        tool_uses = [b for b in resp.content if b.type == "tool_use"]
+        if not tool_uses:
+            return "".join(b.text for b in resp.content if b.type == "text").strip()
+
+        messages.append({"role": "assistant", "content": resp.content})
+        results = []
+        for block in tool_uses:
+            sql = (block.input or {}).get("sql", "")
+            logger.info("ask claude round=%d sql=%s", round_num, sql)
+            sql_upper = sql.strip().upper()
+            if not sql_upper.startswith("SELECT") and not sql_upper.startswith("WITH"):
+                result = "Error: Only SELECT queries are allowed."
+            else:
+                result = await asyncio.to_thread(run_duckdb_query, sql)
+            results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
+        messages.append({"role": "user", "content": results})
+    return None
+
+
 async def ask_agent(question: str, user_id: str, api_key: str | None = None, username: str = "unknown") -> str:
     """
     Process a natural language question about theme park data.
     Uses a local Qwen server (OpenAI-compatible) with async DuckDB tool access.
 
-    api_key is accepted for backwards compatibility and ignored.
+    With TPCR_ASK_PROVIDER=anthropic (default) and an api_key, Claude answers and
+    Qwen is the fallback; TPCR_ASK_PROVIDER=qwen uses Qwen only.
     All blocking work (DuckDB queries, file I/O) is run off the event loop so
     the Discord heartbeat is never starved.
     """
@@ -598,9 +665,35 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
         {"role": "user", "content": question},
     ]
     use_tools = True
+    query_results = []
+
+    async def finish(answer: str, rounds: int, model: str | None = None) -> str:
+        if len(answer) > 1900:
+            answer = answer[:1900] + "..."
+
+        duration_ms = int((_time.monotonic() - _start) * 1000)
+        logger.info("/ask answered by %s after %d rounds in %d ms", model or _qwen_config()[1], rounds, duration_ms)
+        await asyncio.to_thread(log_question, user_id, username, question, answer, duration_ms, model)
+
+        if _is_bad_response(answer):
+            _trigger_self_heal(question, user_id, username, answer)
+
+        return answer
+
+    provider = os.getenv("TPCR_ASK_PROVIDER", "anthropic").strip().lower()
+    if provider == "anthropic" and api_key:
+        try:
+            claude_answer = await _claude_loop(api_key, system_prompt, question)
+        except _CLAUDE_ERRORS as e:
+            logger.warning("Claude /ask failed (%s); falling back to Qwen", type(e).__name__)
+        else:
+            if claude_answer:
+                return await finish(claude_answer, 5, CLAUDE_MODEL)
+    elif provider == "anthropic":
+        logger.warning("TPCR_ASK_PROVIDER=anthropic but no api_key; using Qwen")
 
     # Allow up to 5 tool-use rounds
-    for _ in range(5):
+    for round_num in range(1, 6):
         try:
             data = await _chat(messages, use_tools)
         except QwenHTTPError as e:
@@ -613,7 +706,7 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
                 raise
 
         message = data["choices"][0]["message"]
-        tool_calls = (message.get("tool_calls") or parse_text_tool_calls(message.get("content") or "")) if use_tools else None
+        tool_calls = (message.get("tool_calls") or parse_text_tool_calls(strip_think(message.get("content") or ""))) if use_tools else None
 
         if tool_calls:
             messages.append({
@@ -632,12 +725,15 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
                 except (ValueError, AttributeError):
                     sql = ""
 
+                logger.info("ask round=%d sql=%s", round_num, sql)
+
                 # Safety: reject non-SELECT queries
                 sql_upper = sql.strip().upper()
                 if not sql_upper.startswith("SELECT") and not sql_upper.startswith("WITH"):
                     result = "Error: Only SELECT queries are allowed."
                 else:
                     result = await asyncio.to_thread(run_duckdb_query, sql)
+                    query_results.append(result)
 
                 logger.info("ask tool_result name=%s status=%s", tool_name, tool_result_status(result))
 
@@ -648,20 +744,28 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
                 })
         else:
             # Final text response
-            answer = strip_think(message.get("content") or "")
+            return await finish(strip_think(message.get("content") or ""), round_num)
 
-            # Trim if too long for Discord
-            if len(answer) > 1900:
-                answer = answer[:1900] + "..."
+    messages.append({"role": "user", "content": "You have no more queries. Answer the question now from the results you have."})
+    try:
+        data = await _chat(messages, use_tools=False)
+        answer = strip_think(data["choices"][0]["message"].get("content") or "")
+    except Exception as e:
+        logger.warning("final no-tools answer failed: %s: %s", type(e).__name__, e)
+        answer = ""
+    if answer:
+        return await finish(answer, 5)
 
-            duration_ms = int((_time.monotonic() - _start) * 1000)
-            logger.info("/ask answered by %s in %d ms", _qwen_config()[1], duration_ms)
-            await asyncio.to_thread(log_question, user_id, username, question, answer, duration_ms)
-
-            if _is_bad_response(answer):
-                _trigger_self_heal(question, user_id, username, answer)
-
-            return answer
+    if query_results and all(r == NO_RESULTS_MSG for r in query_results):
+        no_data = "I don't have any wait data for that date."
+        try:
+            bounds = await asyncio.to_thread(run_duckdb_query, date_range_sql())
+            min_date, max_date = [v.strip() for v in bounds.split("\n")[2].split("|")]
+            if "None" not in (min_date, max_date):
+                no_data += f" Data is available from {min_date} to {max_date}."
+        except Exception as e:
+            logger.warning("date range lookup failed: %s: %s", type(e).__name__, e)
+        return await finish(no_data, 5)
 
     fallback = "I wasn't able to fully answer that question. Try rephrasing or asking something more specific!"
     duration_ms = int((_time.monotonic() - _start) * 1000)

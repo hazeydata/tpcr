@@ -19,9 +19,9 @@ def _clear(monkeypatch):
         monkeypatch.delenv(v, raising=False)
 
 
-def test_defaults_unchanged_without_env(monkeypatch):
+def test_defaults_unchanged_without_env(monkeypatch, tmp_path):
     _clear(monkeypatch)
-    assert aa._duckdb_path() == "/mnt/data/pipeline/tpcr_live.duckdb"
+    assert aa._duckdb_path() == f"{tmp_path}/tpcr_live.duckdb"
     assert aa._usage_file() == aa.USAGE_FILE
     assert aa._question_log() == aa.QUESTION_LOG
     assert str(aa.USAGE_FILE).endswith("tpcr-discord-bot/ask_usage.json")
@@ -37,10 +37,10 @@ def test_env_overrides_read_at_call_time(monkeypatch, tmp_path):
     assert aa._question_log() == tmp_path / "q.jsonl"
 
 
-def test_blank_env_falls_back_to_default(monkeypatch):
+def test_blank_env_falls_back_to_default(monkeypatch, tmp_path):
     _clear(monkeypatch)
     monkeypatch.setenv(aa.DUCKDB_PATH_ENV, "  ")
-    assert aa._duckdb_path() == aa.DUCKDB_PATH
+    assert aa._duckdb_path() == f"{tmp_path}/tpcr_live.duckdb"
 
 
 def test_track_usage_and_log_create_parent_dirs(monkeypatch, tmp_path):

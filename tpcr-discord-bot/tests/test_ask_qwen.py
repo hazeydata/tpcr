@@ -5,6 +5,7 @@ import inspect
 import json
 import os
 import sys
+import tempfile
 import types
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -145,8 +146,58 @@ def test_max_five_rounds():
     post = AsyncMock(side_effect=lambda p: chat_reply(tool_calls=[tool_call()]))
     with patch("ask_agent._post_chat", post), patch("ask_agent.run_duckdb_query", return_value="x"):
         answer = run(aa.ask_agent("q", "u"))
-    assert post.await_count == 5
+    assert post.await_count == 6
     assert "wasn't able to fully answer" in answer
+
+
+def test_no_data_message_when_all_results_empty():
+    async def chat(messages, use_tools):
+        if use_tools:
+            return chat_reply(tool_calls=[tool_call()])
+        return chat_reply("")
+
+    def query(sql, *args, **kwargs):
+        if "min(d)" in sql:
+            return "min_date | max_date\n-----\n2026-10-21 | 2026-10-22"
+        return "No results found."
+
+    with patch("ask_agent._chat", AsyncMock(side_effect=chat)), \
+         patch("ask_agent.run_duckdb_query", side_effect=query):
+        answer = run(aa.ask_agent("q", "u"))
+
+    assert "don't have any wait data" in answer
+    assert "2026-10-21" in answer and "2026-10-22" in answer
+    assert "wasn't able to fully answer" not in answer
+
+
+def test_final_answer_after_rounds_exhausted():
+    async def chat(messages, use_tools):
+        if use_tools:
+            return chat_reply(tool_calls=[tool_call()])
+        return chat_reply("<think>hm</think>Final from results")
+
+    chat_mock = AsyncMock(side_effect=chat)
+    with patch("ask_agent._chat", chat_mock), \
+         patch("ask_agent.run_duckdb_query", return_value="x") as q:
+        answer = run(aa.ask_agent("q", "u"))
+
+    assert answer == "Final from results"
+    assert chat_mock.await_count == 6
+    assert q.call_count == 5
+    assert chat_mock.await_args.kwargs["use_tools"] is False
+    assert chat_mock.await_args.args[0][-1] == {
+        "role": "user",
+        "content": "You have no more queries. Answer the question now from the results you have.",
+    }
+
+
+def test_tool_call_inside_think_not_executed():
+    text = '<think><tool_call>{"name": "run_query", "arguments": {"sql": "SELECT 1"}}</tool_call></think>Done'
+    post = AsyncMock(return_value=chat_reply(text))
+    with patch("ask_agent._post_chat", post), patch("ask_agent.run_duckdb_query") as q:
+        answer = run(aa.ask_agent("q", "u"))
+    q.assert_not_called()
+    assert answer == "Done"
 
 
 def test_retry_without_tools_on_4xx():
@@ -385,10 +436,10 @@ def bot():
             pass
     with patch.dict(sys.modules, stubs):
         sys.modules.pop("bot", None)
-        with patch.dict(os.environ, {}, clear=False):
+        with patch.dict(os.environ, {"TPCR_DATA_ROOT": tempfile.mkdtemp(), "TPCR_ASK_PROVIDER": "qwen"}):
             os.environ.pop("DISCORD_BOT_TOKEN", None)
             import bot as bot_module
-        yield bot_module
+            yield bot_module
         sys.modules.pop("bot", None)
 
 
@@ -507,6 +558,3 @@ def test_ask_never_touches_anthropic(bot):
 
     assert events[-1][0] == "edit"
     assert events[-1][1]["embed"].description == "Fine day"
-    src = inspect.getsource(getattr(bot.ask_command, "callback", bot.ask_command))
-    assert "ANTHROPIC" not in src and "anthropic" not in src
-    assert "anthropic" not in inspect.getsource(aa)

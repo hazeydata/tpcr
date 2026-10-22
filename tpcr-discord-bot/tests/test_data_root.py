@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import ask_agent as aa  # noqa: E402
 
 BOT_PY = Path(__file__).resolve().parent.parent / "bot.py"
-ENV = ("TPCR_DATA_ROOT", "TPCR_DUCKDB_PATH", "TPCR_QWEN_MAX_TOKENS",
+ENV = ("TPCR_DUCKDB_PATH", "TPCR_QWEN_MAX_TOKENS",
        "TPCR_QWEN_TEMPERATURE", "TPCR_QWEN_THINKING")
 
 
@@ -37,13 +37,13 @@ def _prompt():
     return captured[0]
 
 
-def test_default_root_unchanged(monkeypatch):
+def test_root_from_env_drives_default_paths(monkeypatch, tmp_path):
     _clear(monkeypatch)
-    assert aa.data_path() == "/mnt/data/pipeline"
-    assert aa._duckdb_path() == "/mnt/data/pipeline/tpcr_live.duckdb"
+    assert aa.data_path() == str(tmp_path)
+    assert aa._duckdb_path() == f"{tmp_path}/tpcr_live.duckdb"
     sysmsg = _prompt()["messages"][0]["content"]
-    assert "DuckDB at /mnt/data/pipeline/tpcr_live.duckdb" in sysmsg
-    assert "read_parquet('/mnt/data/pipeline/wti/wti.parquet')" in sysmsg
+    assert f"DuckDB at {tmp_path}/tpcr_live.duckdb" in sysmsg
+    assert f"read_parquet('{tmp_path}/wti/wti.parquet')" in sysmsg
 
 
 def test_root_env_moves_all_paths_and_prompt(monkeypatch, tmp_path):
@@ -201,7 +201,7 @@ def test_answered_by_log_line(monkeypatch, caplog):
     _clear(monkeypatch)
     with caplog.at_level(logging.INFO, logger=aa.logger.name):
         _prompt()
-    assert any(r.getMessage().startswith(f"/ask answered by {aa.QWEN_MODEL} in ") and r.getMessage().endswith(" ms")
+    assert any(r.getMessage().startswith(f"/ask answered by {aa.QWEN_MODEL} after ") and r.getMessage().endswith(" ms")
                for r in caplog.records)
 
 

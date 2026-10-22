@@ -906,11 +906,12 @@ if __name__ == "__main__":
     
     def fetch_data(park_code, days):
         """Fetch WTI forecast data, trying live DB then parquet fallback."""
+        from ask_agent import data_path
         today = date.today()
         end = today + timedelta(days=days)
         
         try:
-            con = duckdb.connect("/mnt/data/pipeline/tpcr_live.duckdb", read_only=True)
+            con = duckdb.connect(data_path("tpcr_live.duckdb"), read_only=True)
             rows = con.execute('''
                 SELECT park_date, wti 
                 FROM wti 
@@ -924,7 +925,7 @@ if __name__ == "__main__":
         except Exception:
             # Fallback to parquet
             con = duckdb.connect()
-            con.execute("CREATE VIEW wti AS SELECT * FROM read_parquet('/mnt/data/pipeline/wti/wti.parquet')")
+            con.execute(f"CREATE VIEW wti AS SELECT * FROM read_parquet('{data_path('wti', 'wti.parquet')}')")
             rows = con.execute('''
                 SELECT park_date, wti 
                 FROM wti 
