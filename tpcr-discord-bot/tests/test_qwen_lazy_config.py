@@ -48,14 +48,14 @@ def test_qwen_env_set_after_import_is_used(monkeypatch):
     aa = importlib.import_module("ask_agent")  # imported with QWEN_* unset
     try:
         # Now simulate load_dotenv(~/.env) running after the import.
-        monkeypatch.setenv("QWEN_MODEL", "/Users/x/models/Qwen-local-path")
+        monkeypatch.setenv("QWEN_MODEL", "local-models/Qwen-local-path")
         monkeypatch.setenv("QWEN_BASE_URL", "http://qwen.late:9999/")
         monkeypatch.setenv("QWEN_TIMEOUT", "17")
         _FakeClient.calls = []
         monkeypatch.setattr(aa, "httpx", types.SimpleNamespace(AsyncClient=_FakeClient))
         asyncio.run(aa._chat([{"role": "user", "content": "hi"}], use_tools=False))
         call = _FakeClient.calls[0]
-        assert call["json"]["model"] == "/Users/x/models/Qwen-local-path"
+        assert call["json"]["model"] == "local-models/Qwen-local-path"
         assert call["url"] == "http://qwen.late:9999/v1/chat/completions"
         assert call["timeout"] == 17.0
     finally:
