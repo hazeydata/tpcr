@@ -1,0 +1,30 @@
+name: Discord bot tests
+
+on:
+  pull_request:
+    paths:
+      - 'tpcr-discord-bot/**'
+      - '.github/workflows/discord-bot-tests.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'tpcr-discord-bot/**'
+      - '.github/workflows/discord-bot-tests.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test deps
+        run: pip install -r tpcr-discord-bot/requirements-test.txt
+      - name: Run suite
+        working-directory: tpcr-discord-bot
+        run: python -m pytest tests -q

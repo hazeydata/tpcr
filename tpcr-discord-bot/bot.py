@@ -682,10 +682,17 @@ def get_wti_range(park_code: str, target_date: date_type) -> dict:
                 ORDER BY time_slot
             """
             result = duckdb.sql(query).fetchdf()
-            wti_row = duckdb.sql(f"""
-                SELECT wti FROM read_parquet('{WTI_PATH}')
-                WHERE park_code = '{wti_code}' AND park_date = '{target_date}'
-            """).fetchone()
+            # Dedicated connection + execute(): DuckDB 2.x relations (duckdb.sql)
+            # have no fetchone(), and the shared default connection rejects new
+            # work while a prior execute() result is unfinished.
+            _con = duckdb.connect()
+            try:
+                wti_row = _con.execute(
+                    "SELECT wti FROM read_parquet(?) WHERE park_code = ? AND park_date = ?",
+                    [WTI_PATH, wti_code, target_date],
+                ).fetchone()
+            finally:
+                _con.close()
 
         if len(result) == 0:
             return None

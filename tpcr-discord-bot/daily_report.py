@@ -134,11 +134,17 @@ def get_embed_color(wti: float) -> int:
 
 def _read_wti_parquet(wti_code: str, target_date: date):
     """Read WTI from the parquet file (fallback path)."""
-    r = duckdb.sql(f"""
-        SELECT wti FROM read_parquet('{WTI_PATH}')
-        WHERE park_code = '{wti_code}' AND park_date = '{target_date}'
-        LIMIT 1
-    """).fetchone()
+    # Dedicated connection + execute(): DuckDB 2.x relations (duckdb.sql)
+    # have no fetchone(), and the shared default connection rejects new
+    # work while a prior execute() result is unfinished.
+    _con = duckdb.connect()
+    try:
+        r = _con.execute(
+            "SELECT wti FROM read_parquet(?) WHERE park_code = ? AND park_date = ? LIMIT 1",
+            [WTI_PATH, wti_code, target_date],
+        ).fetchone()
+    finally:
+        _con.close()
     return float(r[0]) if r else None
 
 
