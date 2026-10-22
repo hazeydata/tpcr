@@ -8,7 +8,8 @@ then posts PASS/FAIL (+ actions taken) to #bot-commands.
 Usage:
   .venv/bin/python scripts/tpcr_crowd_report_watchdog.py
   .venv/bin/python scripts/tpcr_crowd_report_watchdog.py --quiet
-  .venv/bin/python scripts/tpcr_crowd_report_watchdog.py --check-only
+  .venv/bin/python scripts/tpcr_crowd_report_watchdog.py --check-only --no-post
+  .venv/bin/python scripts/tpcr_crowd_report_watchdog.py --post   # opt in to the #bot-commands embed
   .venv/bin/python scripts/tpcr_crowd_report_watchdog.py --force-heal
 """
 from __future__ import annotations
@@ -29,21 +30,37 @@ from dotenv import load_dotenv
 
 load_dotenv(Path.home() / ".env")
 
-REPO = Path("/home/wilma/theme-park-crowd-report")
+REPO = Path(__file__).resolve().parents[1]
 BOT_DIR = REPO / "tpcr-discord-bot"
 VENV_PY = REPO / ".venv" / "bin" / "python"
-DUCKDB_PATH = "/mnt/data/pipeline/tpcr_live.duckdb"
-PIPELINE_STATE = Path("/mnt/data/pipeline/state/pipeline_state.json")
 PIPELINE_PY = REPO / "pipeline" / "pipeline.py"
 DAILY_REPORT = BOT_DIR / "daily_report.py"
-UPDATE_STATE_SH = Path.home() / "update_pipeline_state.sh"
-GATE_LOG = REPO / "logs" / "daily_report_gate.log"
-DAILY_LOG = Path("/tmp/daily_report.log")
+
+
+def data_root() -> Path:
+    """Data root resolved at call time: TPCR_DATA_ROOT else ~/hazeydata/pipeline."""
+    return Path(os.environ.get("TPCR_DATA_ROOT") or "~/hazeydata/pipeline").expanduser()
+
+
+def duckdb_path() -> str:
+    override = os.environ.get("TPCR_DUCKDB_PATH")
+    if override:
+        return str(Path(override).expanduser())
+    return str(data_root() / "tpcr_live.duckdb")
+
+
+def marker_path(today: date) -> Path:
+    return data_root() / "logs" / f"pipeline_metrics_{today.isoformat()}.json"
+
+
+DUCKDB_PATH = duckdb_path()
+GATE_LOG = data_root() / "logs" / "daily_report_gate.log"
+DAILY_LOG = data_root() / "logs" / "tpcr-crowd-report.log"
 
 CROWD_REPORTS_CHANNEL = os.getenv("TPCR_CROWD_REPORTS_CHANNEL", "1478240066382860298")
 BOT_COMMANDS_CHANNEL = os.getenv("TPCR_BOT_COMMANDS_CHANNEL", "1478240248361128079")
-RESULT_PATH = Path("/tmp/tpcr_crowd_report_watchdog.json")
-LOG_PATH = Path("/tmp/tpcr_crowd_report_watchdog.log")
+RESULT_PATH = data_root() / "logs" / "tpcr_crowd_report_watchdog.json"
+LOG_PATH = data_root() / "logs" / "tpcr_crowd_report_watchdog.log"
 
 WDW = ("MK", "EP", "HS", "AK")
 TOKEN = os.getenv("DISCORD_BOT_TOKEN") or ""
@@ -61,6 +78,7 @@ REPORT_TIMEOUT = 120
 def log(msg: str, quiet: bool = False) -> None:
     line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}"
     try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
         with open(LOG_PATH, "a") as f:
             f.write(line + "\n")
     except Exception:
@@ -144,6 +162,8 @@ def today_display_tokens(today: date) -> list[str]:
         today.strftime("%A, %B %d, %Y"),  # Wednesday, September 16, 2026
         today.strftime("%B %d, %Y"),  # September 16, 2026
         today.strftime("%B %-d, %Y") if sys.platform != "win32" else today.strftime("%B %d, %Y"),
+        # current daily_report title: unpadded day
+        f"{today.strftime('%A, %B')} {today.day}, {today.year}",
         # zero-padded day can appear as "September 06" vs "September 6"
         today.strftime("%B %d, %Y").replace(" 0", " "),
     ]
@@ -189,31 +209,32 @@ def find_today_crowd_report(messages: list[dict], today: date) -> dict | None:
     return None
 
 
-def get_wdw_wti_today() -> dict[str, float | None]:
+def get_wdw_wti_today(today: date | None = None) -> dict[str, float | None]:
     import duckdb
 
+    today = today or date.today()
     scores: dict[str, float | None] = {p: None for p in WDW}
-    con = duckdb.connect(DUCKDB_PATH, read_only=True)
+    con = duckdb.connect(duckdb_path(), read_only=True)
     try:
         for code in WDW:
-            row = con.execute(
-                """
-                SELECT wti FROM wti
-                WHERE park_code = ? AND park_date = CURRENT_DATE
-                  AND (time_slot IS NULL OR time_slot = 'daily' OR time_slot = '')
-                ORDER BY CASE WHEN source = 'actual' THEN 0 ELSE 1 END
-                LIMIT 1
-                """,
-                [code],
-            ).fetchone()
-            if row is None:
+            row = None
+            try:
                 row = con.execute(
                     """
                     SELECT wti FROM wti
-                    WHERE park_code = ? AND park_date = CURRENT_DATE
+                    WHERE park_code = ? AND park_date = ?
+                      AND (time_slot IS NULL OR time_slot = 'daily' OR time_slot = '')
+                    ORDER BY CASE WHEN source = 'actual' THEN 0 ELSE 1 END
                     LIMIT 1
                     """,
-                    [code],
+                    [code, today],
+                ).fetchone()
+            except Exception:
+                row = None  # time_slot/source columns may not exist
+            if row is None:
+                row = con.execute(
+                    "SELECT wti FROM wti WHERE park_code = ? AND park_date = ? LIMIT 1",
+                    [code, today],
                 ).fetchone()
             scores[code] = float(row[0]) if row else None
     finally:
@@ -221,23 +242,36 @@ def get_wdw_wti_today() -> dict[str, float | None]:
     return scores
 
 
-def pipeline_state_age_hours() -> tuple[float | None, str | None]:
+def pipeline_marker_status(today: date | None = None) -> tuple[str | None, float | None, str | None]:
+    """Check pipeline_metrics_<today>.json: (status, age_hours_from_mtime, error)."""
+    path = marker_path(today or date.today())
     try:
-        state = json.loads(PIPELINE_STATE.read_text())
-        fc = state.get("forecast_completed") or state.get("wti_completed")
-        if not fc:
-            return None, "no forecast_completed/wti_completed"
-        fc_dt = (
-            datetime.fromisoformat(fc.replace("Z", "+00:00"))
-            if "+" in fc or str(fc).endswith("Z")
-            else datetime.fromisoformat(fc)
-        )
-        if fc_dt.tzinfo is None:
-            fc_dt = fc_dt.replace(tzinfo=timezone.utc)
-        age = (datetime.now(timezone.utc) - fc_dt).total_seconds() / 3600.0
-        return age, None
+        status = json.loads(path.read_text()).get("status")
+        age = (datetime.now().timestamp() - path.stat().st_mtime) / 3600.0
+        return status, age, None
     except Exception as e:
-        return None, str(e)
+        return None, None, f"{path.name}: {type(e).__name__}: {e}"
+
+
+def post_state_check(today: date) -> tuple[bool, str]:
+    """Inspect daily_report's post-state file for `today`: (ok, reason). Read-only."""
+    path = data_root() / "state" / f"crowd_report_posted_{today.isoformat()}.json"
+    if not path.exists():
+        return True, "no post state file"
+    try:
+        data = json.loads(path.read_text())
+    except Exception as e:
+        return False, f"post state corrupt ({type(e).__name__})"
+    if not isinstance(data, dict) or data.get("state") not in ("pending", "posted", "failed"):
+        return False, "post state corrupt (missing or unknown state)"
+    if data["state"] == "pending":
+        return False, "post state pending (stale if > 6h)"
+    return True, f"post state {data['state']}"
+
+
+def _write_result(text: str) -> None:
+    RESULT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    RESULT_PATH.write_text(text)
 
 
 def tail_text(path: Path, n: int = 40) -> str:
@@ -372,13 +406,13 @@ def diagnose(expected: dict[str, float | None], me: dict, validation: dict) -> d
         classes.append("bad_wti_values")
         notes.append(f"out-of-bounds WTI: { {p: expected[p] for p in bad} }")
 
-    age, age_err = pipeline_state_age_hours()
+    pstatus, age, age_err = pipeline_marker_status(today)
     if age_err:
         classes.append("pipeline_state_unreadable")
-        notes.append(age_err)
-    elif age is not None and age > 26:
+        notes.append(f"pipeline marker missing/unreadable: {age_err}")
+    elif pstatus != "done":
         classes.append("pipeline_state_stale")
-        notes.append(f"pipeline_state age={age:.1f}h")
+        notes.append(f"pipeline marker status={pstatus!r} age={age:.1f}h")
 
     # Only inspect today's log slice so yesterday's 401s don't block heal forever
     log_tail = _today_log_slice(DAILY_LOG, today, 80)
@@ -389,9 +423,9 @@ def diagnose(expected: dict[str, float | None], me: dict, validation: dict) -> d
     elif auth_ok and "401" in log_tail and "Unauthorized" in log_tail:
         notes.append("ignoring historical 401 in log — live Discord @me is OK")
 
-    if "Quality gate FAILED" in log_tail:
+    if "GATE FAIL" in log_tail:
         classes.append("quality_gate_failed")
-        m = re.findall(r"Quality gate FAILED: ([^\n]+)", log_tail)
+        m = re.findall(r"GATE FAIL: ([^\n]+)", log_tail)
         if m:
             notes.append(f"last gate fail: {m[-1][:200]}")
     if re.search(r"(?m)^(Traceback \(most recent call last\):|[A-Za-z_]+Error:)", log_tail):
@@ -478,7 +512,7 @@ def heal(diagnosis: dict, quiet: bool) -> list[dict]:
         add(
             "pipeline_s09_wti",
             run_cmd(
-                [py, str(PIPELINE_PY), "--output-base", "/home/wilma/hazeydata/pipeline", "--step", "s09_wti"],
+                [py, str(PIPELINE_PY), "--output-base", str(data_root()), "--step", "s09_wti"],
                 timeout=STEP_TIMEOUT,
                 cwd=str(REPO),
             ),
@@ -487,26 +521,14 @@ def heal(diagnosis: dict, quiet: bool) -> list[dict]:
         add(
             "pipeline_s11_deploy",
             run_cmd(
-                [py, str(PIPELINE_PY), "--output-base", "/home/wilma/hazeydata/pipeline", "--step", "s11_deploy"],
+                [py, str(PIPELINE_PY), "--output-base", str(data_root()), "--step", "s11_deploy"],
                 timeout=STEP_TIMEOUT,
                 cwd=str(REPO),
             ),
         )
 
-    # Refresh pipeline_state timestamps (quality_gate uses this)
-    if UPDATE_STATE_SH.exists() and (
-        need_wti
-        or "pipeline_state_stale" in classes
-        or "pipeline_state_unreadable" in classes
-        or "quality_gate_failed" in classes
-        or "post_missing_or_stale" in classes
-    ):
-        add(
-            "update_pipeline_state",
-            run_cmd(["bash", str(UPDATE_STATE_SH)], timeout=60, cwd=str(Path.home())),
-        )
-
-    # Always attempt re-post when we got this far (unless auth blocked)
+    # Always attempt re-post when we got this far (unless auth blocked).
+    # daily_report honors its posted sentinel, so this cannot duplicate a post.
     # Append marker to daily_report.log
     try:
         with open(DAILY_LOG, "a") as f:
@@ -538,13 +560,8 @@ def heal(diagnosis: dict, quiet: bool) -> list[dict]:
                     "stderr_tail": "Code-level failure — not auto-patching production bot in unattended cron. Needs operator/agent session.",
                 },
             )
-        elif "Quality gate FAILED" in combined:
-            # Second chance: if gate still fails after WTI refresh, try state bump + one more post
-            if UPDATE_STATE_SH.exists():
-                add(
-                    "update_pipeline_state_retry",
-                    run_cmd(["bash", str(UPDATE_STATE_SH)], timeout=60),
-                )
+        elif "GATE FAIL" in combined:
+            # Second chance after the data heal (sentinel prevents duplicates)
             add(
                 "rerun_daily_report_retry",
                 run_cmd(report_cmd, timeout=REPORT_TIMEOUT, cwd=str(BOT_DIR)),
@@ -557,7 +574,7 @@ def recheck(today: date, expected: dict[str, float | None]) -> dict:
     msgs = fetch_recent_messages(CROWD_REPORTS_CHANNEL, limit=10)
     report = find_today_crowd_report(msgs, today)
     # refresh expected after heal (data may have landed)
-    expected2 = get_wdw_wti_today()
+    expected2 = get_wdw_wti_today(today)
     # prefer fresh expected if available
     for k, v in expected2.items():
         if v is not None:
@@ -574,13 +591,17 @@ def recheck(today: date, expected: dict[str, float | None]) -> dict:
     }
 
 
-def main() -> int:
+def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Morning #crowd-reports watchdog + heal")
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--check-only", action="store_true", help="Detect only; no heal")
     ap.add_argument("--force-heal", action="store_true", help="Heal even if post looks OK")
-    ap.add_argument("--no-post", action="store_true", help="Skip #bot-commands embed")
-    args = ap.parse_args()
+    ap.add_argument("--post", action="store_true",
+                    help="Post the status embed to #bot-commands (default: never post)")
+    ap.add_argument("--no-post", action="store_true",
+                    help="Accepted for compatibility; posting is off unless --post (wins over --post)")
+    args = ap.parse_args(argv)
+    do_post = args.post and not args.no_post
     quiet = args.quiet
 
     today = date.today()
@@ -599,7 +620,7 @@ def main() -> int:
         result["discord_me"] = {k: me.get(k) for k in ("ok", "status", "username")}
         log(f"discord @me ok={me.get('ok')} user={me.get('username')}", quiet)
 
-        expected = get_wdw_wti_today()
+        expected = get_wdw_wti_today(today)
         result["expected_wti"] = expected
         log(f"DuckDB WDW WTI today={expected}", quiet)
 
@@ -614,6 +635,17 @@ def main() -> int:
             "title": (report or {}).get("title"),
         }
         log(f"initial ok={validation['ok']} reasons={validation['reasons']}", quiet)
+
+        state_ok, state_reason = post_state_check(today)
+        log(f"post state ok={state_ok} ({state_reason})", quiet)
+        if not state_ok:
+            validation = {
+                **validation,
+                "ok": False,
+                "reasons": [*validation["reasons"], state_reason],
+            }
+            result["initial"]["ok"] = False
+            result["initial"]["reasons"] = validation["reasons"]
 
         need_heal = args.force_heal or not validation["ok"]
         actions: list[dict] = []
@@ -706,7 +738,7 @@ def main() -> int:
                 if tail:
                     desc += f"\n\n**Last fail tail (`{last.get('action')}`):**\n```\n{tail}\n```"
 
-        if not args.no_post:
+        if do_post:
             post = post_embed(
                 f"{title_prefix} — {today.isoformat()}",
                 desc,
@@ -720,7 +752,7 @@ def main() -> int:
             result["post"] = {"skipped": True}
 
         result["finished"] = datetime.now(timezone.utc).isoformat()
-        RESULT_PATH.write_text(json.dumps(result, indent=2, default=str))
+        _write_result(json.dumps(result, indent=2, default=str))
         log(
             f"{'PASS' if ok else 'FAIL'} healed={result.get('healed')} "
             f"post_id={(result.get('post') or {}).get('id')}",
@@ -733,7 +765,7 @@ def main() -> int:
         result["error"] = f"{type(e).__name__}: {e}"
         result["traceback"] = traceback.format_exc()[-2500:]
         try:
-            if not args.no_post:
+            if do_post:
                 result["post"] = post_embed(
                     f"❌ crowd-report watchdog — {today.isoformat()}",
                     f"```{type(e).__name__}: {e}```\n```{traceback.format_exc()[-1500:]}```",
@@ -741,7 +773,7 @@ def main() -> int:
                 )
         except Exception as pe:
             result["post_error"] = str(pe)
-        RESULT_PATH.write_text(json.dumps(result, indent=2, default=str))
+        _write_result(json.dumps(result, indent=2, default=str))
         log(f"FAIL exception: {e}", quiet)
         return 1
 
