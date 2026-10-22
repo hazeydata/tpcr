@@ -295,8 +295,8 @@ def track_usage(user_id: str) -> tuple[int, int]:
     try:
         return _track_usage(user_id)
     except Exception as e:
-        logger.error("ask usage tracking failed (%s=%s): %s: %s",
-                     USAGE_FILE_ENV, _usage_file(), type(e).__name__, e)
+        logger.error("ask usage tracking failed (%s=%s): %s",
+                     USAGE_FILE_ENV, _usage_file(), type(e).__name__)
         return 0, -1
 
 
@@ -323,8 +323,8 @@ def log_question(user_id: str, username: str, question: str, answer: str, durati
     try:
         _log_question(user_id, username, question, answer, duration_ms, model)
     except Exception as e:
-        logger.error("ask question log failed (%s=%s): %s: %s",
-                     QUESTION_LOG_ENV, _question_log(), type(e).__name__, e)
+        logger.error("ask question log failed (%s=%s): %s",
+                     QUESTION_LOG_ENV, _question_log(), type(e).__name__)
 
 
 def _log_question(user_id: str, username: str, question: str, answer: str, duration_ms: int, model: str | None = None):
@@ -388,8 +388,8 @@ def run_duckdb_query(sql: str, max_retries: int = 8) -> str:
                 # Even for non-lock errors, retry once with a brief pause
                 time.sleep(1)
                 continue
-            logger.warning("run_query failed after %d attempts: %s: %s",
-                           attempt + 1, type(e).__name__, e)
+            logger.warning("run_query failed after %d attempts: %s",
+                           attempt + 1, type(e).__name__)
             return QUERY_GLITCH_MSG
 
     return QUERY_BUSY_MSG
@@ -622,6 +622,14 @@ def strip_think(text: str) -> str:
     stays visible. An unmatched opening tag strips to the end (AC11). Leftover
     <tool_call>...</tool_call> markup (never executed from inside a think
     region, see strip_think_for_tools) is removed from the reply too.
+
+    Nesting:
+    - Nested balanced blocks are removed whole (outermost pair):
+      "x<think>a<think>b</think>c</think>y" -> "xy".
+    - With an unclosed outer block, "<think>a<think>b</think>c" strips from
+      the outer tag to the end: the inner close only ends the inner block.
+    - Extra stray closes are dropped and the surrounding text kept:
+      "a</think>b</think>c" -> "abc".
     """
     text = text or ""
     out: list[str] = []
@@ -775,7 +783,7 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
         except QwenHTTPError as e:
             # Server may not support tools: retry once without them
             if use_tools and (400 <= e.status < 500 or "tool" in e.body.lower()):
-                logger.warning("Qwen rejected tools request (%s); retrying without tools", e)
+                logger.warning("Qwen rejected tools request (%s); retrying without tools", type(e).__name__)
                 use_tools = False
                 data = await _chat(messages, use_tools)
             else:

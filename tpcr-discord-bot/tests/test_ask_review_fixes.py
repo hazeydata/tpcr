@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import ask_agent as aa  # noqa: E402
 
 _REAL_LOG_QUESTION = aa.log_question
+_REAL_TRACK_USAGE = aa.track_usage
 
 CALL = '<tool_call>{"name": "run_query", "arguments": {"sql": "SELECT 1"}}</tool_call>'
 
@@ -381,3 +382,50 @@ def test_ac21_no_mnt_data_literals():
     here = os.path.join(os.path.dirname(__file__), "..")
     for name in ("ask_agent.py", "bot.py", "calendar_image.py"):
         assert "/mnt/data" not in open(os.path.join(here, name)).read(), name
+
+
+# Exception text must never reach the logs (it can carry API keys); class name only.
+SECRET = "sk-ant-TESTSECRET123"
+
+
+class SecretBoom(Exception):
+    pass
+
+
+def _path_usage():
+    with patch("ask_agent._track_usage", side_effect=SecretBoom(SECRET)), \
+         patch("ask_agent._usage_file", return_value=aa.Path("usage.json")):
+        _REAL_TRACK_USAGE("u")
+    return "SecretBoom"
+
+
+def _path_question_log():
+    with patch("ask_agent._log_question", side_effect=SecretBoom(SECRET)), \
+         patch("ask_agent._question_log", return_value=aa.Path("q.jsonl")):
+        _REAL_LOG_QUESTION("u", "name", "q", "a", 1)
+    return "SecretBoom"
+
+
+def _path_run_query():
+    with patch("ask_agent._duckdb_path", return_value="x.duckdb"), \
+         patch("ask_agent.duckdb.connect", side_effect=SecretBoom(SECRET)), \
+         patch("time.sleep"):
+        aa.run_duckdb_query("SELECT 1", max_retries=3)
+    return "SecretBoom"
+
+
+def _path_qwen_tools_rejected():
+    post = AsyncMock(side_effect=[aa.QwenHTTPError(400, SECRET), chat_reply("ok")])
+    with patch("ask_agent._post_chat", post):
+        asyncio.run(aa.ask_agent("q", "u"))
+    return "QwenHTTPError"
+
+
+@pytest.mark.parametrize(
+    "path", [_path_usage, _path_question_log, _path_run_query, _path_qwen_tools_rejected]
+)
+def test_exception_text_not_logged(path, caplog):
+    with caplog.at_level(logging.DEBUG):
+        class_name = path()
+    assert SECRET not in caplog.text
+    assert class_name in caplog.text
