@@ -219,8 +219,9 @@ NOTE: "Universal Orlando" or "Universal Orlando Resort" means ALL THREE parks: U
 """
 
 # Usage tracking (simple JSON file)
-USAGE_FILE = Path("/home/wilma/theme-park-crowd-report/tpcr-discord-bot/ask_usage.json")
-QUESTION_LOG = Path("/home/wilma/theme-park-crowd-report/tpcr-discord-bot/ask_questions.jsonl")
+_BOT_DIR = Path(__file__).resolve().parent
+USAGE_FILE = _BOT_DIR / "ask_usage.json"
+QUESTION_LOG = _BOT_DIR / "ask_questions.jsonl"
 
 
 def _env_path(var: str, default):
@@ -391,8 +392,16 @@ _TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
 
 def _qwen_params() -> tuple[int, float, bool]:
     """(max_tokens, temperature, thinking) from env, read at call time."""
-    max_tokens = int(os.getenv("TPCR_QWEN_MAX_TOKENS", "").strip() or MAX_TOKENS)
-    temperature = float(os.getenv("TPCR_QWEN_TEMPERATURE", "").strip() or TEMPERATURE)
+    def num(var, cast, default):
+        raw = os.getenv(var, "").strip()
+        try:
+            return cast(raw) if raw else default
+        except ValueError:
+            logger.warning("invalid %s=%r; using default %s", var, raw, default)
+            return default
+
+    max_tokens = num("TPCR_QWEN_MAX_TOKENS", int, MAX_TOKENS)
+    temperature = num("TPCR_QWEN_TEMPERATURE", float, TEMPERATURE)
     thinking = os.getenv("TPCR_QWEN_THINKING", "").strip().lower() in ("1", "true", "yes", "on")
     return max_tokens, temperature, thinking
 
@@ -404,8 +413,8 @@ def parse_text_tool_calls(content: str) -> list[dict]:
         try:
             j = json.loads(blk)
             calls.append({"id": f"text{i}", "type": "function",
-                          "function": {"name": j["name"], "arguments": json.dumps(j.get("arguments", {}))}})
-        except (ValueError, KeyError, TypeError):
+                          "function": {"name": j["name"], "arguments": json.dumps(j["arguments"])}})
+        except Exception:  # any malformed block (incl. RecursionError) is skipped
             pass
     return calls
 _CHARS_PER_TOKEN = 3  # conservative: real text averages ~4

@@ -49,8 +49,8 @@ with python-dotenv (`load_dotenv(os.path.expanduser("~/.env"))`), so set them th
 |---|---|
 | `TPCR_DATA_ROOT` | `/mnt/data/pipeline` (pipeline root; DuckDB, WTI, forecasts, dimension tables, staging, fact parquet, accuracy archive, calendar images, live inference, and the /ask prompt all derive from it) |
 | `TPCR_DUCKDB_PATH` | `$TPCR_DATA_ROOT/tpcr_live.duckdb` (explicit value wins over the root) |
-| `TPCR_ASK_USAGE_FILE` | `$HOME/theme-park-crowd-report/tpcr-discord-bot/ask_usage.json` |
-| `TPCR_ASK_QUESTION_LOG` | `$HOME/theme-park-crowd-report/tpcr-discord-bot/ask_questions.jsonl` |
+| `TPCR_ASK_USAGE_FILE` | `<bot dir>/ask_usage.json` |
+| `TPCR_ASK_QUESTION_LOG` | `<bot dir>/ask_questions.jsonl` |
 | `TPCR_ASK_FEEDBACK_LOG` | `<bot dir>/ask_feedback.jsonl` (write failures log a WARNING) |
 | `TPCR_QWEN_MAX_TOKENS` | `700` |
 | `TPCR_QWEN_TEMPERATURE` | `0.2` |

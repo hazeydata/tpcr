@@ -157,3 +157,56 @@ def test_question_log_has_model_field(monkeypatch, tmp_path):
     monkeypatch.setenv("TPCR_ASK_QUESTION_LOG", str(log))
     aa.log_question("u", "n", "q", "a", 5)
     assert json.loads(log.read_text())["model"] == aa.QWEN_MODEL
+
+
+# ---------------------------------------------------------------- review fixes (v1)
+
+def test_text_tool_call_deeply_nested_json_skipped():
+    deep = "[" * 100000 + "]" * 100000
+    content = (f'<tool_call>{{"name": "run_query", "arguments": {deep}}}</tool_call>'
+               '<tool_call>{"name": "run_query", "arguments": {"sql": "SELECT 2"}}</tool_call>')
+    calls = aa.parse_text_tool_calls(content)
+    assert [json.loads(c["function"]["arguments"]) for c in calls] == [{"sql": "SELECT 2"}]
+
+
+def test_text_tool_call_without_arguments_skipped():
+    assert aa.parse_text_tool_calls('<tool_call>{"name": "run_query"}</tool_call>') == []
+
+
+def test_non_numeric_qwen_env_falls_back_with_warning(monkeypatch, caplog):
+    _clear(monkeypatch)
+    monkeypatch.setenv("TPCR_QWEN_MAX_TOKENS", "lots")
+    monkeypatch.setenv("TPCR_QWEN_TEMPERATURE", "warm")
+    with caplog.at_level(logging.WARNING, logger=aa.logger.name):
+        assert aa._qwen_params() == (700, 0.2, False)
+    assert "TPCR_QWEN_MAX_TOKENS" in caplog.text and "TPCR_QWEN_TEMPERATURE" in caplog.text
+    p = _prompt()  # /ask still works
+    assert (p["max_tokens"], p["temperature"]) == (700, 0.2)
+
+
+def test_feedback_log_default_is_bot_dir(monkeypatch):
+    monkeypatch.delenv("TPCR_ASK_FEEDBACK_LOG", raising=False)
+    tree = ast.parse(BOT_PY.read_text())
+    node = next(n for n in tree.body if isinstance(n, ast.Assign)
+                and getattr(n.targets[0], "id", None) == "FEEDBACK_LOG")
+    ns = {"Path": Path, "os": os, "__file__": str(BOT_PY)}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(BOT_PY), "exec"), ns)
+    assert ns["FEEDBACK_LOG"] == BOT_PY.parent / "ask_feedback.jsonl"
+    monkeypatch.setenv("TPCR_ASK_FEEDBACK_LOG", "/tmp/x/f.jsonl")
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(BOT_PY), "exec"), ns)
+    assert ns["FEEDBACK_LOG"] == Path("/tmp/x/f.jsonl")
+
+
+def test_answered_by_log_line(monkeypatch, caplog):
+    _clear(monkeypatch)
+    with caplog.at_level(logging.INFO, logger=aa.logger.name):
+        _prompt()
+    assert any(r.getMessage().startswith(f"/ask answered by {aa.QWEN_MODEL} in ") and r.getMessage().endswith(" ms")
+               for r in caplog.records)
+
+
+def test_usage_and_question_log_defaults_in_bot_dir():
+    bot_dir = BOT_PY.parent
+    assert aa.USAGE_FILE == bot_dir / "ask_usage.json"
+    assert aa.QUESTION_LOG == bot_dir / "ask_questions.jsonl"
+    assert "wilma" not in (bot_dir / "ask_agent.py").read_text()
