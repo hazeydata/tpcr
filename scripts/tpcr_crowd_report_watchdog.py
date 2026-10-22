@@ -8,7 +8,8 @@ then posts PASS/FAIL (+ actions taken) to #bot-commands.
 Usage:
   .venv/bin/python scripts/tpcr_crowd_report_watchdog.py
   .venv/bin/python scripts/tpcr_crowd_report_watchdog.py --quiet
-  .venv/bin/python scripts/tpcr_crowd_report_watchdog.py --check-only
+  .venv/bin/python scripts/tpcr_crowd_report_watchdog.py --check-only --no-post
+  .venv/bin/python scripts/tpcr_crowd_report_watchdog.py --post   # opt in to the #bot-commands embed
   .venv/bin/python scripts/tpcr_crowd_report_watchdog.py --force-heal
 """
 from __future__ import annotations
@@ -574,13 +575,17 @@ def recheck(today: date, expected: dict[str, float | None]) -> dict:
     }
 
 
-def main() -> int:
+def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Morning #crowd-reports watchdog + heal")
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--check-only", action="store_true", help="Detect only; no heal")
     ap.add_argument("--force-heal", action="store_true", help="Heal even if post looks OK")
-    ap.add_argument("--no-post", action="store_true", help="Skip #bot-commands embed")
-    args = ap.parse_args()
+    ap.add_argument("--post", action="store_true",
+                    help="Post the status embed to #bot-commands (default: never post)")
+    ap.add_argument("--no-post", action="store_true",
+                    help="Accepted for compatibility; posting is off unless --post (wins over --post)")
+    args = ap.parse_args(argv)
+    do_post = args.post and not args.no_post
     quiet = args.quiet
 
     today = date.today()
@@ -706,7 +711,7 @@ def main() -> int:
                 if tail:
                     desc += f"\n\n**Last fail tail (`{last.get('action')}`):**\n```\n{tail}\n```"
 
-        if not args.no_post:
+        if do_post:
             post = post_embed(
                 f"{title_prefix} — {today.isoformat()}",
                 desc,
@@ -733,7 +738,7 @@ def main() -> int:
         result["error"] = f"{type(e).__name__}: {e}"
         result["traceback"] = traceback.format_exc()[-2500:]
         try:
-            if not args.no_post:
+            if do_post:
                 result["post"] = post_embed(
                     f"❌ crowd-report watchdog — {today.isoformat()}",
                     f"```{type(e).__name__}: {e}```\n```{traceback.format_exc()[-1500:]}```",

@@ -8,12 +8,25 @@ has written pipeline_metrics_<date>.json with status "done".
 Data root: TPCR_DATA_ROOT (env / ~/.env) else ~/hazeydata/pipeline.
 Optional TPCR_DUCKDB_PATH overrides the live DuckDB file.
 
-Exit codes: 0 ok / already posted / dry-run, 1 post failed or no token,
-2 quality gate failed, 3 pipeline marker never appeared within the wait.
+Post state lives in <root>/state/crowd_report_posted_<date>.json, written
+atomically: "pending" is claimed before the POST, then "posted" (or "failed" on
+a definite non-2xx response, which does not block a retry). "pending" and
+"posted" block reposting unless --force.
 
-  daily_report.py --dry-run              # gate + render to stdout, never posts
+Exit codes:
+  0 ok / already posted / dry-run
+  1 post failed or no token
+  2 quality gate failed
+  3 pipeline marker never appeared within the wait
+  4 corrupt state file
+  5 pending state file (possible crash mid-post)
+  6 claim (pending) write failed; nothing was posted
+  7 final (posted) state write failed; pending marker remains
+  8 pipeline status is sync_partial
+
+  daily_report.py --dry-run              # gate + render to stdout, never posts, writes nothing
   daily_report.py --wait-for-pipeline 90
-  daily_report.py --force                # ignore the posted sentinel
+  daily_report.py --force                # override existing post state
   daily_report.py --skip-pipeline-check  # manual use only
 """
 
@@ -21,6 +34,7 @@ import argparse
 import json as _json
 import os
 import sys
+import tempfile
 import time
 import requests
 import duckdb
@@ -75,8 +89,49 @@ def gate_log_path() -> _Path:
     return data_root() / "logs" / "daily_report_gate.log"
 
 
-def sentinel_path(target: date) -> _Path:
+def state_path(target: date) -> _Path:
     return data_root() / "state" / f"crowd_report_posted_{target.isoformat()}.json"
+
+
+def write_state_atomic(path, data: dict) -> None:
+    """Write JSON to a tmp file in the same dir, fsync, then os.replace. Raises on failure."""
+    path = _Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(_json.dumps(data))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _now_iso() -> str:
+    return _dt.now(_tz.utc).isoformat()
+
+
+def read_state(target: date):
+    """Return (state_dict | None, corrupt_reason | None). None/None = no state file."""
+    path = state_path(target)
+    if not path.exists():
+        return None, None
+    try:
+        data = _json.loads(path.read_text())
+    except Exception as e:
+        return None, f"unparseable ({type(e).__name__})"
+    if not isinstance(data, dict):
+        return None, "not a JSON object"
+    if data.get("state") not in ("pending", "posted", "failed"):
+        return None, f"missing or unknown state {data.get('state')!r}"
+    if data.get("run_date") != target.isoformat():
+        return None, f"run_date {data.get('run_date')!r} != {target.isoformat()}"
+    return data, None
 
 
 def marker_path(target: date) -> _Path:
@@ -113,18 +168,27 @@ THIN_LINE = "─" * 35
 FOOTER_TEXT = "\U0001f4a1 /now [park] for live waits • /crowd [park] for forecasts • hazeydata.ai"
 
 
-def read_pipeline_status(target: date):
-    """Return status string from pipeline_metrics_<date>.json, or None if missing/unreadable."""
+TERMINAL_STATUSES = ("done", "failed", "sync_partial")
+
+
+def _read_marker(target: date):
     try:
         with open(marker_path(target)) as f:
-            status = _json.load(f).get("status")
-        return str(status) if status is not None else None
+            data = _json.load(f)
+        return data if isinstance(data, dict) else None
     except Exception:
         return None
 
 
+def read_pipeline_status(target: date):
+    """Return status string from pipeline_metrics_<date>.json, or None if missing/unreadable."""
+    data = _read_marker(target)
+    status = data.get("status") if data else None
+    return str(status) if status is not None else None
+
+
 def wait_for_pipeline(minutes: float, target: date, sleep=None, clock=None) -> str | None:
-    """Poll the marker every 60s until status is done; stop at failed or timeout.
+    """Poll the marker every 60s until status is terminal (done/failed/sync_partial) or timeout.
 
     Returns the last observed status (None if the marker never appeared).
     """
@@ -133,7 +197,7 @@ def wait_for_pipeline(minutes: float, target: date, sleep=None, clock=None) -> s
     deadline = clock() + minutes * 60
     while True:
         status = read_pipeline_status(target)
-        if status in ("done", "failed"):
+        if status in TERMINAL_STATUSES:
             return status
         if clock() >= deadline:
             return status
@@ -155,6 +219,9 @@ def quality_gate(park_groups, get_wti_fn, today, skip_pipeline_check=False) -> t
         status = read_pipeline_status(today)
         if status != "done":
             return False, f"Pipeline status is {status!r}, expected 'done' ({marker.name})"
+        marker_date = (_read_marker(today) or {}).get("run_date")
+        if marker_date is not None and marker_date != today.isoformat():
+            return False, f"Pipeline marker run_date {marker_date!r} != {today.isoformat()} ({marker.name})"
 
     # Check 2: All 4 WDW parks have WTI scores
     wdw_scores = {}
@@ -355,11 +422,30 @@ def render_text(payload: dict) -> str:
     return "\n\n".join(chunks).replace("**", "").replace("*", "")
 
 
+def _mark_failed(today: date, message: str) -> None:
+    """Best-effort: record a definite failure so a retry is allowed."""
+    try:
+        write_state_atomic(state_path(today), {
+            "run_date": today.isoformat(), "state": "failed",
+            "failed_at": _now_iso(), "error": message[:200],
+        })
+    except Exception as e:
+        print(f"⚠️ Could not write failed state: {e}")
+
+
 def post_report(payload: dict, today: date) -> int:
     token = os.getenv("DISCORD_BOT_TOKEN")
     if not token:
         print("❌ DISCORD_BOT_TOKEN is not set; cannot post.")
         return 1
+    try:
+        write_state_atomic(state_path(today), {
+            "run_date": today.isoformat(), "state": "pending",
+            "claimed_at": _now_iso(), "pid": os.getpid(),
+        })
+    except Exception as e:
+        print(f"❌ Could not write pending state ({type(e).__name__}: {e}); not posting.")
+        return 6
     headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
     try:
         r = requests.post(
@@ -367,27 +453,53 @@ def post_report(payload: dict, today: date) -> int:
             headers=headers, json=payload, timeout=30,
         )
     except Exception as e:
-        print(f"❌ Post failed: {type(e).__name__}")
+        # Outcome unknown: the pending marker stays and blocks automatic reposts.
+        print(f"❌ Post failed: {type(e).__name__} (outcome unknown; pending marker kept)")
         return 1
     if not r.ok:
         print(f"❌ Failed: {r.status_code} {r.text[:200]}")
+        _mark_failed(today, f"HTTP {r.status_code}")
         return 1
     try:
         message_id = r.json().get("id")
     except Exception:
         message_id = None
     try:
-        sp = sentinel_path(today)
-        sp.parent.mkdir(parents=True, exist_ok=True)
-        sp.write_text(_json.dumps({
-            "date": today.isoformat(),
-            "message_id": message_id,
-            "timestamp": _dt.now(_tz.utc).isoformat(),
-        }))
+        write_state_atomic(state_path(today), {
+            "run_date": today.isoformat(), "state": "posted",
+            "message_id": message_id, "posted_at": _now_iso(),
+        })
     except Exception as e:
-        print(f"⚠️ Could not write posted sentinel: {e}")
+        print(f"❌ Posted (message id {message_id}) but could not write posted state "
+              f"({type(e).__name__}: {e}); pending marker remains and blocks reposts.")
+        return 7
     print(f"✅ Daily report posted to #crowd-reports for {today} (message id {message_id})")
     return 0
+
+
+def check_state(today: date, force: bool):
+    """Return an exit code if existing state forbids posting, else None."""
+    state, corrupt = read_state(today)
+    path = state_path(today)
+    if corrupt:
+        if force:
+            print(f"FORCE: overriding corrupt state ({corrupt})")
+            return None
+        print(f"STATE CORRUPT ({path.name}: {corrupt}); refusing to post. "
+              f"Check #crowd-reports, fix or remove the file, or use --force.")
+        return 4
+    if state is None or state["state"] == "failed":
+        return None
+    st = state["state"]
+    if force:
+        print(f"FORCE: overriding existing state {st}")
+        return None
+    if st == "posted":
+        print(f"Daily report for {today} already posted ({path.name}); use --force to repost.")
+        return 0
+    print("PENDING marker from an earlier run (possible crash mid-post); refusing automatic "
+          "repost; check #crowd-reports, then use --force")
+    return 5
 
 
 def main(argv=None) -> int:
@@ -405,15 +517,16 @@ def main(argv=None) -> int:
     parser.add_argument("--skip-pipeline-check", action="store_true",
                         help="Skip gate check 1 (manual use only)")
     parser.add_argument("--force", action="store_true",
-                        help="Ignore the posted sentinel")
+                        help="Override existing post state (posted/pending/corrupt)")
     args = parser.parse_args(argv)
     today = args.date or date.today()
 
     _refresh_paths()
 
-    if not args.dry_run and not args.force and sentinel_path(today).exists():
-        print(f"Daily report for {today} already posted ({sentinel_path(today).name}); use --force to repost.")
-        return 0
+    if not args.dry_run:
+        rc = check_state(today, args.force)
+        if rc is not None:
+            return rc
 
     if args.wait_for_pipeline > 0 and not args.skip_pipeline_check:
         status = wait_for_pipeline(args.wait_for_pipeline, today)
@@ -421,10 +534,16 @@ def main(argv=None) -> int:
             print(f"❌ Pipeline marker for {today} never appeared within {args.wait_for_pipeline:g} min.")
             return 3
 
+    if (not args.dry_run and not args.skip_pipeline_check
+            and read_pipeline_status(today) == "sync_partial"):
+        print(f"❌ Pipeline status for {today} is sync_partial; not posting.")
+        return 8
+
     # === QUALITY GATE ===
     passed, reason = quality_gate(PARK_GROUPS, get_wti, today,
                                   skip_pipeline_check=args.skip_pipeline_check)
-    log_gate_result(passed, reason)
+    if not args.dry_run:
+        log_gate_result(passed, reason)
     if not passed:
         print(f"GATE FAIL: {reason}")
         if args.dry_run:

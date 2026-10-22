@@ -32,6 +32,8 @@
         <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>PYTHONUNBUFFERED</key>
         <string>1</string>
+        <key>TPCR_DATA_ROOT</key>
+        <string>__HOME__/hazeydata/pipeline</string>
     </dict>
 </dict>
 </plist>

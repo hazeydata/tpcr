@@ -68,6 +68,59 @@ def root(tmp_path, monkeypatch):
     return data
 
 
+class FakeTime:
+    """Fake clock + sleep. Sleeping beyond MAX_SLEEPS fails the test instead of hanging."""
+    MAX_SLEEPS = 5
+
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        if len(self.sleeps) > self.MAX_SLEEPS:
+            raise AssertionError(f"sleep called more than {self.MAX_SLEEPS} times (missing cap?)")
+        self.now += seconds
+
+    def monotonic(self):
+        return self.now
+
+
+@pytest.fixture(autouse=True)
+def fake_time(monkeypatch):
+    ft = FakeTime()
+    monkeypatch.setattr(daily_report, "time",
+                        SimpleNamespace(sleep=ft.sleep, monotonic=ft.monotonic))
+    return ft
+
+
+STATE_FILE = "crowd_report_posted_2026-10-12.json"
+
+
+def _state_file(root):
+    return root / "state" / STATE_FILE
+
+
+def _read_state_file(root):
+    return json.loads(_state_file(root).read_text())
+
+
+def _write_state(root, content):
+    (root / "state").mkdir(exist_ok=True)
+    _state_file(root).write_text(content if isinstance(content, str) else json.dumps(content))
+
+
+def _counting_post(monkeypatch, ok=True, status=200):
+    calls = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        calls.append((url, timeout))
+        return SimpleNamespace(ok=ok, status_code=status, text="boom", json=lambda: {"id": "999"})
+
+    monkeypatch.setattr(daily_report.requests, "post", fake_post, raising=False)
+    return calls
+
+
 def _set_marker(root, status):
     (root / "logs" / "pipeline_metrics_2026-10-12.json").write_text(json.dumps({"status": status}))
 
@@ -161,6 +214,36 @@ class TestGate:
         passed, _ = self._gate(skip_pipeline_check=True)
         assert passed
 
+    def test_gate_ignores_pipeline_state_forecast_completed(self, root):
+        (root / "logs" / "pipeline_metrics_2026-10-12.json").unlink()
+        (root / "state").mkdir()
+        (root / "state" / "pipeline_state.json").write_text(
+            json.dumps({"forecast_completed": "2026-10-12T06:10:00+00:00"}))
+        daily_report._refresh_paths()
+        passed, reason = self._gate()
+        assert not passed and "marker missing" in reason
+
+    def test_gate_passes_on_done_marker_without_pipeline_state(self, root):
+        _set_marker(root, "done")
+        assert not (root / "state" / "pipeline_state.json").exists()
+        daily_report._refresh_paths()
+        passed, reason = self._gate()
+        assert passed, reason
+
+    def test_marker_without_status_fails(self, root):
+        (root / "logs" / "pipeline_metrics_2026-10-12.json").write_text(
+            json.dumps({"forecast_completed": "2026-10-12T06:10:00+00:00"}))
+        daily_report._refresh_paths()
+        passed, reason = self._gate()
+        assert not passed and "None" in reason
+
+    def test_marker_run_date_mismatch_fails(self, root):
+        (root / "logs" / "pipeline_metrics_2026-10-12.json").write_text(
+            json.dumps({"status": "done", "run_date": "2026-10-11"}))
+        daily_report._refresh_paths()
+        passed, reason = self._gate()
+        assert not passed and "run_date" in reason
+
     def test_wdw_wti_still_required(self, root):
         daily_report._refresh_paths()
         passed, reason = daily_report.quality_gate(
@@ -198,19 +281,14 @@ class TestMain:
     def test_missing_token_exits_1(self, root):
         assert daily_report.main(self.ARGS) == 1
 
-    def test_sentinel_prevents_second_post(self, root, monkeypatch, capsys):
+    def test_posted_state_prevents_second_post(self, root, monkeypatch, capsys):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
-        calls = []
-
-        def fake_post(url, headers=None, json=None, timeout=None):
-            calls.append((url, timeout))
-            return SimpleNamespace(ok=True, status_code=200, text="", json=lambda: {"id": "999"})
-
-        monkeypatch.setattr(daily_report.requests, "post", fake_post, raising=False)
+        calls = _counting_post(monkeypatch)
         assert daily_report.main(self.ARGS) == 0
         assert len(calls) == 1 and calls[0][1] == 30
-        sentinel = json.loads((root / "state" / "crowd_report_posted_2026-10-12.json").read_text())
-        assert sentinel["message_id"] == "999" and sentinel["date"] == "2026-10-12"
+        state = _read_state_file(root)
+        assert state["state"] == "posted" and state["message_id"] == "999"
+        assert state["run_date"] == "2026-10-12" and "posted_at" in state
         assert "999" in capsys.readouterr().out
 
         assert daily_report.main(self.ARGS) == 0
@@ -218,34 +296,157 @@ class TestMain:
         assert len(calls) == 1
 
         assert daily_report.main(self.ARGS + ["--force"]) == 0
+        assert "FORCE: overriding existing state posted" in capsys.readouterr().out
         assert len(calls) == 2
 
-    def test_post_failure_exits_1_and_writes_no_sentinel(self, root, monkeypatch):
+    def test_non_2xx_marks_failed_and_retry_posts(self, root, monkeypatch):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
-        monkeypatch.setattr(
-            daily_report.requests, "post",
-            lambda *a, **k: SimpleNamespace(ok=False, status_code=500, text="boom"), raising=False)
+        _counting_post(monkeypatch, ok=False, status=500)
         assert daily_report.main(self.ARGS) == 1
-        assert not (root / "state" / "crowd_report_posted_2026-10-12.json").exists()
+        assert _read_state_file(root)["state"] == "failed"
+        calls = _counting_post(monkeypatch)
+        assert daily_report.main(self.ARGS) == 0
+        assert len(calls) == 1
+        assert _read_state_file(root)["state"] == "posted"
 
-    def test_wait_gives_up_with_exit_3(self, root, monkeypatch, capsys):
+    def test_exception_keeps_pending_and_blocks_retry(self, root, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+
+        def boom(*a, **k):
+            raise TimeoutError("slow")
+
+        monkeypatch.setattr(daily_report.requests, "post", boom, raising=False)
+        assert daily_report.main(self.ARGS) == 1
+        assert _read_state_file(root)["state"] == "pending"
+        monkeypatch.setattr(daily_report.requests, "post", _fail_post, raising=False)
+        assert daily_report.main(self.ARGS) == 5
+
+    def test_missing_token_writes_no_state(self, root):
+        assert daily_report.main(self.ARGS) == 1
+        assert not (root / "state").exists()
+
+    def test_claim_write_failure_exits_6_without_posting(self, root, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        real = daily_report.write_state_atomic
+
+        def flaky(path, data):
+            if data.get("state") == "pending":
+                raise OSError("disk full")
+            return real(path, data)
+
+        monkeypatch.setattr(daily_report, "write_state_atomic", flaky)
+        assert daily_report.main(self.ARGS) == 6  # _fail_post would raise if called
+
+    def test_final_write_failure_exits_7_and_pending_blocks(self, root, monkeypatch, capsys):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        calls = _counting_post(monkeypatch)
+        real = daily_report.write_state_atomic
+
+        def flaky(path, data):
+            if data.get("state") == "posted":
+                raise OSError("disk full")
+            return real(path, data)
+
+        monkeypatch.setattr(daily_report, "write_state_atomic", flaky)
+        assert daily_report.main(self.ARGS) == 7
+        assert len(calls) == 1
+        assert _read_state_file(root)["state"] == "pending"
+        assert daily_report.main(self.ARGS) == 5
+        assert len(calls) == 1
+        assert "PENDING" in capsys.readouterr().out
+
+    def test_pending_blocks_and_force_posts(self, root, monkeypatch, capsys):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        calls = _counting_post(monkeypatch)
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending"})
+        assert daily_report.main(self.ARGS) == 5
+        assert calls == []
+        assert daily_report.main(self.ARGS + ["--force"]) == 0
+        assert len(calls) == 1
+        assert "FORCE: overriding existing state pending" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("content", [
+        "not json {{{",
+        "[1, 2]",
+        {"run_date": "2026-10-12"},
+        {"run_date": "2026-10-11", "state": "posted"},
+    ])
+    def test_corrupt_state_exits_4_without_posting(self, root, monkeypatch, capsys, content):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        _write_state(root, content)
+        assert daily_report.main(self.ARGS) == 4
+        assert "STATE CORRUPT" in capsys.readouterr().out
+
+    def test_wait_gives_up_with_exit_3(self, root, monkeypatch, fake_time, capsys):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
         (root / "logs" / "pipeline_metrics_2026-10-12.json").unlink()
-        now = [0.0]
-        sleeps = []
-
-        def fake_sleep(s):
-            sleeps.append(s)
-            now[0] += s
-
-        monkeypatch.setattr(daily_report, "time",
-                            SimpleNamespace(sleep=fake_sleep, monotonic=lambda: now[0]))
-        assert daily_report.main(self.ARGS + ["--wait-for-pipeline", "3"]) == 3
-        assert sleeps == [60, 60, 60]
+        assert daily_report.main(self.ARGS + ["--wait-for-pipeline", "2"]) == 3
+        assert len(fake_time.sleeps) <= 3
         assert "never appeared" in capsys.readouterr().out
+        assert not (root / "state").exists()
+
+    def test_sync_partial_exits_8_without_waiting_or_posting(self, root, monkeypatch, fake_time):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        _set_marker(root, "sync_partial")
+        assert daily_report.main(self.ARGS + ["--wait-for-pipeline", "90"]) == 8
+        assert fake_time.sleeps == []
+        assert not _state_file(root).exists()
+
+    def test_dry_run_writes_nothing(self, root):
+        daily_report._refresh_paths()
+        assert daily_report.main(self.ARGS + ["--dry-run"]) == 0
+        assert not daily_report.gate_log_path().exists()
+        assert not (root / "state").exists()
+        # A pending/corrupt state is neither read nor changed by a dry run.
+        _write_state(root, "garbage")
+        assert daily_report.main(self.ARGS + ["--dry-run"]) == 0
+        assert _state_file(root).read_text() == "garbage"
+
+    def test_real_run_writes_gate_log(self, root, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        _counting_post(monkeypatch)
+        assert daily_report.main(self.ARGS) == 0
+        assert daily_report.gate_log_path().exists()
+
+
+class TestAtomicWrite:
+    def test_uses_os_replace_and_leaves_no_tmp(self, tmp_path, monkeypatch):
+        replaced = []
+        real_replace = daily_report.os.replace
+
+        def spy(src, dst):
+            replaced.append((Path(src).parent, Path(dst)))
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(daily_report.os, "replace", spy)
+        target = tmp_path / "state" / "x.json"
+        daily_report.write_state_atomic(target, {"a": 1})
+        assert json.loads(target.read_text()) == {"a": 1}
+        assert replaced == [(target.parent, target)]
+        assert [p.name for p in target.parent.iterdir()] == ["x.json"]
+
+    def test_failure_raises_and_cleans_tmp(self, tmp_path, monkeypatch):
+        def boom(src, dst):
+            raise OSError("nope")
+
+        monkeypatch.setattr(daily_report.os, "replace", boom)
+        target = tmp_path / "x.json"
+        with pytest.raises(OSError):
+            daily_report.write_state_atomic(target, {"a": 1})
+        assert list(tmp_path.iterdir()) == []
 
 
 class TestWait:
+    def test_missing_marker_capped_by_minutes(self, root, fake_time):
+        (root / "logs" / "pipeline_metrics_2026-10-12.json").unlink()
+        assert daily_report.wait_for_pipeline(2, TODAY) is None
+        assert len(fake_time.sleeps) <= 3
+
+    def test_sync_partial_is_terminal(self, root, fake_time):
+        _set_marker(root, "sync_partial")
+        assert daily_report.wait_for_pipeline(90, TODAY) == "sync_partial"
+        assert fake_time.sleeps == []
+
     def test_returns_done_once_marker_turns_done(self, root):
         _set_marker(root, "running")
         now = [0.0]
@@ -298,7 +499,7 @@ PLISTS = {
     },
     "com.hazeydata.tpcr-crowd-report-watchdog": {
         "script": "__HOME__/theme-park-crowd-report/scripts/tpcr_crowd_report_watchdog.py",
-        "args": ["--check-only"],
+        "args": ["--check-only", "--no-post"],
         "hour": 9,
         "log": "tpcr-crowd-report-watchdog",
     },
@@ -322,7 +523,11 @@ class TestPlists:
         assert pl["StandardOutPath"] == f"__HOME__/hazeydata/pipeline/logs/{spec['log']}.log"
         assert pl["StandardErrorPath"] == f"__HOME__/hazeydata/pipeline/logs/{spec['log']}.err.log"
         assert pl["EnvironmentVariables"] == {
-            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "PYTHONUNBUFFERED": "1"}
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "PYTHONUNBUFFERED": "1",
+            "TPCR_DATA_ROOT": "__HOME__/hazeydata/pipeline"}
+        root = pl["EnvironmentVariables"]["TPCR_DATA_ROOT"]
+        assert pl["StandardOutPath"].startswith(root + "/")
+        assert pl["StandardErrorPath"].startswith(root + "/")
 
     def test_no_absolute_user_paths_or_secrets(self, label):
         text, pl = self._load(label)
@@ -349,6 +554,31 @@ def watchdog():
 
 
 class TestWatchdog:
+    @pytest.mark.parametrize("argv,expect_post", [
+        ([], False),
+        (["--check-only"], False),
+        (["--check-only", "--no-post"], False),
+        (["--post", "--no-post"], False),
+        (["--post"], True),
+        (["--check-only", "--post"], True),
+    ])
+    def test_posts_only_with_post_flag(self, watchdog, root, monkeypatch, argv, expect_post):
+        posted = []
+        monkeypatch.setattr(watchdog, "_write_result", lambda text: None)
+        monkeypatch.setattr(watchdog, "discord_me", lambda: {"ok": True, "username": "bot"})
+        monkeypatch.setattr(watchdog, "get_wdw_wti_today",
+                            lambda today=None: {"MK": 20.0, "EP": 24.0, "HS": 32.0, "AK": 40.0})
+        monkeypatch.setattr(watchdog, "fetch_recent_messages", lambda *a, **k: [])
+        monkeypatch.setattr(watchdog, "post_embed",
+                            lambda *a, **k: posted.append(a) or {"ok": True, "id": "1"})
+        # No heal may shell out: the empty channel makes validation fail.
+        monkeypatch.setattr(watchdog, "diagnose", lambda *a, **k: {"primary": "x", "classes": []})
+        monkeypatch.setattr(watchdog, "heal", lambda *a, **k: [])
+        monkeypatch.setattr(watchdog, "recheck",
+                            lambda *a, **k: {"ok": False, "reasons": ["stub"]})
+        watchdog.main(argv + ["--quiet"])
+        assert bool(posted) is expect_post
+
     def test_repo_is_relative(self, watchdog):
         assert watchdog.REPO == REPO
 

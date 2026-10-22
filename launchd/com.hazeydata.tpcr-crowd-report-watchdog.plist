@@ -9,6 +9,7 @@
         <string>__HOME__/theme-park-crowd-report/.venv/bin/python</string>
         <string>__HOME__/theme-park-crowd-report/scripts/tpcr_crowd_report_watchdog.py</string>
         <string>--check-only</string>
+        <string>--no-post</string>
     </array>
     <key>WorkingDirectory</key>
     <string>__HOME__/theme-park-crowd-report</string>
@@ -31,6 +32,8 @@
         <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>PYTHONUNBUFFERED</key>
         <string>1</string>
+        <key>TPCR_DATA_ROOT</key>
+        <string>__HOME__/hazeydata/pipeline</string>
     </dict>
 </dict>
 </plist>
