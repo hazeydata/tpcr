@@ -584,7 +584,7 @@ def trim_messages(
 _THINK_TAG_RE = re.compile(r"<(/?)think\s*>", re.IGNORECASE)
 
 
-def strip_think(text: str) -> str:
+def strip_think_for_tools(text: str) -> str:
     """Remove <think>...</think> blocks, nested or not, case-insensitively.
 
     Tags are matched by depth, so a nested block is removed as a whole. An
@@ -612,6 +612,38 @@ def strip_think(text: str) -> str:
     if depth == 0:
         out.append(text[pos:])
     return "".join(out).strip()
+
+
+def strip_think(text: str) -> str:
+    """User-visible answer: drop balanced <think>...</think> blocks only.
+
+    Case-insensitive and nesting-aware. A stray closing tag is ignored and
+    the text around it kept (AC26), so "The answer is 42 minutes.</think>"
+    stays visible. An unmatched opening tag strips to the end (AC11). Leftover
+    <tool_call>...</tool_call> markup (never executed from inside a think
+    region, see strip_think_for_tools) is removed from the reply too.
+    """
+    text = text or ""
+    out: list[str] = []
+    stack: list[int] = []
+    pos = 0
+    for m in _THINK_TAG_RE.finditer(text):
+        out.append(text[pos:m.start()])
+        pos = m.end()
+        if m.group(1):
+            if stack:
+                del out[stack.pop():]
+            # stray close: tag dropped, text kept
+        else:
+            stack.append(len(out))
+    if stack:  # unmatched <think>: strip to the end (AC11)
+        del out[stack[0]:]
+    else:
+        out.append(text[pos:])
+    visible = "".join(out)
+    visible = _TOOL_CALL_RE.sub("", visible)
+    visible = re.sub(r"</?tool_call>", "", visible)
+    return visible.strip()
 
 
 async def _post_chat(payload: dict) -> dict:
@@ -721,7 +753,13 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
         try:
             claude_result = await _claude_loop(api_key, system_prompt, question)
         except Exception as e:  # any Claude failure (API, timeout, KeyError, ...) falls back
-            logger.warning("Claude /ask failed (%s: %s); falling back to Qwen", type(e).__name__, e)
+            # Class name (and HTTP status) only: provider error text can echo the key (AC24/AC27).
+            status = getattr(e, "status_code", None)
+            if status in (401, 403):
+                logger.error("Claude /ask auth failed (%s, status %s); falling back to Qwen",
+                             type(e).__name__, status)
+            else:
+                logger.warning("Claude /ask failed (%s); falling back to Qwen", type(e).__name__)
         else:
             claude_answer, claude_rounds = (claude_result if isinstance(claude_result, tuple)
                                             else (claude_result, 5))
@@ -744,7 +782,7 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
                 raise
 
         message = data["choices"][0]["message"]
-        tool_calls = (message.get("tool_calls") or parse_text_tool_calls(strip_think(message.get("content") or ""))) if use_tools else None
+        tool_calls = (message.get("tool_calls") or parse_text_tool_calls(strip_think_for_tools(message.get("content") or ""))) if use_tools else None
 
         if tool_calls:
             messages.append({
@@ -789,12 +827,14 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
         data = await _chat(messages, use_tools=False)
         answer = strip_think(data["choices"][0]["message"].get("content") or "")
     except Exception as e:
-        logger.warning("final no-tools answer failed: %s: %s", type(e).__name__, e)
+        logger.warning("final no-tools answer failed: %s", type(e).__name__)
         answer = ""
 
+    if answer:
+        return await finish(answer, 5)
+
     if query_results and all(r == NO_RESULTS_MSG for r in query_results):
-        # Every query was empty: the deterministic no-data message (with the
-        # available range) wins over whatever the final model call said.
+        # AC4: rounds exhausted, final call empty/raised, >=1 SELECT ran, all empty.
         no_data = "I don't have any wait data for that date."
         try:
             bounds = await asyncio.to_thread(run_duckdb_query, date_range_sql())
@@ -802,11 +842,8 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
             if "None" not in (min_date, max_date):
                 no_data += f" Data is available from {min_date} to {max_date}."
         except Exception as e:
-            logger.warning("date range lookup failed: %s: %s", type(e).__name__, e)
+            logger.warning("date range lookup failed: %s", type(e).__name__)
         return await finish(no_data, 5)
-
-    if answer:
-        return await finish(answer, 5)
 
     fallback = "I wasn't able to fully answer that question. Try rephrasing or asking something more specific!"
     duration_ms = int((_time.monotonic() - _start) * 1000)
