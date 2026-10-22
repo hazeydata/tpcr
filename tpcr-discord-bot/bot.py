@@ -47,8 +47,8 @@ from calendar_image import generate_calendar_image
 # Load ~/.env BEFORE importing ask_agent so its QWEN_* settings see it
 # (ask_agent also reads them at call time; this is defense in depth).
 load_dotenv(os.path.expanduser("~/.env"))
-from ask_agent import ask_agent, data_path, _duckdb_path
-data_path()
+from ask_agent import ask_agent, data_path, _duckdb_path, validate_config
+validate_config()
 
 # Add theme-park-crowd-report/src to sys.path for live inference model
 theme_park_src = os.path.expanduser("~/theme-park-crowd-report/src")

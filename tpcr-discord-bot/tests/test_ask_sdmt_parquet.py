@@ -10,9 +10,9 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-duckdb = pytest.importorskip("duckdb")
-pytest.importorskip("pandas")
-pytest.importorskip("pyarrow")
+import duckdb  # noqa: F401  required (requirements-test.txt); no skip
+import pandas  # noqa: F401
+import pyarrow  # noqa: F401
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 

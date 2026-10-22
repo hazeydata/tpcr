@@ -241,6 +241,27 @@ def data_path(*parts: str) -> str:
     return os.path.join(str(root), *parts)
 
 
+ASK_PROVIDERS = ("anthropic", "qwen")
+
+
+def ask_provider() -> str:
+    """TPCR_ASK_PROVIDER (default anthropic); any other value raises."""
+    provider = os.getenv("TPCR_ASK_PROVIDER", "anthropic").strip().lower() or "anthropic"
+    if provider not in ASK_PROVIDERS:
+        raise RuntimeError(
+            f"TPCR_ASK_PROVIDER={provider!r} is invalid; allowed values: {' or '.join(ASK_PROVIDERS)}"
+        )
+    return provider
+
+
+def validate_config() -> None:
+    """Startup check: fail loudly on a bad provider or a missing data root."""
+    ask_provider()
+    root = data_path()
+    if not os.path.isdir(root):
+        raise RuntimeError(f"{DATA_ROOT_ENV}={root} does not exist or is not a directory")
+
+
 def _duckdb_path() -> str:
     return str(_env_path(DUCKDB_PATH_ENV, "") or data_path("tpcr_live.duckdb"))
 
@@ -560,14 +581,37 @@ def trim_messages(
     return msgs
 
 
-_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_THINK_TAG_RE = re.compile(r"<(/?)think\s*>", re.IGNORECASE)
 
 
 def strip_think(text: str) -> str:
-    """Remove <think>...</think> blocks (and an unterminated trailing one)."""
-    text = _THINK_RE.sub("", text or "")
-    text = re.sub(r"<think>.*\Z", "", text, flags=re.DOTALL)
-    return text.replace("</think>", "").strip()
+    """Remove <think>...</think> blocks, nested or not, case-insensitively.
+
+    Tags are matched by depth, so a nested block is removed as a whole. An
+    unmatched opening tag hides everything to the end of the text. A stray
+    closing tag at depth 0 means the previous block was nested deeper than it
+    looked, so that block is extended to the stray tag (with no previous
+    block, everything before it is treated as thinking).
+    """
+    text = text or ""
+    out: list[str] = []
+    depth, pos, last_block_at = 0, 0, 0
+    for m in _THINK_TAG_RE.finditer(text):
+        closing = bool(m.group(1))
+        if depth == 0:
+            out.append(text[pos:m.start()])
+            if closing:  # stray close: extend the previous block to here
+                del out[last_block_at:]
+            else:
+                last_block_at = len(out)
+        if closing:
+            depth = max(depth - 1, 0)
+        else:
+            depth += 1
+        pos = m.end()
+    if depth == 0:
+        out.append(text[pos:])
+    return "".join(out).strip()
 
 
 async def _post_chat(payload: dict) -> dict:
@@ -595,14 +639,6 @@ async def _chat(messages: list[dict], use_tools: bool) -> dict:
     return await _post_chat(payload)
 
 
-try:
-    import anthropic as _anthropic
-    _CLAUDE_ERRORS = tuple(
-        e for e in (getattr(_anthropic, n, None) for n in ("APIError", "APIConnectionError", "APITimeoutError")) if e
-    ) + (asyncio.TimeoutError, ConnectionError, ImportError)
-except ImportError:
-    _CLAUDE_ERRORS = (asyncio.TimeoutError, ConnectionError, ImportError)
-
 CLAUDE_MODEL = "claude-sonnet-4-6"
 CLAUDE_TOOLS = [
     {
@@ -624,7 +660,7 @@ async def _claude_loop(api_key: str, system_prompt: str, question: str) -> str |
         )
         tool_uses = [b for b in resp.content if b.type == "tool_use"]
         if not tool_uses:
-            return "".join(b.text for b in resp.content if b.type == "text").strip()
+            return "".join(b.text for b in resp.content if b.type == "text").strip(), round_num
 
         messages.append({"role": "assistant", "content": resp.content})
         results = []
@@ -638,7 +674,7 @@ async def _claude_loop(api_key: str, system_prompt: str, question: str) -> str |
                 result = await asyncio.to_thread(run_duckdb_query, sql)
             results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
         messages.append({"role": "user", "content": results})
-    return None
+    return None, 5
 
 
 async def ask_agent(question: str, user_id: str, api_key: str | None = None, username: str = "unknown") -> str:
@@ -680,15 +716,17 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
 
         return answer
 
-    provider = os.getenv("TPCR_ASK_PROVIDER", "anthropic").strip().lower()
+    provider = ask_provider()
     if provider == "anthropic" and api_key:
         try:
-            claude_answer = await _claude_loop(api_key, system_prompt, question)
-        except _CLAUDE_ERRORS as e:
-            logger.warning("Claude /ask failed (%s); falling back to Qwen", type(e).__name__)
+            claude_result = await _claude_loop(api_key, system_prompt, question)
+        except Exception as e:  # any Claude failure (API, timeout, KeyError, ...) falls back
+            logger.warning("Claude /ask failed (%s: %s); falling back to Qwen", type(e).__name__, e)
         else:
+            claude_answer, claude_rounds = (claude_result if isinstance(claude_result, tuple)
+                                            else (claude_result, 5))
             if claude_answer:
-                return await finish(claude_answer, 5, CLAUDE_MODEL)
+                return await finish(claude_answer, claude_rounds, CLAUDE_MODEL)
     elif provider == "anthropic":
         logger.warning("TPCR_ASK_PROVIDER=anthropic but no api_key; using Qwen")
 
@@ -753,10 +791,10 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
     except Exception as e:
         logger.warning("final no-tools answer failed: %s: %s", type(e).__name__, e)
         answer = ""
-    if answer:
-        return await finish(answer, 5)
 
     if query_results and all(r == NO_RESULTS_MSG for r in query_results):
+        # Every query was empty: the deterministic no-data message (with the
+        # available range) wins over whatever the final model call said.
         no_data = "I don't have any wait data for that date."
         try:
             bounds = await asyncio.to_thread(run_duckdb_query, date_range_sql())
@@ -766,6 +804,9 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
         except Exception as e:
             logger.warning("date range lookup failed: %s: %s", type(e).__name__, e)
         return await finish(no_data, 5)
+
+    if answer:
+        return await finish(answer, 5)
 
     fallback = "I wasn't able to fully answer that question. Try rephrasing or asking something more specific!"
     duration_ms = int((_time.monotonic() - _start) * 1000)
