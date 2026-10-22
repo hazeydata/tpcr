@@ -133,3 +133,24 @@ def test_run_duckdb_query_uses_env_path(monkeypatch, tmp_path):
     monkeypatch.setattr("time.sleep", lambda s: None)
     assert aa.run_duckdb_query("SELECT 1", max_retries=2) == aa.QUERY_GLITCH_MSG
     assert seen == [str(tmp_path / "mini.duckdb")] * 2
+
+
+def test_question_log_default_used_when_env_unset(monkeypatch, tmp_path):
+    """With TPCR_ASK_QUESTION_LOG unset, log_question writes to the QUESTION_LOG default."""
+    _clear(monkeypatch)
+    monkeypatch.delenv("TPCR_ASK_QUESTION_LOG", raising=False)
+    assert str(aa._question_log()).endswith("tpcr-discord-bot/ask_questions.jsonl")
+    default = tmp_path / "default" / "ask_questions.jsonl"
+    monkeypatch.setattr(aa, "QUESTION_LOG", default)
+    assert aa._question_log() == default
+    aa.log_question("u1", "n", "default?", "a.", 3)
+    assert json.loads(default.read_text().splitlines()[0])["question"] == "default?"
+
+
+def test_duckdb_path_env_var_name_is_exact(monkeypatch, tmp_path):
+    """The DuckDB path comes from the env var named exactly TPCR_DUCKDB_PATH."""
+    _clear(monkeypatch)
+    assert aa.DUCKDB_PATH_ENV == "TPCR_DUCKDB_PATH"
+    target = str(tmp_path / "exact.duckdb")
+    monkeypatch.setenv("TPCR_DUCKDB_PATH", target)
+    assert aa._duckdb_path() == target

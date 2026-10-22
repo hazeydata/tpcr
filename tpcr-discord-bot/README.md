@@ -48,8 +48,8 @@ with python-dotenv (`load_dotenv(os.path.expanduser("~/.env"))`), so set them th
 | env var | default (original Linux host) |
 |---|---|
 | `TPCR_DUCKDB_PATH` | `/mnt/data/pipeline/tpcr_live.duckdb` |
-| `TPCR_ASK_USAGE_FILE` | `/home/wilma/theme-park-crowd-report/tpcr-discord-bot/ask_usage.json` |
-| `TPCR_ASK_QUESTION_LOG` | `/home/wilma/theme-park-crowd-report/tpcr-discord-bot/ask_questions.jsonl` |
+| `TPCR_ASK_USAGE_FILE` | `$HOME/theme-park-crowd-report/tpcr-discord-bot/ask_usage.json` |
+| `TPCR_ASK_QUESTION_LOG` | `$HOME/theme-park-crowd-report/tpcr-discord-bot/ask_questions.jsonl` |
 
 The repo does not record the Mini's DuckDB location: the pipeline's `output_base` lives in the
 gitignored `config/config.json`, and the Mini-side `bot.py` on `mini-live` still hardcodes
