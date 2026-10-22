@@ -253,6 +253,22 @@ def pipeline_marker_status(today: date | None = None) -> tuple[str | None, float
         return None, None, f"{path.name}: {type(e).__name__}: {e}"
 
 
+def post_state_check(today: date) -> tuple[bool, str]:
+    """Inspect daily_report's post-state file for `today`: (ok, reason). Read-only."""
+    path = data_root() / "state" / f"crowd_report_posted_{today.isoformat()}.json"
+    if not path.exists():
+        return True, "no post state file"
+    try:
+        data = json.loads(path.read_text())
+    except Exception as e:
+        return False, f"post state corrupt ({type(e).__name__})"
+    if not isinstance(data, dict) or data.get("state") not in ("pending", "posted", "failed"):
+        return False, "post state corrupt (missing or unknown state)"
+    if data["state"] == "pending":
+        return False, "post state pending (stale if > 6h)"
+    return True, f"post state {data['state']}"
+
+
 def _write_result(text: str) -> None:
     RESULT_PATH.parent.mkdir(parents=True, exist_ok=True)
     RESULT_PATH.write_text(text)
@@ -619,6 +635,17 @@ def main(argv=None) -> int:
             "title": (report or {}).get("title"),
         }
         log(f"initial ok={validation['ok']} reasons={validation['reasons']}", quiet)
+
+        state_ok, state_reason = post_state_check(today)
+        log(f"post state ok={state_ok} ({state_reason})", quiet)
+        if not state_ok:
+            validation = {
+                **validation,
+                "ok": False,
+                "reasons": [*validation["reasons"], state_reason],
+            }
+            result["initial"]["ok"] = False
+            result["initial"]["reasons"] = validation["reasons"]
 
         need_heal = args.force_heal or not validation["ok"]
         actions: list[dict] = []

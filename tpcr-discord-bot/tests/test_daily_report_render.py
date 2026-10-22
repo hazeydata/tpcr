@@ -9,7 +9,10 @@ import plistlib
 import shutil
 import sys
 import types
-from datetime import date
+import builtins
+import os
+import pathlib
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -68,9 +71,14 @@ def root(tmp_path, monkeypatch):
     return data
 
 
+class SleepCapExceeded(AssertionError):
+    """Raised by the fake sleep when a wait loop runs away (e.g. the deadline check is gone)."""
+
+
 class FakeTime:
-    """Fake clock + sleep. Sleeping beyond MAX_SLEEPS fails the test instead of hanging."""
+    """Fake clock + sleep. Fails immediately past MAX_SLEEPS calls or MAX_ELAPSED fake seconds."""
     MAX_SLEEPS = 5
+    MAX_ELAPSED = 10 * 60
 
     def __init__(self):
         self.now = 0.0
@@ -78,9 +86,10 @@ class FakeTime:
 
     def sleep(self, seconds):
         self.sleeps.append(seconds)
-        if len(self.sleeps) > self.MAX_SLEEPS:
-            raise AssertionError(f"sleep called more than {self.MAX_SLEEPS} times (missing cap?)")
         self.now += seconds
+        if len(self.sleeps) > self.MAX_SLEEPS or self.now > self.MAX_ELAPSED:
+            raise SleepCapExceeded(
+                f"sleep cap exceeded (calls={len(self.sleeps)}, fake elapsed={self.now}s)")
 
     def monotonic(self):
         return self.now
@@ -89,8 +98,9 @@ class FakeTime:
 @pytest.fixture(autouse=True)
 def fake_time(monkeypatch):
     ft = FakeTime()
-    monkeypatch.setattr(daily_report, "time",
-                        SimpleNamespace(sleep=ft.sleep, monotonic=ft.monotonic))
+    # wait_for_pipeline reads time.sleep / time.monotonic from this module at call time.
+    monkeypatch.setattr(daily_report, "time", SimpleNamespace(
+        sleep=ft.sleep, monotonic=ft.monotonic, time=lambda: ft.now))
     return ft
 
 
@@ -122,7 +132,16 @@ def _counting_post(monkeypatch, ok=True, status=200):
 
 
 def _set_marker(root, status):
-    (root / "logs" / "pipeline_metrics_2026-10-12.json").write_text(json.dumps({"status": status}))
+    (root / "logs" / "pipeline_metrics_2026-10-12.json").write_text(
+        json.dumps({"status": status, "run_date": "2026-10-12"}))
+
+
+def _write_marker(root, content):
+    (root / "logs" / "pipeline_metrics_2026-10-12.json").write_text(json.dumps(content))
+
+
+def _hours_ago(hours):
+    return (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
 
 
 def _payload(root):
@@ -232,7 +251,8 @@ class TestGate:
 
     def test_marker_without_status_fails(self, root):
         (root / "logs" / "pipeline_metrics_2026-10-12.json").write_text(
-            json.dumps({"forecast_completed": "2026-10-12T06:10:00+00:00"}))
+            json.dumps({"forecast_completed": "2026-10-12T06:10:00+00:00",
+                        "run_date": "2026-10-12"}))
         daily_report._refresh_paths()
         passed, reason = self._gate()
         assert not passed and "None" in reason
@@ -240,6 +260,32 @@ class TestGate:
     def test_marker_run_date_mismatch_fails(self, root):
         (root / "logs" / "pipeline_metrics_2026-10-12.json").write_text(
             json.dumps({"status": "done", "run_date": "2026-10-11"}))
+        daily_report._refresh_paths()
+        passed, reason = self._gate()
+        assert not passed and "run_date" in reason
+
+    def test_done_status_without_forecast_completed_passes(self, root):
+        _write_marker(root, {"status": "done", "run_date": "2026-10-12"})
+        daily_report._refresh_paths()
+        assert daily_report.read_pipeline_status(TODAY) == "done"
+        passed, reason = self._gate()
+        assert passed is True, reason
+
+    def test_forecast_completed_without_status_fails(self, root):
+        _write_marker(root, {"forecast_completed": "2026-10-12T06:10:00+00:00",
+                             "run_date": "2026-10-12"})
+        daily_report._refresh_paths()
+        passed, _ = self._gate()
+        assert passed is False
+
+    def test_dry_run_gate_pass_with_status_only_marker_no_wait(self, root, capsys, fake_time):
+        _write_marker(root, {"status": "done", "run_date": "2026-10-12"})
+        assert daily_report.main(["--date", "2026-10-12", "--dry-run"]) == 0
+        assert "GATE PASS" in capsys.readouterr().out
+        assert fake_time.sleeps == []
+
+    def test_marker_missing_run_date_fails(self, root):
+        _write_marker(root, {"status": "done"})
         daily_report._refresh_paths()
         passed, reason = self._gate()
         assert not passed and "run_date" in reason
@@ -358,12 +404,105 @@ class TestMain:
     def test_pending_blocks_and_force_posts(self, root, monkeypatch, capsys):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
         calls = _counting_post(monkeypatch)
-        _write_state(root, {"run_date": "2026-10-12", "state": "pending"})
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": _hours_ago(1)})
         assert daily_report.main(self.ARGS) == 5
         assert calls == []
         assert daily_report.main(self.ARGS + ["--force"]) == 0
         assert len(calls) == 1
         assert "FORCE: overriding existing state pending" in capsys.readouterr().out
+
+    def test_stale_pending_exits_9_and_force_posts(self, root, monkeypatch, capsys):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        calls = _counting_post(monkeypatch)
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": _hours_ago(7)})
+        assert daily_report.main(self.ARGS) == 9
+        out = capsys.readouterr().out
+        assert "STALE PENDING" in out and "--force" in out
+        assert calls == []
+        assert daily_report.main(self.ARGS + ["--force"]) == 0
+        assert len(calls) == 1
+        assert _read_state_file(root)["state"] == "posted"
+
+    def test_pending_without_claimed_at_is_stale(self, root, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": "garbage"})
+        assert daily_report.main(self.ARGS) == 9
+
+    def test_pending_for_other_run_date_exits_9(self, root, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        calls = _counting_post(monkeypatch)
+        _write_state(root, {"run_date": "2026-10-11", "state": "pending",
+                            "claimed_at": _hours_ago(1)})
+        assert daily_report.main(self.ARGS) == 9
+        assert calls == []
+        assert daily_report.main(self.ARGS + ["--force"]) == 0
+
+    def test_fresh_pending_still_exits_5(self, root, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        calls = _counting_post(monkeypatch)
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": _hours_ago(1)})
+        assert daily_report.main(self.ARGS) == 5
+        assert calls == []
+
+    def test_yesterday_pending_warns_but_does_not_block(self, root, monkeypatch, capsys):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        calls = _counting_post(monkeypatch)
+        (root / "state").mkdir()
+        (root / "state" / "crowd_report_posted_2026-10-11.json").write_text(json.dumps(
+            {"run_date": "2026-10-11", "state": "pending", "claimed_at": _hours_ago(30)}))
+        assert daily_report.main(self.ARGS) == 0
+        out = capsys.readouterr().out
+        assert "WARN" in out and "2026-10-11" in out
+        assert len(calls) == 1
+
+    def test_state_writes_are_atomic_and_replace_inode(self, root, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        state_dir = root / "state"
+        inodes = []
+
+        def fake_post(url, headers=None, json=None, timeout=None):
+            inodes.append(_state_file(root).stat().st_ino)
+            return SimpleNamespace(ok=True, status_code=200, text="", json=lambda: {"id": "1"})
+
+        monkeypatch.setattr(daily_report.requests, "post", fake_post, raising=False)
+
+        def in_state_dir(p):
+            try:
+                return pathlib.Path(p).resolve().is_relative_to(state_dir.resolve())
+            except (TypeError, ValueError, OSError):
+                return False
+
+        real_open = builtins.open
+        real_write_text = pathlib.Path.write_text
+        real_write_bytes = pathlib.Path.write_bytes
+
+        def guarded_open(file, mode="r", *a, **k):
+            if isinstance(file, (str, bytes, os.PathLike)) and any(c in mode for c in "wax+") \
+                    and in_state_dir(file):
+                raise AssertionError("non-atomic state write")
+            return real_open(file, mode, *a, **k)
+
+        def guarded_write_text(self, *a, **k):
+            if in_state_dir(self):
+                raise AssertionError("non-atomic state write")
+            return real_write_text(self, *a, **k)
+
+        def guarded_write_bytes(self, *a, **k):
+            if in_state_dir(self):
+                raise AssertionError("non-atomic state write")
+            return real_write_bytes(self, *a, **k)
+
+        monkeypatch.setattr(builtins, "open", guarded_open)
+        monkeypatch.setattr(pathlib.Path, "write_text", guarded_write_text)
+        monkeypatch.setattr(pathlib.Path, "write_bytes", guarded_write_bytes)
+        assert daily_report.main(self.ARGS) == 0
+        assert _read_state_file(root)["state"] == "posted"
+        assert len(inodes) == 1
+        assert _state_file(root).stat().st_ino != inodes[0]
 
     @pytest.mark.parametrize("content", [
         "not json {{{",
@@ -447,30 +586,34 @@ class TestWait:
         assert daily_report.wait_for_pipeline(90, TODAY) == "sync_partial"
         assert fake_time.sleeps == []
 
-    def test_returns_done_once_marker_turns_done(self, root):
+    def test_returns_done_once_marker_turns_done(self, root, fake_time):
         _set_marker(root, "running")
-        now = [0.0]
 
         def fake_sleep(s):
-            now[0] += s
+            fake_time.sleep(s)
             _set_marker(root, "done")
 
         status = daily_report.wait_for_pipeline(
-            10, TODAY, sleep=fake_sleep, clock=lambda: now[0])
-        assert status == "done" and now[0] == 60
+            10, TODAY, sleep=fake_sleep, clock=fake_time.monotonic)
+        assert status == "done" and fake_time.now == 60
 
-    def test_stops_immediately_on_failed(self, root):
+    def test_stops_immediately_on_failed(self, root, fake_time):
         _set_marker(root, "failed")
-        sleeps = []
         status = daily_report.wait_for_pipeline(
-            90, TODAY, sleep=sleeps.append, clock=lambda: 0.0)
-        assert status == "failed" and sleeps == []
+            90, TODAY, sleep=fake_time.sleep, clock=fake_time.monotonic)
+        assert status == "failed" and fake_time.sleeps == []
 
-    def test_zero_minutes_checks_once(self, root):
+    def test_zero_minutes_checks_once(self, root, fake_time):
         (root / "logs" / "pipeline_metrics_2026-10-12.json").unlink()
-        sleeps = []
-        assert daily_report.wait_for_pipeline(0, TODAY, sleep=sleeps.append) is None
-        assert sleeps == []
+        assert daily_report.wait_for_pipeline(
+            0, TODAY, sleep=fake_time.sleep, clock=fake_time.monotonic) is None
+        assert fake_time.sleeps == []
+
+    def test_deadline_ends_wait_with_explicit_fakes(self, root, fake_time):
+        (root / "logs" / "pipeline_metrics_2026-10-12.json").unlink()
+        assert daily_report.wait_for_pipeline(
+            3, TODAY, sleep=fake_time.sleep, clock=fake_time.monotonic) is None
+        assert fake_time.sleeps == [60, 60, 60]
 
 
 class TestPaths:
@@ -578,6 +721,40 @@ class TestWatchdog:
                             lambda *a, **k: {"ok": False, "reasons": ["stub"]})
         watchdog.main(argv + ["--quiet"])
         assert bool(posted) is expect_post
+
+    def test_post_state_check(self, watchdog, root):
+        ok, _ = watchdog.post_state_check(TODAY)
+        assert ok  # no state file
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending"})
+        ok, reason = watchdog.post_state_check(TODAY)
+        assert not ok and "pending" in reason
+        _write_state(root, {"run_date": "2026-10-12", "state": "posted"})
+        assert watchdog.post_state_check(TODAY)[0]
+        _write_state(root, "not json {{{")
+        ok, reason = watchdog.post_state_check(TODAY)
+        assert not ok and "corrupt" in reason
+
+    def test_check_only_fails_on_pending_state_and_never_posts(
+            self, watchdog, root, monkeypatch):
+        monkeypatch.setattr(watchdog, "date", SimpleNamespace(today=lambda: TODAY))
+        results, logs, posted = [], [], []
+        monkeypatch.setattr(watchdog, "_write_result", results.append)
+        monkeypatch.setattr(watchdog, "log", lambda msg, quiet=False: logs.append(msg))
+        monkeypatch.setattr(watchdog, "discord_me", lambda: {"ok": True, "username": "bot"})
+        monkeypatch.setattr(watchdog, "get_wdw_wti_today",
+                            lambda today=None: {"MK": 20.0, "EP": 24.0, "HS": 32.0, "AK": 40.0})
+        embed = daily_report.build_payload(TODAY, lambda *a: 20.0, None)["embeds"][0]
+        monkeypatch.setattr(watchdog, "fetch_recent_messages",
+                            lambda *a, **k: [{"id": "1", "embeds": [embed]}])
+        monkeypatch.setattr(watchdog, "post_embed",
+                            lambda *a, **k: posted.append(a) or {"ok": True, "id": "1"})
+        monkeypatch.setattr(watchdog, "diagnose", lambda *a, **k: {"primary": "x", "classes": []})
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending"})
+        rc = watchdog.main(["--check-only", "--no-post", "--quiet"])
+        assert rc == 1 and posted == []
+        assert any("post state pending" in m for m in logs)
+        assert any(m.startswith("FAIL") for m in logs)
+        assert "post state pending" in results[-1]
 
     def test_repo_is_relative(self, watchdog):
         assert watchdog.REPO == REPO

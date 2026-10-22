@@ -23,6 +23,8 @@ Exit codes:
   6 claim (pending) write failed; nothing was posted
   7 final (posted) state write failed; pending marker remains
   8 pipeline status is sync_partial
+  9 stale pending state (claimed > 6h ago, unparseable claimed_at, or for another
+    run_date); never reposted automatically, check #crowd-reports then --force
 
   daily_report.py --dry-run              # gate + render to stdout, never posts, writes nothing
   daily_report.py --wait-for-pipeline 90
@@ -38,7 +40,7 @@ import tempfile
 import time
 import requests
 import duckdb
-from datetime import date, datetime as _dt, timezone as _tz
+from datetime import date, datetime as _dt, timedelta as _td, timezone as _tz
 from pathlib import Path as _Path
 from dotenv import load_dotenv
 
@@ -49,6 +51,7 @@ CROWD_REPORTS_CHANNEL = "1478240066382860298"  # #crowd-reports (recreated Mar 2
 DATA_ROOT_ENV = "TPCR_DATA_ROOT"
 DUCKDB_PATH_ENV = "TPCR_DUCKDB_PATH"
 DEFAULT_DATA_ROOT = "~/hazeydata/pipeline"
+STALE_PENDING_HOURS = 6
 
 
 def data_root() -> _Path:
@@ -117,7 +120,10 @@ def _now_iso() -> str:
 
 
 def read_state(target: date):
-    """Return (state_dict | None, corrupt_reason | None). None/None = no state file."""
+    """Return (state_dict | None, corrupt_reason | None). None/None = no state file.
+
+    A pending file whose run_date differs from `target` yields ("stale", reason).
+    """
     path = state_path(target)
     if not path.exists():
         return None, None
@@ -129,6 +135,8 @@ def read_state(target: date):
         return None, "not a JSON object"
     if data.get("state") not in ("pending", "posted", "failed"):
         return None, f"missing or unknown state {data.get('state')!r}"
+    if data.get("state") == "pending" and data.get("run_date") != target.isoformat():
+        return "stale", f"pending state is for run_date {data.get('run_date')!r}, not {target.isoformat()}"
     if data.get("run_date") != target.isoformat():
         return None, f"run_date {data.get('run_date')!r} != {target.isoformat()}"
     return data, None
@@ -219,7 +227,10 @@ def quality_gate(park_groups, get_wti_fn, today, skip_pipeline_check=False) -> t
         status = read_pipeline_status(today)
         if status != "done":
             return False, f"Pipeline status is {status!r}, expected 'done' ({marker.name})"
-        marker_date = (_read_marker(today) or {}).get("run_date")
+        marker_data = _read_marker(today) or {}
+        if "run_date" not in marker_data:
+            return False, f"Pipeline marker missing run_date ({marker.name})"
+        marker_date = marker_data.get("run_date")
         if marker_date is not None and marker_date != today.isoformat():
             return False, f"Pipeline marker run_date {marker_date!r} != {today.isoformat()} ({marker.name})"
 
@@ -477,10 +488,33 @@ def post_report(payload: dict, today: date) -> int:
     return 0
 
 
+def _pending_age_hours(state: dict):
+    """Hours since claimed_at, or None if missing/unparseable."""
+    try:
+        claimed = _dt.fromisoformat(str(state["claimed_at"]))
+        if claimed.tzinfo is None:
+            claimed = claimed.replace(tzinfo=_tz.utc)
+        return (_dt.now(_tz.utc) - claimed).total_seconds() / 3600.0
+    except Exception:
+        return None
+
+
 def check_state(today: date, force: bool):
     """Return an exit code if existing state forbids posting, else None."""
+    yesterday = today - _td(days=1)
+    prev, _ = read_state(yesterday)
+    if isinstance(prev, dict) and prev.get("state") == "pending":
+        print(f"WARN: state for {yesterday} is still pending; check #crowd-reports "
+              f"for a possible missed or duplicate post.")
     state, corrupt = read_state(today)
     path = state_path(today)
+    if state == "stale":
+        if force:
+            print(f"FORCE: overriding stale pending state ({corrupt})")
+            return None
+        print(f"STALE PENDING marker ({corrupt}); refusing automatic repost; "
+              f"check #crowd-reports, then use --force")
+        return 9
     if corrupt:
         if force:
             print(f"FORCE: overriding corrupt state ({corrupt})")
@@ -491,6 +525,16 @@ def check_state(today: date, force: bool):
     if state is None or state["state"] == "failed":
         return None
     st = state["state"]
+    if st == "pending":
+        age_h = _pending_age_hours(state)
+        if age_h is None or age_h > STALE_PENDING_HOURS:
+            if force:
+                print("FORCE: overriding stale pending state")
+                return None
+            age_s = "unknown" if age_h is None else f"{age_h:.1f}"
+            print(f"STALE PENDING marker (claimed {age_s}h ago, limit {STALE_PENDING_HOURS}h); "
+                  f"refusing automatic repost; check #crowd-reports, then use --force")
+            return 9
     if force:
         print(f"FORCE: overriding existing state {st}")
         return None
