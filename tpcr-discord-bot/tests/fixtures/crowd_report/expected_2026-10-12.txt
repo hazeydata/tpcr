@@ -1,0 +1,42 @@
+🏰 Daily Crowd Report — Monday, October 12, 2026
+
+───────────────────────────────────
+🏰 Walt Disney World
+  ▸ Magic Kingdom — WTI 20 (Typical day)
+  ▸ EPCOT — WTI 24 (Typical day)
+  ▸ Hollywood Studios — WTI 32 (Above average)
+  ▸ Animal Kingdom — WTI 40 (Well above average)
+
+───────────────────────────────────
+🎠 Disneyland Resort
+  ▸ Disneyland — WTI 18 (Typical day)
+  ▸ California Adventure — WTI 20 (Typical day)
+
+───────────────────────────────────
+🦈 Universal Orlando
+  ▸ Universal Studios Florida — WTI 18 (Typical day)
+  ▸ Islands of Adventure — WTI 20 (Typical day)
+  ▸ Epic Universe — WTI 31 (Above average)
+
+───────────────────────────────────
+🎬 Universal Hollywood
+  ▸ Universal Studios Hollywood — WTI 22 (Typical day)
+
+───────────────────────────────────
+🗼 Tokyo Disney Resort
+  ▸ Tokyo Disneyland — WTI 9 (Well below avg WTI)
+  ▸ Tokyo DisneySea — WTI 9 (Well below avg WTI)
+
+───────────────────────────────────
+⭐ Best Picks
+  ▸ Magic Kingdom (WTI 20)
+  ▸ Disneyland (WTI 18)
+  ▸ Universal Studios Florida (WTI 18)
+  ▸ Tokyo Disneyland (WTI 9)
+
+───────────────────────────────────
+📈 Forecast Accuracy
+  ▸ Entity MAE: 8.2 min (241 days evaluated)
+  ▸ WTI MAE: 6.0 | Bias: +0.7 (238 days)
+
+💡 /now [park] for live waits • /crowd [park] for forecasts • hazeydata.ai

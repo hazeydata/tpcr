@@ -1,63 +1,160 @@
 """
 Daily Crowd Report — Posts to #crowd-reports every morning.
-Run via cron at 7:00 AM EST.
+
+Runs on the Mac Mini via launchd (launchd/com.hazeydata.tpcr-crowd-report.plist,
+07:00 local) with --wait-for-pipeline so it posts only after the 06:00 pipeline
+has written pipeline_metrics_<date>.json with status "done".
+
+Data root: TPCR_DATA_ROOT (env / ~/.env) else ~/hazeydata/pipeline.
+Optional TPCR_DUCKDB_PATH overrides the live DuckDB file.
+
+Exit codes: 0 ok / already posted / dry-run, 1 post failed or no token,
+2 quality gate failed, 3 pipeline marker never appeared within the wait.
+
+  daily_report.py --dry-run              # gate + render to stdout, never posts
+  daily_report.py --wait-for-pipeline 90
+  daily_report.py --force                # ignore the posted sentinel
+  daily_report.py --skip-pipeline-check  # manual use only
 """
 
 import argparse
+import json as _json
 import os
+import sys
+import time
 import requests
 import duckdb
-from datetime import date
+from datetime import date, datetime as _dt, timezone as _tz
+from pathlib import Path as _Path
 from dotenv import load_dotenv
 
 load_dotenv(os.path.expanduser("~/.env"))
 
-BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 CROWD_REPORTS_CHANNEL = "1478240066382860298"  # #crowd-reports (recreated Mar 2)
-DUCKDB_PATH = "/mnt/data/pipeline/tpcr_live.duckdb"
-WTI_PATH = "/mnt/data/pipeline/wti/wti.parquet"
+
+DATA_ROOT_ENV = "TPCR_DATA_ROOT"
+DUCKDB_PATH_ENV = "TPCR_DUCKDB_PATH"
+DEFAULT_DATA_ROOT = "~/hazeydata/pipeline"
+
+
+def data_root() -> _Path:
+    """Data root resolved at call time (env may be loaded after import)."""
+    return _Path(os.environ.get(DATA_ROOT_ENV) or DEFAULT_DATA_ROOT).expanduser()
+
+
+def _duckdb_path() -> str:
+    override = os.environ.get(DUCKDB_PATH_ENV)
+    if override:
+        return str(_Path(override).expanduser())
+    return str(data_root() / "tpcr_live.duckdb")
+
+
+def _wti_path() -> str:
+    return str(data_root() / "wti" / "wti.parquet")
+
+
+# Module attributes (computed after load_dotenv); helpers read these.
+# main() refreshes them so a changed environment is honored.
+DUCKDB_PATH = _duckdb_path()
+WTI_PATH = _wti_path()
 _USE_DUCKDB = os.path.exists(DUCKDB_PATH)
 
-HEADERS = {
-    "Authorization": f"Bot {BOT_TOKEN}",
-    "Content-Type": "application/json",
-}
+
+def _refresh_paths():
+    global DUCKDB_PATH, WTI_PATH, _USE_DUCKDB
+    DUCKDB_PATH = _duckdb_path()
+    WTI_PATH = _wti_path()
+    _USE_DUCKDB = os.path.exists(DUCKDB_PATH)
+
+
+def accuracy_path() -> _Path:
+    return data_root() / "accuracy" / "accuracy_summary.json"
+
+
+def gate_log_path() -> _Path:
+    return data_root() / "logs" / "daily_report_gate.log"
+
+
+def sentinel_path(target: date) -> _Path:
+    return data_root() / "state" / f"crowd_report_posted_{target.isoformat()}.json"
+
+
+def marker_path(target: date) -> _Path:
+    return data_root() / "logs" / f"pipeline_metrics_{target.isoformat()}.json"
+
 
 # WTI code mapping (TDL and TDS now have their own WTI scores)
 WTI_CODE_MAP = {}
 
-import json as _json
-from datetime import datetime as _dt, timezone as _tz
-from pathlib import Path as _Path
-
-PIPELINE_STATE = _Path("/mnt/data/pipeline/state/pipeline_state.json")
-GATE_LOG = _Path("/home/wilma/theme-park-crowd-report/logs/daily_report_gate.log")
-
 WDW_PARKS = ["MK", "EP", "HS", "AK"]  # Must all have WTI scores
 
+PARK_GROUPS = [
+    ("🏰 Walt Disney World", [
+        ("MK", "Magic Kingdom"), ("EP", "EPCOT"),
+        ("HS", "Hollywood Studios"), ("AK", "Animal Kingdom"),
+    ]),
+    ("🎠 Disneyland Resort", [
+        ("DL", "Disneyland"), ("CA", "California Adventure"),
+    ]),
+    ("🦈 Universal Orlando", [
+        ("UF", "Universal Studios Florida"), ("IA", "Islands of Adventure"),
+        ("EU", "Epic Universe"),
+    ]),
+    ("🎬 Universal Hollywood", [
+        ("UH", "Universal Studios Hollywood"),
+    ]),
+    ("🗼 Tokyo Disney Resort", [
+        ("TDL", "Tokyo Disneyland"),
+        ("TDS", "Tokyo DisneySea"),
+    ]),
+]
 
-def quality_gate(park_groups, get_wti_fn, today) -> tuple[bool, str]:
+THIN_LINE = "─" * 35
+FOOTER_TEXT = "\U0001f4a1 /now [park] for live waits • /crowd [park] for forecasts • hazeydata.ai"
+
+
+def read_pipeline_status(target: date):
+    """Return status string from pipeline_metrics_<date>.json, or None if missing/unreadable."""
+    try:
+        with open(marker_path(target)) as f:
+            status = _json.load(f).get("status")
+        return str(status) if status is not None else None
+    except Exception:
+        return None
+
+
+def wait_for_pipeline(minutes: float, target: date, sleep=None, clock=None) -> str | None:
+    """Poll the marker every 60s until status is done; stop at failed or timeout.
+
+    Returns the last observed status (None if the marker never appeared).
+    """
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    deadline = clock() + minutes * 60
+    while True:
+        status = read_pipeline_status(target)
+        if status in ("done", "failed"):
+            return status
+        if clock() >= deadline:
+            return status
+        print(f"Waiting for pipeline marker (status={status}) ...", flush=True)
+        sleep(60)
+
+
+def quality_gate(park_groups, get_wti_fn, today, skip_pipeline_check=False) -> tuple[bool, str]:
     """Quality gate — verify data before posting to customers.
 
     Returns (passed: bool, reason: str).
     A missing report is better than a broken one.
     """
-    # Check 1: Pipeline ran today (state file updated within 26 hours)
-    try:
-        with open(PIPELINE_STATE) as f:
-            state = _json.load(f)
-        fc = state.get("forecast_completed")
-        if fc:
-            fc_dt = _dt.fromisoformat(fc.replace("Z", "+00:00")) if "+" in fc or fc.endswith("Z") else _dt.fromisoformat(fc)
-            now = _dt.now(_tz.utc)
-            # Make fc_dt timezone-aware if needed
-            if fc_dt.tzinfo is None:
-                fc_dt = fc_dt.replace(tzinfo=_tz.utc)
-            age_hours = (now - fc_dt).total_seconds() / 3600
-            if age_hours > 26:
-                return False, f"Pipeline state stale ({age_hours:.0f}h old)"
-    except Exception as e:
-        return False, f"Pipeline state check failed: {e}"
+    # Check 1: today's pipeline run finished (completion marker with status done)
+    if not skip_pipeline_check:
+        marker = marker_path(today)
+        if not marker.exists():
+            return False, f"Pipeline marker missing ({marker.name})"
+        status = read_pipeline_status(today)
+        if status != "done":
+            return False, f"Pipeline status is {status!r}, expected 'done' ({marker.name})"
 
     # Check 2: All 4 WDW parks have WTI scores
     wdw_scores = {}
@@ -81,7 +178,7 @@ def quality_gate(park_groups, get_wti_fn, today) -> tuple[bool, str]:
                     non_wdw_count += 1
     # Don't fail on non-WDW — just log
     if non_wdw_count == 0:
-        print(f"\u26a0\ufe0f Warning: No non-WDW parks have data")
+        print(f"⚠️ Warning: No non-WDW parks have data")
 
     return True, f"All checks passed (WDW: {wdw_scores})"
 
@@ -89,17 +186,17 @@ def quality_gate(park_groups, get_wti_fn, today) -> tuple[bool, str]:
 def log_gate_result(passed: bool, reason: str):
     """Log quality gate result."""
     try:
-        GATE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        path = gate_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
         entry = {
             "timestamp": _dt.now(_tz.utc).isoformat(),
             "passed": passed,
             "reason": reason,
         }
-        with open(GATE_LOG, "a") as f:
+        with open(path, "a") as f:
             f.write(_json.dumps(entry) + "\n")
     except Exception:
         pass
-
 
 
 def wti_emoji(wti: float) -> str:
@@ -175,68 +272,38 @@ def get_wti(park_code: str, target_date: date) -> float:
         return None
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Daily Crowd Report")
-    parser.add_argument(
-        "--date",
-        type=lambda s: date.fromisoformat(s),
-        default=None,
-        help="Target date in YYYY-MM-DD format (default: today)",
-    )
-    args = parser.parse_args()
-    today = args.date or date.today()
-    date_display = today.strftime("%A, %B %d, %Y")
+def load_accuracy():
+    """Load accuracy_summary.json, or None (with a note) if unavailable."""
+    try:
+        with open(accuracy_path()) as f:
+            return _json.load(f)
+    except Exception as e:
+        print(f"⚠️ Accuracy section skipped: {e}")
+        return None
 
-    park_groups = [
-        ("🏰 Walt Disney World", [
-            ("MK", "Magic Kingdom"), ("EP", "EPCOT"),
-            ("HS", "Hollywood Studios"), ("AK", "Animal Kingdom"),
-        ]),
-        ("🎠 Disneyland Resort", [
-            ("DL", "Disneyland"), ("CA", "California Adventure"),
-        ]),
-        ("🦈 Universal Orlando", [
-            ("UF", "Universal Studios Florida"), ("IA", "Islands of Adventure"),
-            ("EU", "Epic Universe"),
-        ]),
-        ("🎬 Universal Hollywood", [
-            ("UH", "Universal Studios Hollywood"),
-        ]),
-        ("🗼 Tokyo Disney Resort", [
-            ("TDL", "Tokyo Disneyland"),
-            ("TDS", "Tokyo DisneySea"),
-        ]),
-    ]
 
-    # === QUALITY GATE ===
-    passed, reason = quality_gate(park_groups, get_wti, today)
-    log_gate_result(passed, reason)
-    if not passed:
-        print(f"\u274c Quality gate FAILED: {reason}")
-        print(f"Skipping #crowd-reports post — a missing report is better than a broken one.")
-        return
-    print(f"\u2705 Quality gate passed: {reason}")
-
-    THIN_LINE = "\u2500" * 35
+def build_payload(today: date, get_wti_fn, accuracy) -> dict:
+    """Pure renderer: Discord payload {"embeds": [embed]} for `today`."""
+    date_display = f"{today.strftime('%A, %B')} {today.day}, {today.year}"
     desc_parts = []
     best_picks = []
 
-    for group_name, parks in park_groups:
+    for group_name, parks in PARK_GROUPS:
         group_best_park = None
         group_best_wti = 999
 
         section = THIN_LINE + "\n" + group_name + "\n"
         park_lines = []
         for park_code, park_name in parks:
-            wti = get_wti(park_code, today)
+            wti = get_wti_fn(park_code, today)
             if wti is not None:
                 label = wti_label(wti)
-                park_lines.append(f"  \u25b8 **{park_name}** \u2014 WTI **{wti:.0f}** (*{label}*)")
+                park_lines.append(f"  ▸ **{park_name}** — WTI **{wti:.0f}** (*{label}*)")
                 if wti < group_best_wti:
                     group_best_wti = wti
                     group_best_park = park_name
             else:
-                park_lines.append(f"  \u25b8 **{park_name}** \u2014 No data")
+                park_lines.append(f"  ▸ **{park_name}** — No data")
 
         section += "\n".join(park_lines)
         desc_parts.append(section)
@@ -245,58 +312,140 @@ def main():
             best_picks.append((group_name, group_best_park, group_best_wti))
 
     if best_picks:
-        picks_section = THIN_LINE + "\n\u2b50 **Best Picks**\n"
-        pick_lines = []
-        for _, park, wti in best_picks:
-            pick_lines.append(f"  \u25b8 **{park}** (WTI {wti:.0f})")
+        picks_section = THIN_LINE + "\n⭐ **Best Picks**\n"
+        pick_lines = [f"  ▸ **{park}** (WTI {wti:.0f})" for _, park, wti in best_picks]
         picks_section += "\n".join(pick_lines)
         desc_parts.append(picks_section)
 
-    # --- Accuracy & Bias Correction section ---
-    accuracy_path = "/home/wilma/hazeydata/pipeline/accuracy/accuracy_summary.json"
-    try:
-        import json
-        with open(accuracy_path) as f:
-            acc = json.load(f)
-        
+    if accuracy:
         acc_lines = []
-        
-        entity_mae = acc.get("overall_mae")
+        entity_mae = accuracy.get("overall_mae")
         if entity_mae is not None:
-            dates_eval = acc.get("dates_evaluated", 0)
-            acc_lines.append(f"  \u25b8 Entity MAE: **{entity_mae:.1f} min** ({dates_eval} days evaluated)")
-        
-        wti_mae = acc.get("wti_mae")
-        wti_bias = acc.get("wti_bias")
+            dates_eval = accuracy.get("dates_evaluated", 0)
+            acc_lines.append(f"  ▸ Entity MAE: **{entity_mae:.1f} min** ({dates_eval} days evaluated)")
+
+        wti_mae = accuracy.get("wti_mae")
+        wti_bias = accuracy.get("wti_bias")
         if wti_mae is not None:
-            wti_dates = acc.get("wti_dates_evaluated", 0)
-            acc_lines.append(f"  \u25b8 WTI MAE: **{wti_mae:.1f}** | Bias: **{wti_bias:+.1f}** ({wti_dates} days)")
-        
+            wti_dates = accuracy.get("wti_dates_evaluated", 0)
+            bias_s = f"{wti_bias:+.1f}" if wti_bias is not None else "n/a"
+            acc_lines.append(f"  ▸ WTI MAE: **{wti_mae:.1f}** | Bias: **{bias_s}** ({wti_dates} days)")
+
         if acc_lines:
-            acc_section = THIN_LINE + "\n\U0001f4c8 **Forecast Accuracy**\n" + "\n".join(acc_lines)
-            desc_parts.append(acc_section)
-    except Exception as e:
-        print(f"\u26a0\ufe0f Accuracy section skipped: {e}")
+            desc_parts.append(THIN_LINE + "\n\U0001f4c8 **Forecast Accuracy**\n" + "\n".join(acc_lines))
 
     embed = {
-        "title": f"\U0001f3f0 Daily Crowd Report \u2014 {date_display}",
+        "title": f"\U0001f3f0 Daily Crowd Report — {date_display}",
         "color": get_embed_color(best_picks[0][2]) if best_picks else 0x0A2F8F,
         "description": "\n\n".join(desc_parts),
-        "footer": {"text": "\U0001f4a1 /now [park] for live waits \u2022 /crowd [park] for forecasts \u2022 hazeydata.ai"},
+        "footer": {"text": FOOTER_TEXT},
     }
+    return {"embeds": [embed]}
 
-    payload = {"embeds": [embed]}
 
-    r = requests.post(
-        f"https://discord.com/api/v10/channels/{CROWD_REPORTS_CHANNEL}/messages",
-        headers=HEADERS, json=payload
-    )
+def render_text(payload: dict) -> str:
+    """Plain-text view of the post (markdown emphasis stripped): title, description, footer."""
+    chunks = []
+    for emb in payload.get("embeds", []):
+        chunks.append("\n\n".join([
+            emb.get("title", ""),
+            emb.get("description", ""),
+            (emb.get("footer") or {}).get("text", ""),
+        ]))
+    return "\n\n".join(chunks).replace("**", "").replace("*", "")
 
-    if r.ok:
-        print(f"✅ Daily report posted to #crowd-reports for {today}")
-    else:
+
+def post_report(payload: dict, today: date) -> int:
+    token = os.getenv("DISCORD_BOT_TOKEN")
+    if not token:
+        print("❌ DISCORD_BOT_TOKEN is not set; cannot post.")
+        return 1
+    headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
+    try:
+        r = requests.post(
+            f"https://discord.com/api/v10/channels/{CROWD_REPORTS_CHANNEL}/messages",
+            headers=headers, json=payload, timeout=30,
+        )
+    except Exception as e:
+        print(f"❌ Post failed: {type(e).__name__}")
+        return 1
+    if not r.ok:
         print(f"❌ Failed: {r.status_code} {r.text[:200]}")
+        return 1
+    try:
+        message_id = r.json().get("id")
+    except Exception:
+        message_id = None
+    try:
+        sp = sentinel_path(today)
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        sp.write_text(_json.dumps({
+            "date": today.isoformat(),
+            "message_id": message_id,
+            "timestamp": _dt.now(_tz.utc).isoformat(),
+        }))
+    except Exception as e:
+        print(f"⚠️ Could not write posted sentinel: {e}")
+    print(f"✅ Daily report posted to #crowd-reports for {today} (message id {message_id})")
+    return 0
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(description="Daily Crowd Report")
+    parser.add_argument(
+        "--date",
+        type=lambda s: date.fromisoformat(s),
+        default=None,
+        help="Target date in YYYY-MM-DD format (default: today)",
+    )
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Run the gate and print the post; never POST, no token needed")
+    parser.add_argument("--wait-for-pipeline", type=float, default=0, metavar="MINUTES",
+                        help="Poll the pipeline marker every 60s for up to MINUTES (default 0)")
+    parser.add_argument("--skip-pipeline-check", action="store_true",
+                        help="Skip gate check 1 (manual use only)")
+    parser.add_argument("--force", action="store_true",
+                        help="Ignore the posted sentinel")
+    args = parser.parse_args(argv)
+    today = args.date or date.today()
+
+    _refresh_paths()
+
+    if not args.dry_run and not args.force and sentinel_path(today).exists():
+        print(f"Daily report for {today} already posted ({sentinel_path(today).name}); use --force to repost.")
+        return 0
+
+    if args.wait_for_pipeline > 0 and not args.skip_pipeline_check:
+        status = wait_for_pipeline(args.wait_for_pipeline, today)
+        if status is None and not args.dry_run:
+            print(f"❌ Pipeline marker for {today} never appeared within {args.wait_for_pipeline:g} min.")
+            return 3
+
+    # === QUALITY GATE ===
+    passed, reason = quality_gate(PARK_GROUPS, get_wti, today,
+                                  skip_pipeline_check=args.skip_pipeline_check)
+    log_gate_result(passed, reason)
+    if not passed:
+        print(f"GATE FAIL: {reason}")
+        if args.dry_run:
+            print("(dry-run: continuing to render anyway)")
+        else:
+            print("Skipping #crowd-reports post — a missing report is better than a broken one.")
+            return 2
+    else:
+        print(f"GATE PASS: {reason}")
+
+    payload = build_payload(today, get_wti, load_accuracy())
+
+    if args.dry_run:
+        print("\n===== DRY RUN: post preview (not sent) =====")
+        print(render_text(payload))
+        print("\n===== JSON payload =====")
+        print(_json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0
+
+    return post_report(payload, today)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
