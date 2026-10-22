@@ -87,6 +87,20 @@ FACT_PARQUET_DIR = "/mnt/data/pipeline/fact_tables/parquet"
 _USE_DUCKDB = os.path.exists(DUCKDB_PATH)
 
 
+def _parquet_df(query: str):
+    """Run a parquet-fallback query on a dedicated in-memory connection.
+
+    The module-level duckdb.sql() uses the shared default connection, which
+    DuckDB 2.x refuses to reuse while an earlier execute() result is still
+    unfinished (ResourceInUseException). A short-lived connection avoids that.
+    """
+    con = duckdb.connect()
+    try:
+        return con.execute(query).fetchdf()
+    finally:
+        con.close()
+
+
 def get_db(max_retries: int = 5):
     """Get a read-only DuckDB connection to the shared database (retries on lock)."""
     import time as _time
@@ -366,7 +380,7 @@ def get_wti_score(park_code: str, target_date: date_type) -> float:
               AND park_date = '{target_date}'
             LIMIT 1
         """
-        result = duckdb.sql(query).fetchdf()
+        result = _parquet_df(query)
         if len(result) > 0:
             return float(result.iloc[0]['wti'])
         return None
@@ -416,7 +430,7 @@ def get_forecasts(park_code: str, target_date: date_type):
             GROUP BY entity_code
             ORDER BY avg_wait DESC
         """
-        result = duckdb.sql(query).fetchdf()
+        result = _parquet_df(query)
         return result
     except Exception as e:
         print(f"⚠️ Error getting forecasts: {e}")
@@ -456,7 +470,7 @@ def get_archived_forecasts(park_code: str, target_date: date_type):
             GROUP BY entity_code
             ORDER BY avg_wait DESC
         """
-        result = duckdb.sql(query).fetchdf()
+        result = _parquet_df(query)
         return result
     except Exception as e:
         print(f"⚠️ Error getting archived forecasts: {e}")
@@ -681,7 +695,7 @@ def get_wti_range(park_code: str, target_date: date_type) -> dict:
                 GROUP BY time_slot
                 ORDER BY time_slot
             """
-            result = duckdb.sql(query).fetchdf()
+            result = _parquet_df(query)
             # Dedicated connection + execute(): DuckDB 2.x relations (duckdb.sql)
             # have no fetchone(), and the shared default connection rejects new
             # work while a prior execute() result is unfinished.
@@ -983,7 +997,7 @@ async def best_day_command(interaction: discord.Interaction, park: str, timefram
                   AND park_date BETWEEN '{start}' AND '{end}'
                 ORDER BY park_date
             """
-            df = duckdb.sql(query).fetchdf()
+            df = _parquet_df(query)
     except Exception as e:
         print(f"⚠️ Error in /best-day: {e}")
         _log_bot_error("best-day", type(e).__name__, str(e), "shown_error")
