@@ -1,0 +1,7 @@
+{
+  "overall_mae": 8.2,
+  "dates_evaluated": 241,
+  "wti_mae": 6.0,
+  "wti_bias": 0.7,
+  "wti_dates_evaluated": 238
+}
