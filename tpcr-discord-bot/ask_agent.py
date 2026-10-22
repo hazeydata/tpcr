@@ -16,7 +16,15 @@ from datetime import datetime, date
 from pathlib import Path
 from typing import Optional
 
+# Host paths. The defaults are the original (Linux) host values; other hosts
+# override them with env vars, normally set in ~/.env, which bot.py loads with
+# python-dotenv. bot.py imports this module *before* it calls load_dotenv, so the
+# env vars are read at call time (see _duckdb_path/_usage_file/_question_log),
+# never at import time.
 DUCKDB_PATH = "/mnt/data/pipeline/tpcr_live.duckdb"
+DUCKDB_PATH_ENV = "TPCR_DUCKDB_PATH"
+USAGE_FILE_ENV = "TPCR_ASK_USAGE_FILE"
+QUESTION_LOG_ENV = "TPCR_ASK_QUESTION_LOG"
 
 # Failure patterns that trigger immediate self-healing
 _FAILURE_PATTERNS = [
@@ -213,18 +221,50 @@ USAGE_FILE = Path("/home/wilma/theme-park-crowd-report/tpcr-discord-bot/ask_usag
 QUESTION_LOG = Path("/home/wilma/theme-park-crowd-report/tpcr-discord-bot/ask_questions.jsonl")
 
 
+def _env_path(var: str, default):
+    value = os.environ.get(var, "").strip()
+    return os.path.expanduser(value) if value else default
+
+
+def _duckdb_path() -> str:
+    return str(_env_path(DUCKDB_PATH_ENV, DUCKDB_PATH))
+
+
+def _usage_file() -> Path:
+    return Path(_env_path(USAGE_FILE_ENV, USAGE_FILE))
+
+
+def _question_log() -> Path:
+    return Path(_env_path(QUESTION_LOG_ENV, QUESTION_LOG))
+
+
 def _load_usage() -> dict:
-    if USAGE_FILE.exists():
-        return json.loads(USAGE_FILE.read_text())
+    path = _usage_file()
+    if path.exists():
+        return json.loads(path.read_text())
     return {}
 
 
 def _save_usage(data: dict):
-    USAGE_FILE.write_text(json.dumps(data, indent=2))
+    path = _usage_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2))
 
 
 def track_usage(user_id: str) -> tuple[int, int]:
-    """Track usage and return (used_this_month, limit). Returns (-1, -1) if no limit."""
+    """Track usage and return (used_this_month, limit). Returns (-1, -1) if no limit.
+
+    Never raises: a usage-file problem is logged and must not break /ask.
+    """
+    try:
+        return _track_usage(user_id)
+    except Exception as e:
+        logger.error("ask usage tracking failed (%s=%s): %s: %s",
+                     USAGE_FILE_ENV, _usage_file(), type(e).__name__, e)
+        return 0, -1
+
+
+def _track_usage(user_id: str) -> tuple[int, int]:
     data = _load_usage()
     month_key = date.today().strftime("%Y-%m")
 
@@ -240,7 +280,18 @@ def track_usage(user_id: str) -> tuple[int, int]:
 
 
 def log_question(user_id: str, username: str, question: str, answer: str, duration_ms: int):
-    """Append question + answer to JSONL log for analysis."""
+    """Append question + answer to JSONL log for analysis.
+
+    Never raises: a question-log problem is logged and must not break /ask.
+    """
+    try:
+        _log_question(user_id, username, question, answer, duration_ms)
+    except Exception as e:
+        logger.error("ask question log failed (%s=%s): %s: %s",
+                     QUESTION_LOG_ENV, _question_log(), type(e).__name__, e)
+
+
+def _log_question(user_id: str, username: str, question: str, answer: str, duration_ms: int):
     entry = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "user_id": str(user_id),
@@ -249,7 +300,9 @@ def log_question(user_id: str, username: str, question: str, answer: str, durati
         "answer": answer[:2000],
         "duration_ms": duration_ms,
     }
-    with open(QUESTION_LOG, "a") as f:
+    path = _question_log()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as f:
         f.write(json.dumps(entry) + "\n")
 
 
@@ -264,7 +317,7 @@ def run_duckdb_query(sql: str, max_retries: int = 8) -> str:
     for attempt in range(max_retries):
         con = None
         try:
-            con = duckdb.connect(DUCKDB_PATH, read_only=True)
+            con = duckdb.connect(_duckdb_path(), read_only=True)
             result = con.execute(sql).fetchall()
             columns = [desc[0] for desc in con.description]
             con.close()
@@ -298,9 +351,22 @@ def run_duckdb_query(sql: str, max_retries: int = 8) -> str:
                 # Even for non-lock errors, retry once with a brief pause
                 time.sleep(1)
                 continue
-            return "I hit a temporary glitch querying the data — please try your question again in a moment. If it keeps happening, let us know in #feedback!"
+            logger.warning("run_query failed after %d attempts: %s: %s",
+                           attempt + 1, type(e).__name__, e)
+            return QUERY_GLITCH_MSG
 
-    return "Our database is momentarily busy — try your question again in a minute! The data refreshes constantly and things should clear up quickly. 🎢"
+    return QUERY_BUSY_MSG
+
+
+QUERY_GLITCH_MSG = "I hit a temporary glitch querying the data — please try your question again in a moment. If it keeps happening, let us know in #feedback!"
+QUERY_BUSY_MSG = "Our database is momentarily busy — try your question again in a minute! The data refreshes constantly and things should clear up quickly. 🎢"
+
+
+def tool_result_status(result: str) -> str:
+    """Classify a run_query tool result as 'ok' or 'error' for logging."""
+    if result in (QUERY_GLITCH_MSG, QUERY_BUSY_MSG) or result.startswith("Error:"):
+        return "error"
+    return "ok"
 
 
 logger = logging.getLogger("tpcr-bot")
@@ -501,6 +567,8 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
             })
             for call in tool_calls:
                 fn = call.get("function", {})
+                tool_name = fn.get("name") or "?"
+                logger.info("ask tool_call name=%s id=%s", tool_name, call.get("id", ""))
                 try:
                     args = fn.get("arguments") or "{}"
                     args = json.loads(args) if isinstance(args, str) else args
@@ -514,6 +582,8 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
                     result = "Error: Only SELECT queries are allowed."
                 else:
                     result = await asyncio.to_thread(run_duckdb_query, sql)
+
+                logger.info("ask tool_result name=%s status=%s", tool_name, tool_result_status(result))
 
                 messages.append({
                     "role": "tool",
