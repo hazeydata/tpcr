@@ -21,7 +21,9 @@ from typing import Optional
 # python-dotenv. bot.py imports this module *before* it calls load_dotenv, so the
 # env vars are read at call time (see _duckdb_path/_usage_file/_question_log),
 # never at import time.
-DUCKDB_PATH = "/mnt/data/pipeline/tpcr_live.duckdb"
+DATA_ROOT_ENV = "TPCR_DATA_ROOT"
+DATA_ROOT = "/mnt/data/pipeline"
+DUCKDB_PATH = DATA_ROOT + "/tpcr_live.duckdb"
 DUCKDB_PATH_ENV = "TPCR_DUCKDB_PATH"
 USAGE_FILE_ENV = "TPCR_ASK_USAGE_FILE"
 QUESTION_LOG_ENV = "TPCR_ASK_QUESTION_LOG"
@@ -90,7 +92,7 @@ def _trigger_self_heal(question: str, user_id: str, username: str, answer: str):
 SCHEMA_CONTEXT = """You are a theme park data analyst for the Theme Park Crowd Report (TPCR).
 You answer questions about theme park crowds, wait times, and visit planning using real forecast data.
 
-## Database: DuckDB at /mnt/data/pipeline/tpcr_live.duckdb (READ-ONLY)
+## Database: DuckDB at {duckdb_path} (READ-ONLY)
 
 ### Tables
 
@@ -132,9 +134,9 @@ CRITICAL: If a query against a DuckDB table returns no results, ALWAYS retry usi
 corresponding parquet file with read_parquet(). The parquet files often contain a fuller
 date range (365+ days of forecasts) than the DuckDB tables.
 
-- WTI: `SELECT * FROM read_parquet('/mnt/data/pipeline/wti/wti.parquet') WHERE park_code = 'EP' AND park_date = '2026-10-01'`
-- Forecasts: `SELECT * FROM read_parquet('/mnt/data/pipeline/curves/forecast_parquet/all_forecasts.parquet') WHERE entity_code LIKE 'EP%' AND park_date = '2026-10-01'`
-- Fact tables (historical waits): `SELECT * FROM read_parquet('/mnt/data/pipeline/fact_tables/parquet/*.parquet') WHERE entity_code = 'MK01'`
+- WTI: `SELECT * FROM read_parquet('{data_root}/wti/wti.parquet') WHERE park_code = 'EP' AND park_date = '2026-10-01'`
+- Forecasts: `SELECT * FROM read_parquet('{data_root}/curves/forecast_parquet/all_forecasts.parquet') WHERE entity_code LIKE 'EP%' AND park_date = '2026-10-01'`
+- Fact tables (historical waits): `SELECT * FROM read_parquet('{data_root}/fact_tables/parquet/*.parquet') WHERE entity_code = 'MK01'`
 
 Always try the DuckDB table first (faster), then fall back to parquet if no results.
 
@@ -217,8 +219,9 @@ NOTE: "Universal Orlando" or "Universal Orlando Resort" means ALL THREE parks: U
 """
 
 # Usage tracking (simple JSON file)
-USAGE_FILE = Path("/home/wilma/theme-park-crowd-report/tpcr-discord-bot/ask_usage.json")
-QUESTION_LOG = Path("/home/wilma/theme-park-crowd-report/tpcr-discord-bot/ask_questions.jsonl")
+_BOT_DIR = Path(__file__).resolve().parent
+USAGE_FILE = _BOT_DIR / "ask_usage.json"
+QUESTION_LOG = _BOT_DIR / "ask_questions.jsonl"
 
 
 def _env_path(var: str, default):
@@ -226,8 +229,13 @@ def _env_path(var: str, default):
     return os.path.expanduser(value) if value else default
 
 
+def data_path(*parts: str) -> str:
+    """Path under TPCR_DATA_ROOT (default DATA_ROOT); no parts gives the root itself."""
+    return os.path.join(str(_env_path(DATA_ROOT_ENV, DATA_ROOT)), *parts)
+
+
 def _duckdb_path() -> str:
-    return str(_env_path(DUCKDB_PATH_ENV, DUCKDB_PATH))
+    return str(_env_path(DUCKDB_PATH_ENV, data_path("tpcr_live.duckdb")))
 
 
 def _usage_file() -> Path:
@@ -299,6 +307,7 @@ def _log_question(user_id: str, username: str, question: str, answer: str, durat
         "question": question,
         "answer": answer[:2000],
         "duration_ms": duration_ms,
+        "model": QWEN_MODEL,
     }
     path = _question_log()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -376,7 +385,38 @@ QWEN_MODEL = os.getenv("QWEN_MODEL", "Qwen3.8-27B-8bit")
 QWEN_TIMEOUT = float(os.getenv("QWEN_TIMEOUT", "300"))
 
 CONTEXT_LIMIT = 32768  # server context window (tokens)
-MAX_TOKENS = 1500  # reserved for the completion
+MAX_TOKENS = 700  # default completion budget (TPCR_QWEN_MAX_TOKENS)
+TEMPERATURE = 0.2  # default (TPCR_QWEN_TEMPERATURE)
+_TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+
+
+def _qwen_params() -> tuple[int, float, bool]:
+    """(max_tokens, temperature, thinking) from env, read at call time."""
+    def num(var, cast, default):
+        raw = os.getenv(var, "").strip()
+        try:
+            return cast(raw) if raw else default
+        except ValueError:
+            logger.warning("invalid %s=%r; using default %s", var, raw, default)
+            return default
+
+    max_tokens = num("TPCR_QWEN_MAX_TOKENS", int, MAX_TOKENS)
+    temperature = num("TPCR_QWEN_TEMPERATURE", float, TEMPERATURE)
+    thinking = os.getenv("TPCR_QWEN_THINKING", "").strip().lower() in ("1", "true", "yes", "on")
+    return max_tokens, temperature, thinking
+
+
+def parse_text_tool_calls(content: str) -> list[dict]:
+    """<tool_call>{"name":..,"arguments":{..}}</tool_call> blocks in text; malformed blocks are skipped."""
+    calls = []
+    for i, blk in enumerate(_TOOL_CALL_RE.findall(content or "")):
+        try:
+            j = json.loads(blk)
+            calls.append({"id": f"text{i}", "type": "function",
+                          "function": {"name": j["name"], "arguments": json.dumps(j["arguments"])}})
+        except Exception:  # any malformed block (incl. RecursionError) is skipped
+            pass
+    return calls
 _CHARS_PER_TOKEN = 3  # conservative: real text averages ~4
 _MSG_OVERHEAD = 8  # per-message role/format tokens
 _TOOLS_RESERVE = 200  # tool schema is sent with every request
@@ -510,10 +550,13 @@ async def _post_chat(payload: dict) -> dict:
 
 
 async def _chat(messages: list[dict], use_tools: bool) -> dict:
+    max_tokens, temperature, thinking = _qwen_params()
     payload = {
         "model": QWEN_MODEL,
-        "messages": trim_messages(messages, MAX_TOKENS, CONTEXT_LIMIT, with_tools=use_tools),
-        "max_tokens": MAX_TOKENS,
+        "messages": trim_messages(messages, max_tokens, CONTEXT_LIMIT, with_tools=use_tools),
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "chat_template_kwargs": {"enable_thinking": thinking},
     }
     if use_tools:
         payload["tools"] = TOOLS
@@ -535,7 +578,8 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
     _start = _time.monotonic()
 
     today = date.today()
-    system_prompt = SCHEMA_CONTEXT.format(today=today.isoformat(), today_dow=today.strftime("%A"))
+    system_prompt = SCHEMA_CONTEXT.format(today=today.isoformat(), today_dow=today.strftime("%A"),
+                                          duckdb_path=_duckdb_path(), data_root=data_path())
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -557,7 +601,7 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
                 raise
 
         message = data["choices"][0]["message"]
-        tool_calls = message.get("tool_calls") if use_tools else None
+        tool_calls = (message.get("tool_calls") or parse_text_tool_calls(message.get("content") or "")) if use_tools else None
 
         if tool_calls:
             messages.append({
@@ -599,6 +643,7 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
                 answer = answer[:1900] + "..."
 
             duration_ms = int((_time.monotonic() - _start) * 1000)
+            logger.info("/ask answered by %s in %d ms", QWEN_MODEL, duration_ms)
             await asyncio.to_thread(log_question, user_id, username, question, answer, duration_ms)
 
             if _is_bad_response(answer):

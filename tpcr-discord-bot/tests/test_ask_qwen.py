@@ -81,7 +81,7 @@ def test_request_shape():
     assert body["tools"][0]["function"]["name"] == "run_query"
     assert "sql" in body["tools"][0]["function"]["parameters"]["properties"]
     assert "stream" not in body or body["stream"] is False
-    assert body["max_tokens"] == 1500
+    assert body["max_tokens"] == 700
 
 
 @pytest.mark.skipif(any(k in os.environ for k in ("QWEN_BASE_URL", "QWEN_MODEL", "QWEN_TIMEOUT")),
@@ -203,10 +203,10 @@ LIMIT = aa.CONTEXT_LIMIT
 
 def test_limits_are_literal_values():
     assert aa.CONTEXT_LIMIT == 32768
-    assert aa.MAX_TOKENS == 1500
+    assert aa.MAX_TOKENS == 700
     params = inspect.signature(aa.trim_messages).parameters
     assert params["limit"].default == 32768
-    assert params["max_tokens"].default == 1500
+    assert params["max_tokens"].default == 700
 
 
 def total(msgs, tools=True):
