@@ -307,7 +307,7 @@ def _log_question(user_id: str, username: str, question: str, answer: str, durat
         "question": question,
         "answer": answer[:2000],
         "duration_ms": duration_ms,
-        "model": QWEN_MODEL,
+        "model": _qwen_config()[1],
     }
     path = _question_log()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -380,9 +380,20 @@ def tool_result_status(result: str) -> str:
 
 logger = logging.getLogger("tpcr-bot")
 
-QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "http://localhost:8080")
-QWEN_MODEL = os.getenv("QWEN_MODEL", "Qwen3.8-27B-8bit")
-QWEN_TIMEOUT = float(os.getenv("QWEN_TIMEOUT", "300"))
+# Defaults only. The live values come from the environment at call time via
+# _qwen_config(), so a load_dotenv() that runs after this module is imported
+# (as bot.py used to do) still takes effect.
+QWEN_BASE_URL = "http://localhost:8080"
+QWEN_MODEL = "Qwen3.8-27B-8bit"
+QWEN_TIMEOUT = 300.0
+
+
+def _qwen_config() -> tuple[str, str, float]:
+    """(base_url, model, timeout) from QWEN_BASE_URL/QWEN_MODEL/QWEN_TIMEOUT, read each call."""
+    base_url = os.getenv("QWEN_BASE_URL", QWEN_BASE_URL)
+    model = os.getenv("QWEN_MODEL", QWEN_MODEL)
+    timeout = float(os.getenv("QWEN_TIMEOUT", str(QWEN_TIMEOUT)))
+    return base_url, model, timeout
 
 CONTEXT_LIMIT = 32768  # server context window (tokens)
 MAX_TOKENS = 700  # default completion budget (TPCR_QWEN_MAX_TOKENS)
@@ -541,8 +552,9 @@ def strip_think(text: str) -> str:
 
 async def _post_chat(payload: dict) -> dict:
     """POST to the OpenAI-compatible chat completions endpoint."""
-    url = f"{QWEN_BASE_URL.rstrip('/')}/v1/chat/completions"
-    async with httpx.AsyncClient(timeout=QWEN_TIMEOUT) as client:
+    base_url, _model, timeout = _qwen_config()
+    url = f"{base_url.rstrip('/')}/v1/chat/completions"
+    async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(url, json=payload)
     if resp.status_code >= 400:
         raise QwenHTTPError(resp.status_code, resp.text)
@@ -552,7 +564,7 @@ async def _post_chat(payload: dict) -> dict:
 async def _chat(messages: list[dict], use_tools: bool) -> dict:
     max_tokens, temperature, thinking = _qwen_params()
     payload = {
-        "model": QWEN_MODEL,
+        "model": _qwen_config()[1],
         "messages": trim_messages(messages, max_tokens, CONTEXT_LIMIT, with_tools=use_tools),
         "max_tokens": max_tokens,
         "temperature": temperature,
@@ -643,7 +655,7 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
                 answer = answer[:1900] + "..."
 
             duration_ms = int((_time.monotonic() - _start) * 1000)
-            logger.info("/ask answered by %s in %d ms", QWEN_MODEL, duration_ms)
+            logger.info("/ask answered by %s in %d ms", _qwen_config()[1], duration_ms)
             await asyncio.to_thread(log_question, user_id, username, question, answer, duration_ms)
 
             if _is_bad_response(answer):

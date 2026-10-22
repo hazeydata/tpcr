@@ -44,6 +44,9 @@ from forecast_image import generate_forecast_image
 logger = logging.getLogger("tpcr-bot")
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)-8s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 from calendar_image import generate_calendar_image
+# Load ~/.env BEFORE importing ask_agent so its QWEN_* settings see it
+# (ask_agent also reads them at call time; this is defense in depth).
+load_dotenv(os.path.expanduser("~/.env"))
 from ask_agent import ask_agent, data_path, _duckdb_path
 
 # Add theme-park-crowd-report/src to sys.path for live inference model
@@ -59,8 +62,7 @@ except ImportError as e:
     LiveInferenceModel = None
     LIVE_INFERENCE_AVAILABLE = False
 
-# Load token from ~/.env
-load_dotenv(os.path.expanduser("~/.env"))
+# ~/.env was loaded above, before the ask_agent import
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
 # Bot setup
