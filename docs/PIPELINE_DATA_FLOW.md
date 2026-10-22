@@ -717,8 +717,8 @@ Runs data quality checks:
 If the dashboard API (`dashboard/api.py`) is running, it gets restarted to pick up new data.
 
 ### Discord Daily Report
-**Script:** `/home/wilma/tpcr-discord-bot/daily_report.py` (separate cron, 7:00 AM ET)  
-Generates and sends a daily crowd report to Discord.
+**Script:** `tpcr-discord-bot/daily_report.py` (Mac Mini launchd job `com.hazeydata.tpcr-crowd-report`, 7:00 AM; see `launchd/README.md`)  
+Waits up to 90 min for `<root>/logs/pipeline_metrics_<date>.json` with `status: done`, then posts the daily crowd report to Discord. A `--dry-run` flag previews it; a posted sentinel prevents duplicates.
 
 ---
 
@@ -728,7 +728,8 @@ Generates and sends a daily crowd report to Discord.
 | Schedule | Job | Script |
 |----------|-----|--------|
 | **6:00 AM ET** | Daily pipeline | `run_daily_pipeline.sh --skip-dropbox-check --skip-if-unchanged --use-synthetic` |
-| **7:00 AM ET** | Discord daily report | `/home/wilma/tpcr-discord-bot/daily_report.py` |
+| **7:00 AM** | Discord daily report (launchd) | `launchd/com.hazeydata.tpcr-crowd-report.plist` → `tpcr-discord-bot/daily_report.py --wait-for-pipeline 90` |
+| **9:00 AM** | Crowd report watchdog (launchd) | `launchd/com.hazeydata.tpcr-crowd-report-watchdog.plist` → `scripts/tpcr_crowd_report_watchdog.py --check-only` |
 | **3:00 AM ET** | B2 cloud backup | `/home/wilma/backup-to-b2.sh` |
 
 ### Pipeline Flags in Production:
