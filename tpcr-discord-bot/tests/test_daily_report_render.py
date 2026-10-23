@@ -468,6 +468,22 @@ class TestMain:
                             "claimed_at": "garbage"})
         assert daily_report.main(self.ARGS) == 9
 
+    def test_pending_claimed_in_future_exits_9(self, root, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        calls = _counting_post(monkeypatch)
+        now = datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc)
+
+        class FrozenDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        monkeypatch.setattr(daily_report, "_dt", FrozenDT)
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": (now + timedelta(hours=1)).isoformat()})
+        assert daily_report.main(self.ARGS) == 9
+        assert calls == []
+
     def test_pending_for_other_run_date_exits_9(self, root, monkeypatch):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
         calls = _counting_post(monkeypatch)
@@ -795,6 +811,24 @@ class TestWatchdog:
                             "claimed_at": (now - timedelta(hours=1)).isoformat()})
         ok, reason = watchdog.post_state_check(TODAY)
         assert not ok and "stale" in reason
+
+    def test_post_state_check_future_and_floored_age(self, watchdog, root, monkeypatch):
+        now = datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc)
+
+        class FrozenDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        monkeypatch.setattr(watchdog, "datetime", FrozenDT)
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": (now + timedelta(hours=1)).isoformat()})
+        ok, reason = watchdog.post_state_check(TODAY)
+        assert not ok and "stale" in reason and "future" in reason
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": (now - timedelta(hours=5, minutes=59, seconds=59)).isoformat()})
+        ok, reason = watchdog.post_state_check(TODAY)
+        assert ok and "5h59m" in reason and "6.0h" not in reason
 
     def test_check_only_fails_on_pending_state_and_never_posts(
             self, watchdog, root, monkeypatch):

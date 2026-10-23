@@ -274,12 +274,15 @@ def post_state_check(today: date) -> tuple[bool, str]:
             claimed = datetime.fromisoformat(str(data["claimed_at"]))
             if claimed.tzinfo is None:
                 claimed = claimed.replace(tzinfo=timezone.utc)
-            age_h = (datetime.now(timezone.utc) - claimed).total_seconds() / 3600.0
+            age_s = (datetime.now(timezone.utc) - claimed).total_seconds()
         except Exception:
             return False, "post state pending with missing/unparseable claimed_at (stale)"
-        if age_h >= STALE_PENDING_HOURS:
-            return False, f"post state pending {age_h:.1f}h (stale, limit {STALE_PENDING_HOURS}h)"
-        return True, f"post state pending {age_h:.1f}h (in progress)"
+        if age_s < 0:
+            return False, "post state pending with claimed_at in the future (stale)"
+        age_txt = f"{int(age_s // 3600)}h{int(age_s % 3600 // 60):02d}m"
+        if age_s / 3600.0 >= STALE_PENDING_HOURS:
+            return False, f"post state pending {age_txt} (stale, limit {STALE_PENDING_HOURS}h)"
+        return True, f"post state pending {age_txt} (in progress)"
     return True, f"post state {data['state']}"
 
 

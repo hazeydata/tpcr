@@ -527,12 +527,19 @@ def check_state(today: date, force: bool):
     st = state["state"]
     if st == "pending":
         age_h = _pending_age_hours(state)
-        if age_h is None or age_h >= STALE_PENDING_HOURS:
+        if age_h is None or age_h < 0 or age_h >= STALE_PENDING_HOURS:
             if force:
                 print("FORCE: overriding stale pending state")
                 return None
-            age_s = "unknown" if age_h is None else f"{age_h:.1f}"
-            print(f"STALE PENDING marker (claimed {age_s}h ago, limit {STALE_PENDING_HOURS}h); "
+            if age_h is None:
+                when = "claimed at an unknown time"
+            elif age_h < 0:
+                when = "claimed in the future"
+            else:
+                mins = int(age_h * 60)
+                when = f"claimed {mins // 60}h{mins % 60:02d}m ago"
+            print(f"STALE PENDING marker ({when}, "
+                  f"limit {STALE_PENDING_HOURS}h); "
                   f"refusing automatic repost; check #crowd-reports, then use --force")
             return 9
     if force:
