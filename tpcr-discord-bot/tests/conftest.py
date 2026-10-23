@@ -26,6 +26,9 @@ def pytest_configure(config):
 def _ask_env(monkeypatch, tmp_path):
     monkeypatch.setenv("TPCR_DATA_ROOT", str(tmp_path))
     monkeypatch.setenv("TPCR_ASK_PROVIDER", "qwen")
+    monkeypatch.setenv("TPCR_ASK_USAGE_FILE", str(tmp_path / "ask_usage.json"))
+    monkeypatch.setenv("TPCR_ASK_QUESTION_LOG", str(tmp_path / "ask_questions.jsonl"))
+    monkeypatch.setenv("TPCR_ASK_FEEDBACK_LOG", str(tmp_path / "ask_feedback.jsonl"))
 
 
 @pytest.fixture(autouse=True)
