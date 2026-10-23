@@ -90,15 +90,15 @@ def test_ask_failure_log_line_has_no_message_text(bot, caplog):
 
 
 @pytest.mark.parametrize("exc,want", [
-    (asyncio.TimeoutError("read timed out 10.0.0.1"), "TimeoutError"),
-    (ConnectionError("refused 10.0.0.1"), "ConnectionError"),
+    (asyncio.TimeoutError("read timed out at upstream-host-detail"), "TimeoutError"),
+    (ConnectionError("refused by upstream-host-detail"), "ConnectionError"),
 ])
 def test_ask_failure_timeouts_log_class_only(bot, caplog, exc, want):
     with patch.object(bot, "ask_agent", AsyncMock(side_effect=exc)), caplog.at_level(logging.DEBUG):
         call_ask(bot, make_interaction([]))
     assert [r.getMessage() for r in caplog.records if r.getMessage().startswith("/ask failed")] == \
         [f"/ask failed ({want})"]
-    assert "10.0.0.1" not in _all_log_text(caplog)
+    assert "upstream-host-detail" not in _all_log_text(caplog)
 
 
 def test_deliver_failure_has_no_chained_traceback(bot, caplog):
