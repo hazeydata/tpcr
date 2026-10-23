@@ -21,7 +21,7 @@ Set `OPENROUTER_API_KEY` in `~/.env` (name only; never commit or paste the value
 - `openrouter` (default): OpenRouter first, Qwen as fallback.
 - `qwen`: Qwen only.
 - `anthropic`: accepted as an alias for `openrouter`.
-- Any other value fails at startup.
+- Any other value is not checked at startup: the bot starts normally, and each /ask call then raises a RuntimeError (no Qwen fallback).
 
 ## Fallback behavior
 

@@ -157,3 +157,44 @@ def test_planted_key_never_logged(mode, caplog):
     assert "TESTSECRET123" not in logged
     assert "OpenRouter /ask" in logged
     assert "echo" not in logged
+
+
+@pytest.mark.parametrize("status", [302, 400, 404, 429])
+def test_http_4xx_falls_back_to_qwen(status):
+    FakeClient.openrouter_script = [(status, chat_reply("openrouter answer"))]
+    assert ask() == "qwen answer"
+    assert len(FakeClient.openrouter_calls) == 1 and FakeClient.qwen_calls
+
+
+def test_whitespace_answer_falls_back_to_qwen(caplog):
+    FakeClient.openrouter_script = [(200, chat_reply("  \n\t "))]
+    with caplog.at_level(logging.INFO):
+        assert ask() == "qwen answer"
+    assert FakeClient.qwen_calls
+    lines = [r.getMessage() for r in caplog.records if "empty answer" in r.getMessage()]
+    assert len(lines) == 1 and "falling back to Qwen" in lines[0]
+    assert SECRET not in caplog.text
+
+
+def test_http_error_keeps_response_body_out_of_exception_and_logs(caplog):
+    FakeClient.openrouter_script = [(502, chat_reply("x"))]
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(aa.OpenRouterHTTPError) as ei:
+            asyncio.run(aa._post_openrouter(SECRET, {"model": aa.OPENROUTER_MODEL}))
+    assert "echo" not in str(ei.value) and SECRET not in repr(ei.value)
+    assert ei.value.status_code == 502
+    FakeClient.openrouter_script = [(502, chat_reply("x"))]
+    with caplog.at_level(logging.DEBUG):
+        assert ask() == "qwen answer"
+    assert "echo" not in caplog.text and SECRET not in caplog.text
+
+
+def test_key_only_in_authorization_header():
+    FakeClient.openrouter_script = [(200, chat_reply(tool_calls=[tool_call()])), (200, chat_reply("done"))]
+    with patch("ask_agent.run_duckdb_query", return_value="x\n-\n1"):
+        assert ask() == "done"
+    assert len(FakeClient.openrouter_calls) == 2
+    for call in FakeClient.openrouter_calls:
+        assert SECRET not in json.dumps(call["json"]) and SECRET not in call["url"]
+        assert call["headers"]["Authorization"] == f"Bearer {SECRET}"
+        assert all(SECRET not in v for k, v in call["headers"].items() if k != "Authorization")

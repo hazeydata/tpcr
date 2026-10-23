@@ -775,7 +775,7 @@ async def _post_openrouter(api_key: str, payload: dict) -> dict:
     }
     async with httpx.AsyncClient(timeout=OPENROUTER_TIMEOUT) as client:
         resp = await client.post(OPENROUTER_URL, json=payload, headers=headers)
-    if resp.status_code >= 400:
+    if not 200 <= resp.status_code < 300:
         raise OpenRouterHTTPError(resp.status_code)
     return resp.json()
 
@@ -878,6 +878,7 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
                                             else (claude_result, 5))
             if claude_answer:
                 return await finish(claude_answer, claude_rounds, OPENROUTER_MODEL)
+            logger.warning("OpenRouter /ask returned an empty answer after %d rounds; falling back to Qwen", claude_rounds)
     elif provider == "openrouter":
         logger.warning("TPCR_ASK_PROVIDER=openrouter but no api_key; using Qwen")
 
