@@ -591,7 +591,7 @@ def test_redact_runs_before_truncation():
     '"api_key": "opaqueTOKEN999"',
     "BEARER abc.DEF-123_xyz",
     "Bearer abc.DEF-123_xyz",
-    "bearer abcdefghijklmnop",
+    "bearer " + "abcdefgh" * 2,
 ])
 def test_redact_case_insensitive_and_api_key_forms(text):
     out = aa.redact(f"col {text} not found")
