@@ -409,11 +409,13 @@ NO_RESULTS_MSG = "No results found."
 NON_LOCK_ATTEMPTS = 2  # a non-lock error is retried once, not max_retries times
 _SQL_ERROR_NAMES = ("BinderException", "CatalogException", "ParserException")
 _DASH = r"(?:-|\\+u002[dD]|\\+x2[dD]|%2[dD])"  # '-' plain or escaped (JSON/py/url)
+_TOKEN = r"[A-Za-z0-9._~+/=\-]"
 _SECRET_RE = re.compile(
     r"sk" + _DASH + r"ant" + _DASH + r"(?:[A-Za-z0-9_]|" + _DASH + r")+"
     r"|sk" + _DASH + r"(?:[A-Za-z0-9_]|" + _DASH + r"){16,}"
-    r"|(?i:bearer)\s+[A-Za-z0-9._~+/=\-]+"
-    r"|(?i:x" + _DASH + r"api" + _DASH + r"key)[\"']?\s*[:=]\s*[\"']?[^\s\"',;}]+"
+    r"|bearer\s+(?=" + _TOKEN + r"*\d|" + _TOKEN + r"{16})" + _TOKEN + r"+"
+    r"|api(?:_|" + _DASH + r")key[\"']?\s*[:=]\s*[\"']?[^\s\"',;}]+",
+    re.IGNORECASE,
 )
 _LOCK_RE = re.compile(r"\b(?:lock(?:ed|ing)?|busy|io error|could not set|blocked)\b")
 
@@ -457,58 +459,17 @@ def is_select_start(sql: str) -> bool:
 
 
 def is_single_select(sql: str) -> bool:
-    """One SELECT/WITH statement; one trailing ';' is allowed, a second statement is not."""
+    """Exactly one SELECT statement per DuckDB's parser; a trailing ';' is allowed."""
     s = (sql or "").strip()
-    if s.endswith(";"):
-        s = s[:-1].rstrip()
     if not is_select_start(s):
         return False
-    semis = _top_level_semicolons(s)
-    return semis == []
-
-
-_DOLLAR_TAG_RE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)?\$")
-
-
-def _top_level_semicolons(s: str) -> list[int] | None:
-    """Positions of ';' outside comments/literals, scanning left to right once.
-
-    Handles -- and /* */ comments, '...' (with '' escapes), "..." identifiers
-    and $$...$$ / $tag$...$tag$ strings. Returns None (treated as unsafe) when a
-    literal or block comment is left unterminated.
-    """
-    out, i, n = [], 0, len(s)
-    while i < n:
-        c = s[i]
-        if s.startswith("--", i):
-            j = s.find("\n", i)
-            i = n if j < 0 else j + 1
-        elif s.startswith("/*", i):
-            j = s.find("*/", i + 2)
-            if j < 0:
-                return None
-            i = j + 2
-        elif c in ("'", '"'):
-            j = i + 1
-            while True:
-                j = s.find(c, j)
-                if j < 0:
-                    return None
-                if s.startswith(c * 2, j):
-                    j += 2
-                    continue
-                break
-            i = j + 1
-        elif c == "$" and (m := _DOLLAR_TAG_RE.match(s, i)):
-            j = s.find(m.group(0), m.end())
-            if j < 0:
-                return None
-            i = j + len(m.group(0))
-        else:
-            if c == ";":
-                out.append(i)
-            i += 1
-    return out
+    if s.endswith(";") and s[:-1].rstrip().endswith(";"):
+        return False
+    try:
+        statements = duckdb.extract_statements(s)
+    except duckdb.Error:
+        return False
+    return len(statements) == 1 and statements[0].type == duckdb.StatementType.SELECT
 
 
 def date_range_sql() -> str:
