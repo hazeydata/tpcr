@@ -284,6 +284,12 @@ class TestGate:
         assert "GATE PASS" in capsys.readouterr().out
         assert fake_time.sleeps == []
 
+    def test_marker_null_run_date_fails(self, root):
+        _write_marker(root, {"status": "done", "run_date": None})
+        daily_report._refresh_paths()
+        passed, reason = self._gate()
+        assert not passed and "run_date" in reason
+
     def test_marker_missing_run_date_fails(self, root):
         _write_marker(root, {"status": "done"})
         daily_report._refresh_paths()
@@ -412,6 +418,20 @@ class TestMain:
         assert len(calls) == 1
         assert "FORCE: overriding existing state pending" in capsys.readouterr().out
 
+    def test_run_start_marker_precedes_stale_pending_output(self, root, monkeypatch, capsys):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        _counting_post(monkeypatch)
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": _hours_ago(7)})
+        assert daily_report.main(self.ARGS) == 9
+        lines = capsys.readouterr().out.splitlines()
+        assert lines[0].startswith("RUN START run_date=2026-10-12")
+        assert any("PENDING" in line for line in lines[1:])
+
+    def test_dry_run_prints_no_run_start_marker(self, root, capsys):
+        assert daily_report.main(self.ARGS + ["--dry-run"]) == 0
+        assert "RUN START" not in capsys.readouterr().out
+
     def test_stale_pending_exits_9_and_force_posts(self, root, monkeypatch, capsys):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
         calls = _counting_post(monkeypatch)
@@ -424,6 +444,23 @@ class TestMain:
         assert daily_report.main(self.ARGS + ["--force"]) == 0
         assert len(calls) == 1
         assert _read_state_file(root)["state"] == "posted"
+
+    def test_pending_exactly_at_limit_is_stale(self, root, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        now = datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc)
+
+        class FrozenDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        monkeypatch.setattr(daily_report, "_dt", FrozenDT)
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": (now - timedelta(hours=6)).isoformat()})
+        assert daily_report.main(self.ARGS) == 9
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": (now - timedelta(hours=5, minutes=59)).isoformat()})
+        assert daily_report.main(self.ARGS) == 5
 
     def test_pending_without_claimed_at_is_stale(self, root, monkeypatch):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
@@ -727,12 +764,37 @@ class TestWatchdog:
         assert ok  # no state file
         _write_state(root, {"run_date": "2026-10-12", "state": "pending"})
         ok, reason = watchdog.post_state_check(TODAY)
-        assert not ok and "pending" in reason
+        assert not ok and "stale" in reason
         _write_state(root, {"run_date": "2026-10-12", "state": "posted"})
         assert watchdog.post_state_check(TODAY)[0]
         _write_state(root, "not json {{{")
         ok, reason = watchdog.post_state_check(TODAY)
         assert not ok and "corrupt" in reason
+
+    def test_post_state_check_pending_age(self, watchdog, root, monkeypatch):
+        now = datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc)
+
+        class FrozenDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        monkeypatch.setattr(watchdog, "datetime", FrozenDT)
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": (now - timedelta(hours=1)).replace(tzinfo=None).isoformat()})
+        ok, reason = watchdog.post_state_check(TODAY)
+        assert ok and "pending" in reason
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": (now - timedelta(hours=6)).isoformat()})
+        ok, reason = watchdog.post_state_check(TODAY)
+        assert not ok and "stale" in reason
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending"})
+        ok, reason = watchdog.post_state_check(TODAY)
+        assert not ok and "stale" in reason
+        _write_state(root, {"run_date": "2026-10-11", "state": "pending",
+                            "claimed_at": (now - timedelta(hours=1)).isoformat()})
+        ok, reason = watchdog.post_state_check(TODAY)
+        assert not ok and "stale" in reason
 
     def test_check_only_fails_on_pending_state_and_never_posts(
             self, watchdog, root, monkeypatch):

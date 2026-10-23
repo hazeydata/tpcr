@@ -253,6 +253,9 @@ def pipeline_marker_status(today: date | None = None) -> tuple[str | None, float
         return None, None, f"{path.name}: {type(e).__name__}: {e}"
 
 
+STALE_PENDING_HOURS = 6
+
+
 def post_state_check(today: date) -> tuple[bool, str]:
     """Inspect daily_report's post-state file for `today`: (ok, reason). Read-only."""
     path = data_root() / "state" / f"crowd_report_posted_{today.isoformat()}.json"
@@ -265,7 +268,18 @@ def post_state_check(today: date) -> tuple[bool, str]:
     if not isinstance(data, dict) or data.get("state") not in ("pending", "posted", "failed"):
         return False, "post state corrupt (missing or unknown state)"
     if data["state"] == "pending":
-        return False, "post state pending (stale if > 6h)"
+        if data.get("run_date") != today.isoformat():
+            return False, "post state pending for another run_date (stale)"
+        try:
+            claimed = datetime.fromisoformat(str(data["claimed_at"]))
+            if claimed.tzinfo is None:
+                claimed = claimed.replace(tzinfo=timezone.utc)
+            age_h = (datetime.now(timezone.utc) - claimed).total_seconds() / 3600.0
+        except Exception:
+            return False, "post state pending with missing/unparseable claimed_at (stale)"
+        if age_h >= STALE_PENDING_HOURS:
+            return False, f"post state pending {age_h:.1f}h (stale, limit {STALE_PENDING_HOURS}h)"
+        return True, f"post state pending {age_h:.1f}h (in progress)"
     return True, f"post state {data['state']}"
 
 

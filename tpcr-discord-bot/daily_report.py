@@ -23,7 +23,7 @@ Exit codes:
   6 claim (pending) write failed; nothing was posted
   7 final (posted) state write failed; pending marker remains
   8 pipeline status is sync_partial
-  9 stale pending state (claimed > 6h ago, unparseable claimed_at, or for another
+  9 stale pending state (claimed >= 6h ago, unparseable claimed_at, or for another
     run_date); never reposted automatically, check #crowd-reports then --force
 
   daily_report.py --dry-run              # gate + render to stdout, never posts, writes nothing
@@ -231,7 +231,7 @@ def quality_gate(park_groups, get_wti_fn, today, skip_pipeline_check=False) -> t
         if "run_date" not in marker_data:
             return False, f"Pipeline marker missing run_date ({marker.name})"
         marker_date = marker_data.get("run_date")
-        if marker_date is not None and marker_date != today.isoformat():
+        if marker_date != today.isoformat():
             return False, f"Pipeline marker run_date {marker_date!r} != {today.isoformat()} ({marker.name})"
 
     # Check 2: All 4 WDW parks have WTI scores
@@ -527,7 +527,7 @@ def check_state(today: date, force: bool):
     st = state["state"]
     if st == "pending":
         age_h = _pending_age_hours(state)
-        if age_h is None or age_h > STALE_PENDING_HOURS:
+        if age_h is None or age_h >= STALE_PENDING_HOURS:
             if force:
                 print("FORCE: overriding stale pending state")
                 return None
@@ -564,6 +564,8 @@ def main(argv=None) -> int:
                         help="Override existing post state (posted/pending/corrupt)")
     args = parser.parse_args(argv)
     today = args.date or date.today()
+    if not args.dry_run:
+        print(f"RUN START run_date={today.isoformat()} at {_now_iso()}", flush=True)
 
     _refresh_paths()
 
