@@ -405,3 +405,102 @@ def test_ac32_retry_paths_never_log_key_or_rows(kind, tmp_path, monkeypatch, cap
         assert "ROWVALUE777" in res  # rows reach the model ...
     assert "ROWVALUE777" not in caplog.text  # ... but never the log
     assert "TESTSECRET123" not in caplog.text
+
+
+# ---------- Kitty v2 findings ----------
+
+@pytest.mark.parametrize("sql", [
+    "SELECT blocked_untl FROM live_waits",
+    "SELECT busy_flag FROM live_waits",
+    "SELECT * FROM clock_log",
+    "SELECT locked FROM live_waits",
+])
+def test_f1_lock_word_in_identifier_real_duckdb_single_attempt(sql, tmp_path, monkeypatch):
+    db = tmp_path / "live.duckdb"
+    duckdb.connect(str(db)).execute("CREATE TABLE live_waits (entity_code VARCHAR)").close()
+    monkeypatch.setenv(aa.DUCKDB_PATH_ENV, str(db))
+    n, real = [], duckdb.connect
+    monkeypatch.setattr(aa.duckdb, "connect", lambda *a, **k: n.append(1) or real(*a, **k))
+    monkeypatch.setattr("time.sleep", lambda s: pytest.fail("SQL error must not sleep"))
+    res = aa.run_duckdb_query(sql)
+    assert res.startswith("Error: SQL error ") and len(n) == 1
+
+
+@pytest.mark.parametrize("exc,msg", [
+    ("BinderException", 'Referenced column "busy_flag" not found'),
+    ("CatalogException", "Table with name clock_log does not exist"),
+    ("ParserException", "syntax error at or near lock"),
+])
+def test_f1_sql_error_with_lock_words_not_lock_retried(exc, msg, monkeypatch):
+    n = []
+
+    def boom(path, read_only):
+        n.append(1)
+        raise getattr(duckdb, exc)(msg)
+
+    monkeypatch.setattr(aa.duckdb, "connect", boom)
+    monkeypatch.setattr("time.sleep", lambda s: pytest.fail("no sleep"))
+    assert aa.run_duckdb_query("SELECT 1").startswith(f"Error: SQL error {exc}")
+    assert len(n) == 1
+
+
+@pytest.mark.parametrize("msg,lock", [
+    ("IO Error: Could not set lock on file", True),
+    ("database is locked", True),
+    ("database busy", True),
+    ("blocked_untl missing", False),
+    ("clock_log broke", False),
+    ("busy_flag", False),
+])
+def test_f1_lock_check_word_boundary(msg, lock):
+    assert aa._is_lock_error(RuntimeError(msg)) is lock
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT 1 -- it's\n; DROP TABLE t; SELECT 'a'",
+    "SELECT 1 /* it's */; DROP TABLE t; SELECT 'a'",
+    "SELECT $$'$$; DROP TABLE t; SELECT '$$'",
+    "SELECT $q$'$q$; DROP TABLE t; SELECT '$q$'",
+    "SELECT \"it's\"; DROP TABLE t; SELECT 'a'",
+    "SELECT 'unterminated; DROP TABLE t",
+    "SELECT 1 /* unterminated; DROP TABLE t",
+    "SELECT 1;;",
+])
+def test_f2_guard_rejects_comment_literal_bypasses(sql, monkeypatch):
+    assert aa.sql_guard_error(sql) == aa.MULTI_STATEMENT_MSG
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT 1;",
+    "SELECT 'it''s; x'",
+    "SELECT \"a;b\" FROM t;",
+    "SELECT $$a;b$$",
+    "SELECT $t$a;'b$t$;",
+    "SELECT 1 /* ; */ -- ;\n",
+])
+def test_f2_guard_allows_single_statement(sql):
+    assert aa.sql_guard_error(sql) is None
+
+
+@pytest.mark.parametrize("text", [
+    "col sk\\u002dant\\u002dapi03\\u002dABCDEFGHIJ not found",
+    "col sk\\u002Dant\\u002DABCDEFGHIJ not found",
+    "Authorization: Bearer abc.DEF-123_xyz not found",
+    'x-api-key: opaqueTOKEN999 not found',
+    '"x-api-key": "opaqueTOKEN999" not found',
+])
+def test_f3_escaped_and_header_tokens_stripped_for_model(text, monkeypatch):
+    def boom(path, read_only):
+        raise duckdb.BinderException(text)
+
+    monkeypatch.setattr(aa.duckdb, "connect", boom)
+    res = aa.run_duckdb_query("SELECT 1")
+    assert res.startswith("Error: SQL error BinderException") and "[REDACTED]" in res
+    for tok in ("ABCDEFGHIJ", "abc.DEF", "opaqueTOKEN999"):
+        assert tok not in res
+    assert "not found" in res
+
+
+def test_prompt_uses_dayname_try_cast_for_park_date():
+    assert "dayname(TRY_CAST(park_date AS DATE))" in aa.SCHEMA_CONTEXT
+    assert not re.search(r"dayname\(\s*park_date\s*\)", aa.SCHEMA_CONTEXT)

@@ -381,19 +381,19 @@ def run_duckdb_query(sql: str, max_retries: int = 8) -> str:
                     con.close()
                 except Exception:
                     pass
-            error_str = str(e).lower()
-            # Retry on any lock, busy, or IO errors (scraper write collisions)
-            is_lock_error = any(kw in error_str for kw in ("lock", "busy", "io error", "could not set", "blocked"))
-            if is_lock_error and attempt < max_retries - 1:
-                time.sleep(0.5 * (attempt + 1))  # Back off: 0.5s, 1s, 1.5s, 2s, ...
-                continue
             if _is_sql_error(e):
                 # The model's own SQL is wrong (bad column/table/syntax): retrying
                 # cannot help, so return at once with the DuckDB message so the
-                # model can correct the query.
+                # model can correct the query. Checked before the lock test so an
+                # identifier like "blocked_untl" never earns lock retries.
                 logger.warning("run_query failed after %d attempts: %s",
                                attempt + 1, type(e).__name__)
                 return sql_error_result(e)
+            # Retry on lock, busy, or IO errors (scraper write collisions)
+            is_lock_error = _is_lock_error(e)
+            if is_lock_error and attempt < max_retries - 1:
+                time.sleep(0.5 * (attempt + 1))  # Back off: 0.5s, 1s, 1.5s, 2s, ...
+                continue
             if not is_lock_error and attempt < min(max_retries, NON_LOCK_ATTEMPTS) - 1:
                 # Non-lock errors: retry once with a brief pause
                 time.sleep(1)
@@ -408,12 +408,26 @@ def run_duckdb_query(sql: str, max_retries: int = 8) -> str:
 NO_RESULTS_MSG = "No results found."
 NON_LOCK_ATTEMPTS = 2  # a non-lock error is retried once, not max_retries times
 _SQL_ERROR_NAMES = ("BinderException", "CatalogException", "ParserException")
-_SECRET_RE = re.compile(r"sk-ant-[A-Za-z0-9_\-]+|sk-[A-Za-z0-9_\-]{16,}")
+_DASH = r"(?:-|\\+u002[dD]|\\+x2[dD]|%2[dD])"  # '-' plain or escaped (JSON/py/url)
+_SECRET_RE = re.compile(
+    r"sk" + _DASH + r"ant" + _DASH + r"(?:[A-Za-z0-9_]|" + _DASH + r")+"
+    r"|sk" + _DASH + r"(?:[A-Za-z0-9_]|" + _DASH + r"){16,}"
+    r"|(?i:bearer)\s+[A-Za-z0-9._~+/=\-]+"
+    r"|(?i:x" + _DASH + r"api" + _DASH + r"key)[\"']?\s*[:=]\s*[\"']?[^\s\"',;}]+"
+)
+_LOCK_RE = re.compile(r"\b(?:lock(?:ed|ing)?|busy|io error|could not set|blocked)\b")
 
 
 def redact(text: str, limit: int = 300) -> str:
     """Excerpt of text with anything key-shaped replaced (safe to log / show the model)."""
     return _SECRET_RE.sub("[REDACTED]", str(text or ""))[:limit]
+
+
+def _is_lock_error(e: Exception) -> bool:
+    """Lock/busy/IO error: duckdb IOException, or a lock word as a whole word in the text."""
+    if any(c.__name__ == "IOException" for c in type(e).__mro__):
+        return True
+    return bool(_LOCK_RE.search(str(e).lower()))
 
 
 def _is_sql_error(e: Exception) -> bool:
@@ -449,11 +463,52 @@ def is_single_select(sql: str) -> bool:
         s = s[:-1].rstrip()
     if not is_select_start(s):
         return False
-    # strip string literals and comments before looking for a statement separator
-    bare = re.sub(r"'(?:[^']|'')*'", "''", s)
-    bare = re.sub(r'"(?:[^"]|"")*"', '""', bare)
-    bare = re.sub(r"--[^\n]*|/\*.*?\*/", " ", bare, flags=re.DOTALL)
-    return ";" not in bare
+    semis = _top_level_semicolons(s)
+    return semis == []
+
+
+_DOLLAR_TAG_RE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)?\$")
+
+
+def _top_level_semicolons(s: str) -> list[int] | None:
+    """Positions of ';' outside comments/literals, scanning left to right once.
+
+    Handles -- and /* */ comments, '...' (with '' escapes), "..." identifiers
+    and $$...$$ / $tag$...$tag$ strings. Returns None (treated as unsafe) when a
+    literal or block comment is left unterminated.
+    """
+    out, i, n = [], 0, len(s)
+    while i < n:
+        c = s[i]
+        if s.startswith("--", i):
+            j = s.find("\n", i)
+            i = n if j < 0 else j + 1
+        elif s.startswith("/*", i):
+            j = s.find("*/", i + 2)
+            if j < 0:
+                return None
+            i = j + 2
+        elif c in ("'", '"'):
+            j = i + 1
+            while True:
+                j = s.find(c, j)
+                if j < 0:
+                    return None
+                if s.startswith(c * 2, j):
+                    j += 2
+                    continue
+                break
+            i = j + 1
+        elif c == "$" and (m := _DOLLAR_TAG_RE.match(s, i)):
+            j = s.find(m.group(0), m.end())
+            if j < 0:
+                return None
+            i = j + len(m.group(0))
+        else:
+            if c == ";":
+                out.append(i)
+            i += 1
+    return out
 
 
 def date_range_sql() -> str:
