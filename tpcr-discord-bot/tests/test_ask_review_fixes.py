@@ -385,7 +385,6 @@ def test_ac21_no_mnt_data_literals():
 
 
 # Exception text must never reach the logs (it can carry API keys); class name only.
-SECRET = "sk-ant-TESTSECRET123"
 
 
 class SecretBoom(Exception):
