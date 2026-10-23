@@ -507,9 +507,23 @@ class TestMain:
         assert daily_report.main(self.ARGS) == 9
         out = capsys.readouterr().out
         assert "claimed 6h59m ago" in out and "7h00m" not in out
-        # Limit 0 so any age is stale: 5.99h and 5h59m45s -> 5h59m, 0h -> 0h00m.
+        # 7h59m59s must read 7h59m (no extra second pushing it to 8h00m).
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": (now - timedelta(hours=7, minutes=59, seconds=59)).isoformat()})
+        assert daily_report.main(self.ARGS) == 9
+        out = capsys.readouterr().out
+        assert "claimed 7h59m ago" in out and "8h00m" not in out
+        # 5h59m59s with the real 6h limit is NOT stale: plain pending (exit 5), no STALE text, no post.
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": (now - timedelta(hours=5, minutes=59, seconds=59)).isoformat()})
+        assert daily_report.main(self.ARGS) == 5
+        out = capsys.readouterr().out
+        assert "STALE" not in out and "claimed" not in out
+        assert calls == []
+        # Limit 0 so any age is stale: 5.99h, 5h59m45s and 5h59m59s -> 5h59m, 0h -> 0h00m.
         monkeypatch.setattr(daily_report, "STALE_PENDING_HOURS", 0)
         for hours, text in ((5.99, "claimed 5h59m ago"), (5 + 59.75 / 60, "claimed 5h59m ago"),
+                            (5 + 59 / 60 + 59 / 3600, "claimed 5h59m ago"),
                             (0, "claimed 0h00m ago")):
             _write_state(root, {"run_date": "2026-10-12", "state": "pending",
                                 "claimed_at": (now - timedelta(hours=hours)).isoformat()})
