@@ -642,24 +642,20 @@ def test_ac28_parse_error_text_reaches_model_qwen(sql, monkeypatch):
 
 
 @pytest.mark.parametrize("sql", PARSE_ERROR_SQL)
-def test_ac28_parse_error_text_reaches_model_claude(sql, monkeypatch):
-    replies = [
-        NS(content=[NS(type="tool_use", id="tu1", name="run_query", input={"sql": sql})]),
-        NS(content=[NS(type="text", text="done")]),
-    ]
+def test_ac28_parse_error_text_reaches_model_openrouter(sql, monkeypatch):
+    call = {"id": "tu1", "type": "function", "function": {"name": "run_query", "arguments": json.dumps({"sql": sql})}}
+    replies = [chat_reply(tool_calls=[call]), chat_reply("done")]
     sent = []
 
-    async def create(**kw):
-        sent.append(kw["messages"])
+    async def post(api_key, payload):
+        sent.append(json.loads(json.dumps(payload)))
         return replies.pop(0)
 
-    fake = NS(AsyncAnthropic=lambda **k: NS(messages=NS(create=create)))
-    monkeypatch.setitem(sys.modules, "anthropic", fake)
+    monkeypatch.setattr(aa, "_post_openrouter", post)
     monkeypatch.setattr(aa.duckdb, "connect", lambda *a, **k: pytest.fail("connected to DuckDB"))
-    answer, _ = asyncio.run(aa._claude_loop("k", "system prompt", "q"))
+    answer, _ = asyncio.run(aa._openrouter_loop("k", "system prompt", "q"))
     assert answer == "done"
-    results = [b["content"] for m in sent[-1] if m["role"] == "user" and isinstance(m["content"], list)
-               for b in m["content"] if b.get("type") == "tool_result"]
+    results = [m["content"] for m in sent[-1]["messages"] if m["role"] == "tool"]
     assert results == [_parser_error_text(sql)]
     assert "Only one SQL statement" not in results[0]
 
