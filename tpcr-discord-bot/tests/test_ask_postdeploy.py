@@ -804,3 +804,51 @@ def test_redact_escape_matrix_boundary_safe(sep):
 def test_redact_escape_matrix_sk_keys(sep):
     out = aa.redact("x" + sep + "sk" + sep + "abcdefghijklmnopqrst")
     assert "abcdefghijklmnopqrst" not in out and "[REDACTED]" in out
+
+
+@pytest.mark.parametrize("text", ["Bearer 123456789012", "Bearer 123456789012345", "bearer abcdefghijkl", "Bearer abcdefghijklmno"])
+def test_redact_bearer_12_to_15_needs_letters_and_digits(text):
+    assert aa.redact(text) == text
+
+
+@pytest.mark.parametrize("text", ["Bearer abc123def456", "bearer 123456789abc", "Bearer A1B2C3D4E5F6G7H"])
+def test_redact_bearer_12_to_15_with_letters_and_digits(text):
+    assert aa.redact(text) == "[REDACTED]"
+
+
+@pytest.mark.parametrize("text,kept", [
+    ("Bearer abc123def456_session", ""),
+    ("Bearer abc123def456;next", ";next"),
+    ("Bearer abc123def456ü", "ü"),
+    ("Bearer abc123def456ghijklmnopq", ""),
+    ("Bearer abc123def456,next", ",next"),
+])
+def test_redact_bearer_consumes_whole_token_up_to_adjacent_char(text, kept):
+    out = aa.redact(text)
+    assert out == "[REDACTED]" + kept
+    assert "abc123" not in out and "def456" not in out and "ghij" not in out
+
+
+@pytest.mark.parametrize("text", ["xbearer abc123def456", "column_xbearer abcdefghijklmnopqr", "Subbearer 1a2b3c4d5e6f"])
+def test_redact_bearer_needs_word_boundary(text):
+    assert aa.redact(text) == text
+
+
+@pytest.mark.parametrize("exc", [duckdb.InvalidInputException, duckdb.ConversionException, duckdb.Error])
+def test_guard_non_parser_duckdb_error_returns_sql_error_result(exc, monkeypatch):
+    err = exc("bad input near 'abc")
+
+    def boom(sql):
+        raise err
+
+    monkeypatch.setattr(aa.duckdb, "extract_statements", boom)
+    assert aa.sql_guard_error("SELECT 'abc") == aa.sql_error_result(err)
+
+
+@pytest.mark.parametrize("sql", ["SELECT 'abc", "SELECT \"abc", "SELECT $t$abc", "SELECT E'\\\\", "SELECT 1 /* x"])
+def test_guard_unclosed_literal_returns_duckdb_error_text(sql):
+    with pytest.raises(duckdb.Error) as ei:
+        duckdb.extract_statements(sql)
+    out = aa.sql_guard_error(sql)
+    assert out == aa.sql_error_result(ei.value)
+    assert out.startswith("Error: SQL error ") and "Only one SQL statement" not in out
