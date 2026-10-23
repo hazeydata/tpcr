@@ -412,9 +412,9 @@ _DASH = r"(?:-|\\+u002[dD]|\\+x2[dD]|%2[dD])"  # '-' plain or escaped (JSON/py/u
 _TOKEN = r"[A-Za-z0-9._~+/=\-]"
 _SECRET_RE = re.compile(
     r"sk" + _DASH + r"ant" + _DASH + r"(?:[A-Za-z0-9_]|" + _DASH + r")+"
-    r"|sk" + _DASH + r"(?:[A-Za-z0-9_]|" + _DASH + r"){16,}"
-    r"|bearer\s+(?=" + _TOKEN + r"*\d|" + _TOKEN + r"{16})" + _TOKEN + r"+"
-    r"|api(?:_|" + _DASH + r")key[\"']?\s*[:=]\s*[\"']?[^\s\"',;}]+",
+    r"|(?<![A-Za-z0-9_])sk" + _DASH + r"(?:[A-Za-z0-9_]|" + _DASH + r"){16,}"
+    r"|\bbearer\s+(?:" + _TOKEN + r"{16,}|(?=" + _TOKEN + r"*\d)(?=" + _TOKEN + r"*[A-Za-z])" + _TOKEN + r"{12,})(?!" + _TOKEN + r")"
+    r"|(?<![A-Za-z0-9])api(?:_|" + _DASH + r")key[\"']?\s*[:=]\s*[\"']?[^\s\"',;}]+",
     re.IGNORECASE,
 )
 _LOCK_RE = re.compile(r"\b(?:lock(?:ed|ing)?|busy|io error|could not set|blocked)\b")
@@ -448,9 +448,20 @@ NON_SELECT_MSG = "Error: Only SELECT queries are allowed."
 
 def sql_guard_error(sql: str) -> str | None:
     """AC31: None if sql is a single SELECT/WITH statement, else the tool error to return."""
-    if not is_select_start(sql):
+    s = (sql or "").strip()
+    if not is_select_start(s):
         return NON_SELECT_MSG
-    return None if is_single_select(sql) else MULTI_STATEMENT_MSG
+    try:
+        statements = duckdb.extract_statements(s)
+        tokens = duckdb.tokenize(s)
+    except duckdb.Error as e:
+        return sql_error_result(e)
+    semicolons = sum(1 for pos, kind in tokens if kind == duckdb.token_type.operator and s[pos] == ";")
+    if len(statements) != 1 or semicolons > 1:
+        return MULTI_STATEMENT_MSG
+    if statements[0].type != duckdb.StatementType.SELECT:
+        return NON_SELECT_MSG
+    return None
 
 
 def is_select_start(sql: str) -> bool:
@@ -459,17 +470,8 @@ def is_select_start(sql: str) -> bool:
 
 
 def is_single_select(sql: str) -> bool:
-    """Exactly one SELECT statement per DuckDB's parser; a trailing ';' is allowed."""
-    s = (sql or "").strip()
-    if not is_select_start(s):
-        return False
-    if s.endswith(";") and s[:-1].rstrip().endswith(";"):
-        return False
-    try:
-        statements = duckdb.extract_statements(s)
-    except duckdb.Error:
-        return False
-    return len(statements) == 1 and statements[0].type == duckdb.StatementType.SELECT
+    """Exactly one SELECT statement per DuckDB's parser; one trailing ';' is allowed, empty statements are not."""
+    return sql_guard_error(sql) is None
 
 
 def date_range_sql() -> str:

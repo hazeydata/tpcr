@@ -462,8 +462,6 @@ def test_f1_lock_check_word_boundary(msg, lock):
     "SELECT $$'$$; DROP TABLE t; SELECT '$$'",
     "SELECT $q$'$q$; DROP TABLE t; SELECT '$q$'",
     "SELECT \"it's\"; DROP TABLE t; SELECT 'a'",
-    "SELECT 'unterminated; DROP TABLE t",
-    "SELECT 1 /* unterminated; DROP TABLE t",
     "SELECT 1;;",
 ])
 def test_f2_guard_rejects_comment_literal_bypasses(sql, monkeypatch):
@@ -633,3 +631,112 @@ def test_redact_case_insensitive_and_api_key_forms(text):
 ])
 def test_redact_leaves_plain_bearer_word(text):
     assert aa.redact(text) == text
+
+
+PARSE_ERROR_SQL = [
+    "SELECT FROM WHERE",
+    "SELECT 1 +",
+    "SELECT * FROM t2 WHERE",
+    "SELECT 'unterminated; DROP TABLE t",
+    "SELECT 1 /* unterminated; DROP TABLE t",
+]
+
+
+def _parser_error_text(sql):
+    with pytest.raises(duckdb.ParserException) as ei:
+        duckdb.extract_statements(sql)
+    return aa.sql_error_result(ei.value)
+
+
+@pytest.mark.parametrize("sql", PARSE_ERROR_SQL)
+def test_ac28_parse_error_returns_duckdb_text_from_guard(sql):
+    out = aa.sql_guard_error(sql)
+    assert out == _parser_error_text(sql)
+    assert out.startswith("Error: SQL error ParserException: Parser Error")
+    assert "Only one SQL statement" not in out
+
+
+@pytest.mark.parametrize("sql", PARSE_ERROR_SQL)
+def test_ac28_parse_error_text_reaches_model_qwen(sql, monkeypatch):
+    monkeypatch.setattr(aa.duckdb, "connect", lambda *a, **k: pytest.fail("connected to DuckDB"))
+    chat = AsyncMock(side_effect=[_tool(sql), chat_reply("done")])
+    with patch("ask_agent._chat", chat):
+        assert asyncio.run(aa.ask_agent("q", "u")) == "done"
+    tool_msgs = [m["content"] for m in chat.call_args_list[-1].args[0] if m.get("role") == "tool"]
+    assert tool_msgs == [_parser_error_text(sql)]
+    assert "Only one SQL statement" not in tool_msgs[0]
+
+
+@pytest.mark.parametrize("sql", PARSE_ERROR_SQL)
+def test_ac28_parse_error_text_reaches_model_claude(sql, monkeypatch):
+    replies = [
+        NS(content=[NS(type="tool_use", id="tu1", name="run_query", input={"sql": sql})]),
+        NS(content=[NS(type="text", text="done")]),
+    ]
+    sent = []
+
+    async def create(**kw):
+        sent.append(kw["messages"])
+        return replies.pop(0)
+
+    fake = NS(AsyncAnthropic=lambda **k: NS(messages=NS(create=create)))
+    monkeypatch.setitem(sys.modules, "anthropic", fake)
+    monkeypatch.setattr(aa.duckdb, "connect", lambda *a, **k: pytest.fail("connected to DuckDB"))
+    answer, _ = asyncio.run(aa._claude_loop("k", "system prompt", "q"))
+    assert answer == "done"
+    results = [b["content"] for m in sent[-1] if m["role"] == "user" and isinstance(m["content"], list)
+               for b in m["content"] if b.get("type") == "tool_result"]
+    assert results == [_parser_error_text(sql)]
+    assert "Only one SQL statement" not in results[0]
+
+
+@pytest.mark.parametrize("sql", [
+    "WITH x AS (SELECT 1) DELETE FROM t",
+    "WITH x AS (SELECT 1) INSERT INTO t SELECT 1",
+    "WITH x AS (SELECT 1) UPDATE t SET a = 1",
+    "WITH x AS (SELECT 1) DELETE FROM t;",
+])
+def test_guard_rejects_non_select_behind_with_prefix(sql):
+    statements = duckdb.extract_statements(sql)
+    assert len(statements) == 1 and statements[0].type != duckdb.StatementType.SELECT
+    assert aa.sql_guard_error(sql) == aa.NON_SELECT_MSG
+    assert aa.is_single_select(sql) is False
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT 1;;",
+    "SELECT 1 ; ; -- c",
+    "SELECT 1;\n;",
+    "SELECT 1; /* c */ ;",
+    "WITH a AS (SELECT 1) SELECT * FROM a;;",
+])
+def test_guard_rejects_empty_statements(sql):
+    assert aa.sql_guard_error(sql) == aa.MULTI_STATEMENT_MSG
+
+
+@pytest.mark.parametrize("sql", ["SELECT 1; -- c", "SELECT ';;' AS x;", "SELECT 1 /* ;; */", "SELECT $t$;;$t$;"])
+def test_guard_allows_one_trailing_semicolon_and_literal_semicolons(sql):
+    assert aa.sql_guard_error(sql) is None
+
+
+@pytest.mark.parametrize("text", [
+    "task-scheduler-identifier",
+    "DISK-CACHE-DIRECTORY-PATH",
+    "column risk-assessment-score-value missing",
+    "bearer 2",
+    "Bearer abc123",
+    "bearer short-token",
+])
+def test_redact_keeps_words_that_only_contain_key_prefixes(text):
+    assert aa.redact(text) == text
+
+
+@pytest.mark.parametrize("text,gone", [
+    ("token sk-" + "abcdefghijklmnop" + "qrst here", "abcdefghijklmnopqrst"),
+    ("Authorization: Bearer " + "abcdefgh" * 2, "abcdefgh" * 2),
+    ("Authorization: Bearer abc123def456", "abc123def456"),
+    ("x=" + SECRET, "TESTSECRET"),
+])
+def test_redact_still_strips_keys_at_word_boundaries(text, gone):
+    out = aa.redact(text)
+    assert gone not in out and "[REDACTED]" in out
