@@ -484,6 +484,32 @@ class TestMain:
         assert daily_report.main(self.ARGS) == 9
         assert calls == []
 
+    def test_stale_pending_age_text_is_floored(self, root, monkeypatch, capsys):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        calls = _counting_post(monkeypatch)
+        now = datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc)
+
+        class FrozenDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        monkeypatch.setattr(daily_report, "_dt", FrozenDT)
+        # Real 6h limit: 6.99h must read 6h59m, never a rounded "7.0h".
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": (now - timedelta(hours=6.99)).isoformat()})
+        assert daily_report.main(self.ARGS) == 9
+        out = capsys.readouterr().out
+        assert "claimed 6h59m ago" in out and "7.0h" not in out
+        # Limit 0 so any age is stale: 5.99h -> 5h59m, 0h -> 0h00m.
+        monkeypatch.setattr(daily_report, "STALE_PENDING_HOURS", 0)
+        for hours, text in ((5.99, "claimed 5h59m ago"), (0, "claimed 0h00m ago")):
+            _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                                "claimed_at": (now - timedelta(hours=hours)).isoformat()})
+            assert daily_report.main(self.ARGS) == 9
+            assert text in capsys.readouterr().out
+        assert calls == []
+
     def test_pending_for_other_run_date_exits_9(self, root, monkeypatch):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
         calls = _counting_post(monkeypatch)
