@@ -501,9 +501,16 @@ class TestMain:
         assert daily_report.main(self.ARGS) == 9
         out = capsys.readouterr().out
         assert "claimed 6h59m ago" in out and "7.0h" not in out
-        # Limit 0 so any age is stale: 5.99h -> 5h59m, 0h -> 0h00m.
+        # 6h59m45s must floor to 6h59m, never round up to 7h00m.
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": (now - timedelta(hours=6, minutes=59, seconds=45)).isoformat()})
+        assert daily_report.main(self.ARGS) == 9
+        out = capsys.readouterr().out
+        assert "claimed 6h59m ago" in out and "7h00m" not in out
+        # Limit 0 so any age is stale: 5.99h and 5h59m45s -> 5h59m, 0h -> 0h00m.
         monkeypatch.setattr(daily_report, "STALE_PENDING_HOURS", 0)
-        for hours, text in ((5.99, "claimed 5h59m ago"), (0, "claimed 0h00m ago")):
+        for hours, text in ((5.99, "claimed 5h59m ago"), (5 + 59.75 / 60, "claimed 5h59m ago"),
+                            (0, "claimed 0h00m ago")):
             _write_state(root, {"run_date": "2026-10-12", "state": "pending",
                                 "claimed_at": (now - timedelta(hours=hours)).isoformat()})
             assert daily_report.main(self.ARGS) == 9
