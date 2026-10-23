@@ -552,7 +552,7 @@ def test_ask_never_touches_anthropic(bot):
     interaction = make_interaction(events)
     post = AsyncMock(return_value=chat_reply("Fine day"))
     with patch.dict(sys.modules, {"anthropic": Boom("anthropic")}), \
-         patch.object(bot, "ANTHROPIC_API_KEY", None), \
+         patch.object(bot, "OPENROUTER_API_KEY", None), \
          patch("ask_agent._post_chat", post):
         call_ask(bot, interaction)
 

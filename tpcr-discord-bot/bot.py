@@ -1708,15 +1708,7 @@ class AskFeedbackView(discord.ui.View):
             item.disabled = True
 
 
-ANTHROPIC_API_KEY = None
-_auth_profiles = os.path.expanduser("~/.clawdbot/agents/anthropic/agent/auth-profiles.json")
-try:
-    import json as _json
-    _data = _json.loads(open(_auth_profiles).read())
-    _profiles = _data.get("profiles", _data)  # handle nested or flat
-    ANTHROPIC_API_KEY = _profiles.get("anthropic:default", {}).get("key")
-except Exception as e:
-    print(f"⚠️ Could not load Anthropic API key: {e}")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 BOT_COMMANDS_CHANNEL = 1478240248361128079  # #bot-commands (recreated Mar 2)
 
@@ -1737,7 +1729,7 @@ async def ask_command(interaction: discord.Interaction, question: str):
     try:
         placeholder = await interaction.followup.send("Thinking…", wait=True)
 
-        answer = await ask_agent(question, str(interaction.user.id), api_key=ANTHROPIC_API_KEY, username=str(interaction.user))
+        answer = await ask_agent(question, str(interaction.user.id), api_key=OPENROUTER_API_KEY, username=str(interaction.user))
 
         # Build embed
         embed = discord.Embed(

@@ -244,12 +244,14 @@ def data_path(*parts: str) -> str:
     return os.path.join(str(root), *parts)
 
 
-ASK_PROVIDERS = ("anthropic", "qwen")
+ASK_PROVIDERS = ("openrouter", "qwen")
 
 
 def ask_provider() -> str:
-    """TPCR_ASK_PROVIDER (default anthropic); any other value raises."""
-    provider = os.getenv("TPCR_ASK_PROVIDER", "anthropic").strip().lower() or "anthropic"
+    """TPCR_ASK_PROVIDER (default openrouter; "anthropic" is an alias); any other value raises."""
+    provider = os.getenv("TPCR_ASK_PROVIDER", "openrouter").strip().lower() or "openrouter"
+    if provider == "anthropic":
+        provider = "openrouter"
     if provider not in ASK_PROVIDERS:
         raise RuntimeError(
             f"TPCR_ASK_PROVIDER={provider!r} is invalid; allowed values: {' or '.join(ASK_PROVIDERS)}"
@@ -792,55 +794,68 @@ async def _chat(messages: list[dict], use_tools: bool) -> dict:
     return await _post_chat(payload)
 
 
-CLAUDE_MODEL = "claude-sonnet-4-6"
-CLAUDE_TOOLS = [
-    {
-        "name": "run_query",
-        "description": TOOLS[0]["function"]["description"],
-        "input_schema": TOOLS[0]["function"]["parameters"],
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL = "anthropic/claude-sonnet-4.6"
+OPENROUTER_TIMEOUT = 60.0
+
+
+class OpenRouterHTTPError(Exception):
+    """Non-2xx response from OpenRouter; carries the status only, never the body."""
+
+    def __init__(self, status_code: int):
+        super().__init__(f"HTTP {status_code}")
+        self.status_code = status_code
+
+
+async def _post_openrouter(api_key: str, payload: dict) -> dict:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "X-Title": "TPCR /ask",
     }
-]
+    async with httpx.AsyncClient(timeout=OPENROUTER_TIMEOUT) as client:
+        resp = await client.post(OPENROUTER_URL, json=payload, headers=headers)
+    if resp.status_code >= 400:
+        raise OpenRouterHTTPError(resp.status_code)
+    return resp.json()
 
 
-def claude_assistant_blocks(content) -> list[dict]:
-    """Echo a Claude reply back as plain dict blocks, dropping empty text blocks
-    (the API 400s on "text content blocks must be non-empty")."""
-    out = []
-    for b in content:
-        if b.type == "text":
-            if (getattr(b, "text", "") or "").strip():
-                out.append({"type": "text", "text": b.text})
-        elif b.type == "tool_use":
-            out.append({"type": "tool_use", "id": b.id,
-                        "name": getattr(b, "name", None) or "run_query", "input": b.input or {}})
-    return out
-
-
-async def _claude_loop(api_key: str, system_prompt: str, question: str) -> str | None:
-    import anthropic
-
-    client = anthropic.AsyncAnthropic(api_key=api_key, timeout=60.0, max_retries=1)
-    messages = [{"role": "user", "content": question}]
+async def _openrouter_loop(api_key: str, system_prompt: str, question: str):
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": question},
+    ]
     for round_num in range(1, 6):
-        resp = await client.messages.create(
-            model=CLAUDE_MODEL, max_tokens=1500, system=system_prompt, messages=messages, tools=CLAUDE_TOOLS,
-        )
-        tool_uses = [b for b in resp.content if b.type == "tool_use"]
-        if not tool_uses:
-            return "".join(b.text for b in resp.content if b.type == "text").strip(), round_num
+        data = await _post_openrouter(api_key, {
+            "model": OPENROUTER_MODEL,
+            "max_tokens": 1500,
+            "messages": messages,
+            "tools": TOOLS,
+        })
+        message = data["choices"][0]["message"]
+        tool_calls = message.get("tool_calls") or []
+        if not tool_calls:
+            return (message.get("content") or "").strip(), round_num
 
-        messages.append({"role": "assistant", "content": claude_assistant_blocks(resp.content)})
-        results = []
-        for block in tool_uses:
-            sql = (block.input or {}).get("sql", "")
-            logger.info("ask claude round=%d sql=%s", round_num, sql)
+        messages.append({
+            "role": "assistant",
+            "content": message.get("content") or "",
+            "tool_calls": tool_calls,
+        })
+        for call in tool_calls:
+            fn = call.get("function", {})
+            try:
+                args = fn.get("arguments") or "{}"
+                args = json.loads(args) if isinstance(args, str) else args
+                sql = args.get("sql", "")
+            except (ValueError, AttributeError):
+                sql = ""
+            logger.info("ask openrouter round=%d sql=%s", round_num, sql)
             guard = sql_guard_error(sql)
             if guard:
                 result = guard
             else:
                 result = await asyncio.to_thread(run_duckdb_query, sql)
-            results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
-        messages.append({"role": "user", "content": results})
+            messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": result})
     return None, 5
 
 
@@ -849,7 +864,7 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
     Process a natural language question about theme park data.
     Uses a local Qwen server (OpenAI-compatible) with async DuckDB tool access.
 
-    With TPCR_ASK_PROVIDER=anthropic (default) and an api_key, Claude answers and
+    With TPCR_ASK_PROVIDER=openrouter (default) and an api_key, Claude via OpenRouter answers and
     Qwen is the fallback; TPCR_ASK_PROVIDER=qwen uses Qwen only.
     All blocking work (DuckDB queries, file I/O) is run off the event loop so
     the Discord heartbeat is never starved.
@@ -884,28 +899,26 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
         return answer
 
     provider = ask_provider()
-    if provider == "anthropic" and api_key:
+    if provider == "openrouter" and api_key:
         try:
-            claude_result = await _claude_loop(api_key, system_prompt, question)
-        except Exception as e:  # any Claude failure (API, timeout, KeyError, ...) falls back
-            # Class name (and HTTP status) only: provider error text can echo the key (AC24/AC27).
+            claude_result = await _openrouter_loop(api_key, system_prompt, question)
+        except Exception as e:  # any OpenRouter failure (API, timeout, KeyError, ...) falls back
             status = getattr(e, "status_code", None)
             if status in (401, 403):
-                logger.error("Claude /ask auth failed (%s, status %s); falling back to Qwen",
+                logger.error("OpenRouter /ask auth failed (%s, status %s); falling back to Qwen",
                              type(e).__name__, status)
             elif status is not None:
-                # AC27: class name + HTTP status only, never the provider message.
-                logger.warning("Claude /ask failed (%s, status %s); falling back to Qwen",
+                logger.warning("OpenRouter /ask failed (%s, status %s); falling back to Qwen",
                                type(e).__name__, status)
             else:
-                logger.warning("Claude /ask failed (%s); falling back to Qwen", type(e).__name__)
+                logger.warning("OpenRouter /ask failed (%s); falling back to Qwen", type(e).__name__)
         else:
             claude_answer, claude_rounds = (claude_result if isinstance(claude_result, tuple)
                                             else (claude_result, 5))
             if claude_answer:
-                return await finish(claude_answer, claude_rounds, CLAUDE_MODEL)
-    elif provider == "anthropic":
-        logger.warning("TPCR_ASK_PROVIDER=anthropic but no api_key; using Qwen")
+                return await finish(claude_answer, claude_rounds, OPENROUTER_MODEL)
+    elif provider == "openrouter":
+        logger.warning("TPCR_ASK_PROVIDER=openrouter but no api_key; using Qwen")
 
     # Allow up to 5 tool-use rounds
     for round_num in range(1, 6):
