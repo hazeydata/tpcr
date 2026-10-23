@@ -284,6 +284,12 @@ class TestGate:
         assert "GATE PASS" in capsys.readouterr().out
         assert fake_time.sleeps == []
 
+    def test_marker_null_run_date_fails(self, root):
+        _write_marker(root, {"status": "done", "run_date": None})
+        daily_report._refresh_paths()
+        passed, reason = self._gate()
+        assert not passed and "run_date" in reason
+
     def test_marker_missing_run_date_fails(self, root):
         _write_marker(root, {"status": "done"})
         daily_report._refresh_paths()
@@ -412,6 +418,20 @@ class TestMain:
         assert len(calls) == 1
         assert "FORCE: overriding existing state pending" in capsys.readouterr().out
 
+    def test_run_start_marker_precedes_stale_pending_output(self, root, monkeypatch, capsys):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        _counting_post(monkeypatch)
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": _hours_ago(7)})
+        assert daily_report.main(self.ARGS) == 9
+        lines = capsys.readouterr().out.splitlines()
+        assert lines[0].startswith("RUN START run_date=2026-10-12")
+        assert any("PENDING" in line for line in lines[1:])
+
+    def test_dry_run_prints_no_run_start_marker(self, root, capsys):
+        assert daily_report.main(self.ARGS + ["--dry-run"]) == 0
+        assert "RUN START" not in capsys.readouterr().out
+
     def test_stale_pending_exits_9_and_force_posts(self, root, monkeypatch, capsys):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
         calls = _counting_post(monkeypatch)
@@ -425,11 +445,91 @@ class TestMain:
         assert len(calls) == 1
         assert _read_state_file(root)["state"] == "posted"
 
+    def test_pending_exactly_at_limit_is_stale(self, root, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        now = datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc)
+
+        class FrozenDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        monkeypatch.setattr(daily_report, "_dt", FrozenDT)
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": (now - timedelta(hours=6)).isoformat()})
+        assert daily_report.main(self.ARGS) == 9
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": (now - timedelta(hours=5, minutes=59)).isoformat()})
+        assert daily_report.main(self.ARGS) == 5
+
     def test_pending_without_claimed_at_is_stale(self, root, monkeypatch):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
         _write_state(root, {"run_date": "2026-10-12", "state": "pending",
                             "claimed_at": "garbage"})
         assert daily_report.main(self.ARGS) == 9
+
+    def test_pending_claimed_in_future_exits_9(self, root, monkeypatch):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        calls = _counting_post(monkeypatch)
+        now = datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc)
+
+        class FrozenDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        monkeypatch.setattr(daily_report, "_dt", FrozenDT)
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": (now + timedelta(hours=1)).isoformat()})
+        assert daily_report.main(self.ARGS) == 9
+        assert calls == []
+
+    def test_stale_pending_age_text_is_floored(self, root, monkeypatch, capsys):
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        calls = _counting_post(monkeypatch)
+        now = datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc)
+
+        class FrozenDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        monkeypatch.setattr(daily_report, "_dt", FrozenDT)
+        # Real 6h limit: 6.99h must read 6h59m, never a rounded "7.0h".
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": (now - timedelta(hours=6.99)).isoformat()})
+        assert daily_report.main(self.ARGS) == 9
+        out = capsys.readouterr().out
+        assert "claimed 6h59m ago" in out and "7.0h" not in out
+        # 6h59m45s must floor to 6h59m, never round up to 7h00m.
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": (now - timedelta(hours=6, minutes=59, seconds=45)).isoformat()})
+        assert daily_report.main(self.ARGS) == 9
+        out = capsys.readouterr().out
+        assert "claimed 6h59m ago" in out and "7h00m" not in out
+        # 7h59m59s must read 7h59m (no extra second pushing it to 8h00m).
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": (now - timedelta(hours=7, minutes=59, seconds=59)).isoformat()})
+        assert daily_report.main(self.ARGS) == 9
+        out = capsys.readouterr().out
+        assert "claimed 7h59m ago" in out and "8h00m" not in out
+        # 5h59m59s with the real 6h limit is NOT stale: plain pending (exit 5), no STALE text, no post.
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": (now - timedelta(hours=5, minutes=59, seconds=59)).isoformat()})
+        assert daily_report.main(self.ARGS) == 5
+        out = capsys.readouterr().out
+        assert "STALE" not in out and "claimed" not in out
+        assert calls == []
+        # Limit 0 so any age is stale: 5.99h, 5h59m45s and 5h59m59s -> 5h59m, 0h -> 0h00m.
+        monkeypatch.setattr(daily_report, "STALE_PENDING_HOURS", 0)
+        for hours, text in ((5.99, "claimed 5h59m ago"), (5 + 59.75 / 60, "claimed 5h59m ago"),
+                            (5 + 59 / 60 + 59 / 3600, "claimed 5h59m ago"),
+                            (0, "claimed 0h00m ago")):
+            _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                                "claimed_at": (now - timedelta(hours=hours)).isoformat()})
+            assert daily_report.main(self.ARGS) == 9
+            assert text in capsys.readouterr().out
+        assert calls == []
 
     def test_pending_for_other_run_date_exits_9(self, root, monkeypatch):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
@@ -727,12 +827,55 @@ class TestWatchdog:
         assert ok  # no state file
         _write_state(root, {"run_date": "2026-10-12", "state": "pending"})
         ok, reason = watchdog.post_state_check(TODAY)
-        assert not ok and "pending" in reason
+        assert not ok and "stale" in reason
         _write_state(root, {"run_date": "2026-10-12", "state": "posted"})
         assert watchdog.post_state_check(TODAY)[0]
         _write_state(root, "not json {{{")
         ok, reason = watchdog.post_state_check(TODAY)
         assert not ok and "corrupt" in reason
+
+    def test_post_state_check_pending_age(self, watchdog, root, monkeypatch):
+        now = datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc)
+
+        class FrozenDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        monkeypatch.setattr(watchdog, "datetime", FrozenDT)
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": (now - timedelta(hours=1)).replace(tzinfo=None).isoformat()})
+        ok, reason = watchdog.post_state_check(TODAY)
+        assert ok and "pending" in reason
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": (now - timedelta(hours=6)).isoformat()})
+        ok, reason = watchdog.post_state_check(TODAY)
+        assert not ok and "stale" in reason
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending"})
+        ok, reason = watchdog.post_state_check(TODAY)
+        assert not ok and "stale" in reason
+        _write_state(root, {"run_date": "2026-10-11", "state": "pending",
+                            "claimed_at": (now - timedelta(hours=1)).isoformat()})
+        ok, reason = watchdog.post_state_check(TODAY)
+        assert not ok and "stale" in reason
+
+    def test_post_state_check_future_and_floored_age(self, watchdog, root, monkeypatch):
+        now = datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc)
+
+        class FrozenDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        monkeypatch.setattr(watchdog, "datetime", FrozenDT)
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": (now + timedelta(hours=1)).isoformat()})
+        ok, reason = watchdog.post_state_check(TODAY)
+        assert not ok and "stale" in reason and "future" in reason
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": (now - timedelta(hours=5, minutes=59, seconds=59)).isoformat()})
+        ok, reason = watchdog.post_state_check(TODAY)
+        assert ok and "5h59m" in reason and "6.0h" not in reason
 
     def test_check_only_fails_on_pending_state_and_never_posts(
             self, watchdog, root, monkeypatch):
@@ -790,3 +933,63 @@ class TestWatchdog:
         con.close()
         scores = watchdog.get_wdw_wti_today(TODAY)
         assert scores == {"MK": 20.0, "EP": 24.0, "HS": 32.0, "AK": 40.0}
+
+
+# Exact floored age text at every edge, for BOTH daily_report and the watchdog.
+AGE_TEXT_CASES = [
+    ((0, 0, 0), "0h00m"),
+    ((0, 0, 59), "0h00m"),
+    ((0, 1, 0), "0h01m"),
+    ((5, 59, 0), "5h59m"),
+    ((5, 59, 59), "5h59m"),
+    ((6, 0, 0), "6h00m"),
+    ((6, 59, 45), "6h59m"),
+    ((6, 59, 59), "6h59m"),
+    ((7, 59, 59), "7h59m"),
+]
+
+
+class TestAgeTextTable:
+    NOW = datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc)
+
+    def _claim(self, root, hms):
+        h, m, s = hms
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": (self.NOW - timedelta(hours=h, minutes=m, seconds=s)).isoformat()})
+
+    @pytest.mark.parametrize("hms,text", AGE_TEXT_CASES)
+    def test_daily_report_age_text(self, hms, text, root, monkeypatch, capsys):
+        now = self.NOW
+
+        class FrozenDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        calls = _counting_post(monkeypatch)
+        monkeypatch.setattr(daily_report, "_dt", FrozenDT)
+        # Limit 0 so every age (including 0s) is stale and the text prints.
+        monkeypatch.setattr(daily_report, "STALE_PENDING_HOURS", 0)
+        self._claim(root, hms)
+        assert daily_report.main(TestMain.ARGS) == 9
+        out = capsys.readouterr().out
+        assert f"STALE PENDING marker (claimed {text} ago, limit 0h)" in out
+        assert calls == []
+
+    @pytest.mark.parametrize("hms,text", AGE_TEXT_CASES)
+    def test_watchdog_age_text(self, hms, text, watchdog, root, monkeypatch):
+        now = self.NOW
+
+        class FrozenDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        monkeypatch.setattr(watchdog, "datetime", FrozenDT)
+        # Limit 0 so every age is stale; the text is the same either way.
+        monkeypatch.setattr(watchdog, "STALE_PENDING_HOURS", 0)
+        self._claim(root, hms)
+        ok, reason = watchdog.post_state_check(TODAY)
+        assert not ok
+        assert reason == f"post state pending {text} (stale, limit 0h)"
