@@ -410,13 +410,24 @@ def run_duckdb_query(sql: str, max_retries: int = 8) -> str:
 NO_RESULTS_MSG = "No results found."
 NON_LOCK_ATTEMPTS = 2  # a non-lock error is retried once, not max_retries times
 _SQL_ERROR_NAMES = ("BinderException", "CatalogException", "ParserException")
-_DASH = r"(?:-|\\+u002[dD]|\\+x2[dD]|%2[dD])"  # '-' plain or escaped (JSON/py/url)
+_DASH_FORMS = ("-", "\\u002d", "\\x2d", "%2d", "&#45;", "&#x2d;")
+_UNDERSCORE_FORMS = ("_", "\\u005f", "\\x5f", "%5f", "&#95;", "&#x5f;")
+_SEP_FORMS = _DASH_FORMS + _UNDERSCORE_FORMS
+
+
+def _form_re(form: str) -> str:
+    return r"\\+" + re.escape(form[1:]) if form.startswith("\\") else re.escape(form)
+
+
+_DASH = "(?:" + "|".join(_form_re(f) for f in _DASH_FORMS) + ")"
+_SEP = "(?:" + "|".join(_form_re(f) for f in _SEP_FORMS) + ")"
+_WORD_START = "(?:" + "|".join("(?<=" + re.escape(f) + ")" for f in _SEP_FORMS) + "|(?<![A-Za-z0-9]))"
 _TOKEN = r"[A-Za-z0-9._~+/=\-]"
 _SECRET_RE = re.compile(
     r"sk" + _DASH + r"ant" + _DASH + r"(?:[A-Za-z0-9_]|" + _DASH + r")+"
-    r"|(?<![A-Za-z0-9_])sk" + _DASH + r"(?:[A-Za-z0-9_]|" + _DASH + r"){16,}"
+    "|" + _WORD_START + "sk" + _DASH + r"(?:[A-Za-z0-9_]|" + _DASH + r"){16,}"
     r"|\bbearer\s+(?:" + _TOKEN + r"{16,}|(?=" + _TOKEN + r"*\d)(?=" + _TOKEN + r"*[A-Za-z])" + _TOKEN + r"{12,})(?!" + _TOKEN + r")"
-    r"|(?:(?<=\\u002d)|(?<=\\u005f)|(?<=\\x2d)|(?<=\\x5f)|(?<![A-Za-z0-9]))api(?:_|\\+u005[fF]|\\+x5[fF]|" + _DASH + r")key[\"']?\s*[:=]\s*[\"']?[^\s\"',;}]+",
+    "|" + _WORD_START + "api" + _SEP + r"key[\"']?\s*[:=]\s*[\"']?[^\s\"',;}]+",
     re.IGNORECASE,
 )
 _LOCK_RE = re.compile(r"\b(?:lock(?:ed|ing)?|busy|io error|could not set|blocked)\b")

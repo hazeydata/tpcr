@@ -733,3 +733,44 @@ def test_redact_escaped_separator_before_api_key(text):
 ])
 def test_redact_api_key_needs_boundary_or_escape(text):
     assert aa.redact(text) == text
+
+
+ESCAPE_SEPARATORS = [
+    "-", "_", "\\u002d", "\\u005f", "\\x2d", "\\x5f", "%2d", "%5f", "&#45;", "&#x2d;", "&#95;", "&#x5f;",
+]
+ESCAPE_CASES = sorted({form for sep in ESCAPE_SEPARATORS for form in (sep, sep.upper())})
+
+
+def test_escape_separator_list_matches_redactor():
+    assert sorted(aa._SEP_FORMS) == sorted(ESCAPE_SEPARATORS)
+
+
+@pytest.mark.parametrize("sep", ESCAPE_CASES)
+@pytest.mark.parametrize("word", ["api", "API", "Api"])
+def test_redact_escape_matrix_both_positions(sep, word):
+    for text in (
+        "x" + sep + word + sep + "key=opaqueTOKEN999",
+        "x" + sep + word + "_key: opaqueTOKEN999",
+        "x" + sep + word + "-KEY: opaqueTOKEN999",
+        word + sep + "key=opaqueTOKEN999",
+        "{\"x" + sep + word + sep + "key\": \"opaqueTOKEN999\"}",
+    ):
+        out = aa.redact(text)
+        assert "opaqueTOKEN999" not in out and "[REDACTED]" in out, text
+
+
+@pytest.mark.parametrize("sep", ESCAPE_CASES)
+def test_redact_escape_matrix_boundary_safe(sep):
+    for text in (
+        "rapi" + sep + "key=notasecret",
+        "xapi" + sep + "key: value",
+        "task" + sep + "scheduler" + sep + "identifier",
+        "DISK" + sep + "CACHE" + sep + "DIRECTORY" + sep + "PATH",
+    ):
+        assert aa.redact(text) == text, text
+
+
+@pytest.mark.parametrize("sep", [s for s in ESCAPE_CASES if s.lower() in ("-", "\\u002d", "\\x2d", "%2d", "&#45;", "&#x2d;")])
+def test_redact_escape_matrix_sk_keys(sep):
+    out = aa.redact("x" + sep + "sk" + sep + "abcdefghijklmnopqrst")
+    assert "abcdefghijklmnopqrst" not in out and "[REDACTED]" in out
