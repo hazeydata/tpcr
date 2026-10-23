@@ -481,3 +481,129 @@ def test_f3_escaped_and_header_tokens_stripped_for_model(text, monkeypatch):
 def test_prompt_uses_dayname_try_cast_for_park_date():
     assert "dayname(TRY_CAST(park_date AS DATE))" in aa.SCHEMA_CONTEXT
     assert not re.search(r"dayname\(\s*park_date\s*\)", aa.SCHEMA_CONTEXT)
+
+
+
+BYPASS_SQL = [
+    "SELECT E'\\''; DROP TABLE t; -- '",
+    "SELECT 1 /* /* */ '; */ ; DROP TABLE t; --'",
+]
+
+
+@pytest.mark.parametrize("sql", BYPASS_SQL)
+def test_parser_guard_bypass_never_reaches_duckdb_qwen(sql, monkeypatch):
+    ran = []
+    monkeypatch.setattr(aa, "run_duckdb_query", lambda q: ran.append(q) or "x")
+    monkeypatch.setattr(aa.duckdb, "connect", lambda *a, **k: pytest.fail("connected to DuckDB"))
+    replies = [_tool(sql), chat_reply("done")]
+    with patch("ask_agent._chat", AsyncMock(side_effect=replies)):
+        assert asyncio.run(aa.ask_agent("q", "u")) == "done"
+    assert ran == []
+
+
+@pytest.mark.parametrize("sql", BYPASS_SQL)
+def test_parser_guard_bypass_never_reaches_duckdb_openrouter(sql, monkeypatch):
+    call = {"id": "tu1", "type": "function", "function": {"name": "run_query", "arguments": json.dumps({"sql": sql})}}
+    replies = [chat_reply(tool_calls=[call]), chat_reply("done")]
+
+    async def post(api_key, payload):
+        return replies.pop(0)
+
+    monkeypatch.setattr(aa, "_post_openrouter", post)
+    monkeypatch.setattr(aa.duckdb, "connect", lambda *a, **k: pytest.fail("connected to DuckDB"))
+    answer, _ = asyncio.run(aa._openrouter_loop("k", "system prompt", "q"))
+    assert answer == "done"
+
+
+@pytest.mark.parametrize("sql", BYPASS_SQL)
+def test_parser_guard_rejects_bypass(sql):
+    assert aa.sql_guard_error(sql) is not None
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT $tag$a;b$tag$; DROP TABLE t",
+    "SELECT $tag$ x; DROP TABLE t",
+    "SELECT $$ x; DROP TABLE t",
+    "SELECT 'a''b'; DROP TABLE t",
+    "SELECT 'a\"b'; DROP TABLE t; SELECT '\"'",
+    "SELECT \"a'b\"; DROP TABLE t; SELECT 'c'",
+    "SELECT 'unclosed; DROP TABLE t",
+    "SELECT 1 /* unclosed; DROP TABLE t",
+    "SELECT U&'a'; DROP TABLE t",
+    "SELECT 1;;",
+    "SELECT 1;\rDROP TABLE t",
+    "SELECT 1;\r\nDROP TABLE t",
+])
+def test_parser_guard_rejects(sql):
+    assert aa.sql_guard_error(sql) is not None
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT $tag$a;b$tag$",
+    "SELECT $tag$a;b$tag$;",
+    "SELECT 'it''s; x'",
+    "SELECT U&'a;b'",
+    "SELECT \"a;b\" FROM t",
+    "SELECT \"a;b\" FROM t;",
+    "SELECT 'a\"b;c'",
+    "SELECT 1;",
+    "WITH a AS (SELECT 1) SELECT * FROM a;",
+])
+def test_parser_guard_allows(sql):
+    assert aa.sql_guard_error(sql) is None
+
+
+def test_guard_rejects_non_select_statement_type():
+    assert aa.sql_guard_error("SELECT 1; ATTACH 'x.db'") == aa.MULTI_STATEMENT_MSG
+    assert aa.sql_guard_error("DELETE FROM t") == aa.NON_SELECT_MSG
+
+
+
+KEY = SECRET + "456789ABCDEFG"
+
+
+def test_redact_caps_length_at_300():
+    assert len(aa.redact("a" * 1000)) == 300
+
+
+def test_redact_key_straddling_cap_leaves_no_fragment():
+    out = aa.redact("x" * 290 + KEY + "tail")
+    assert len(out) <= 300
+    assert "TESTSECRET" not in out and "sk-ant" not in out
+    assert not any(KEY[i:i + 4] in out for i in range(len(KEY) - 3))
+
+
+def test_redact_runs_before_truncation():
+    out = aa.redact("x" * 295 + KEY)
+    assert out == "x" * 295 + "[REDA"
+    assert "sk-a" not in out
+
+
+@pytest.mark.parametrize("text", [
+    "SK-ANT-API03-ABCDEFGHIJ",
+    "Sk-ant-api03-ABCDEFGHIJ",
+    "SK-ABCDEFGHIJKLMNOPQRSTUV",
+    "Sk-abcdefghijklmnopqrstuv",
+    "X-API-KEY: opaqueTOKEN999",
+    "api_key=opaqueTOKEN999",
+    "API_KEY: opaqueTOKEN999",
+    "api-key = opaqueTOKEN999",
+    '"api_key": "opaqueTOKEN999"',
+    "BEARER abc.DEF-123_xyz",
+    "Bearer abc.DEF-123_xyz",
+    "bearer abcdefghijklmnop",
+])
+def test_redact_case_insensitive_and_api_key_forms(text):
+    out = aa.redact(f"col {text} not found")
+    assert "[REDACTED]" in out
+    for tok in ("ABCDEFGHIJ", "opaqueTOKEN999", "abc.DEF", "abcdefghijklmnop", "KLMNOPQRSTUV", "klmnopqrstuv"):
+        assert tok not in out
+
+
+@pytest.mark.parametrize("text", [
+    "column bearer not found",
+    "Referenced column Bearer does not exist",
+    "column bearer authorization missing",
+])
+def test_redact_leaves_plain_bearer_word(text):
+    assert aa.redact(text) == text
