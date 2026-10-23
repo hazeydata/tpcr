@@ -421,10 +421,12 @@ _DASH = "(?:" + "|".join(_form_re(f) for f in _DASH_FORMS) + ")"
 _SEP = "(?:" + "|".join(_form_re(f) for f in _SEP_FORMS) + ")"
 _WORD_START = "(?:" + "|".join("(?<=" + re.escape(f) + ")" for f in _SEP_FORMS) + "|(?<![A-Za-z0-9]))"
 _TOKEN = r"[A-Za-z0-9._~+/=\-]"
+# Bearer: no tail guard needed; both alternatives are greedy over _TOKEN, so the match
+# always ends at the first non-token character (proved equivalent over 400k random cases).
 _SECRET_RE = re.compile(
     r"sk" + _DASH + r"ant" + _DASH + r"(?:[A-Za-z0-9_]|" + _DASH + r")+"
     "|" + _WORD_START + "sk" + _DASH + r"(?:[A-Za-z0-9_]|" + _DASH + r"){16,}"
-    r"|\bbearer\s+(?:" + _TOKEN + r"{16,}|(?=" + _TOKEN + r"*\d)(?=" + _TOKEN + r"*[A-Za-z])" + _TOKEN + r"{12,})(?!" + _TOKEN + r")"
+    r"|\bbearer\s+(?:" + _TOKEN + r"{16,}|(?=" + _TOKEN + r"*\d)(?=" + _TOKEN + r"*[A-Za-z])" + _TOKEN + r"{12,})"
     "|" + _WORD_START + "api" + _SEP + r"key[\"']?\s*[:=]\s*[\"']?[^\s\"',;}]+",
     re.IGNORECASE,
 )
@@ -583,7 +585,8 @@ class QwenHTTPError(Exception):
     """Non-2xx response from the Qwen server."""
 
     def __init__(self, status: int, body: str = ""):
-        super().__init__(f"HTTP {status}: {body[:300]}")
+        # Defence in depth (AC24): provider bodies can echo the key; never put it in the message.
+        super().__init__(f"HTTP {status}: {redact(body, 300)}")
         self.status = status
         self.body = body
 

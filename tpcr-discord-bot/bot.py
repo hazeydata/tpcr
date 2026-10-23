@@ -1724,6 +1724,16 @@ BOT_COMMANDS_CHANNEL = 1478240248361128079  # #bot-commands (recreated Mar 2)
 FRIENDLY_ERROR = "Sorry, I couldn't answer that right now. Please try again in a bit."
 
 
+def _ask_err(e: BaseException) -> str:
+    """Spec R4: exception class plus integer HTTP status only; never message, body or traceback."""
+    status = getattr(e, "status_code", None)
+    if status is None:
+        status = getattr(e, "status", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        return f"{type(e).__name__}, status {status}"
+    return type(e).__name__
+
+
 @tree.command(name="ask", description="Ask anything about theme park crowds, wait times, and visit planning")
 @app_commands.describe(question="Your question (e.g., 'What's the best day to visit Magic Kingdom this month?')")
 async def ask_command(interaction: discord.Interaction, question: str):
@@ -1750,20 +1760,22 @@ async def ask_command(interaction: discord.Interaction, question: str):
         view = AskFeedbackView(question, str(interaction.user.id), str(interaction.user))
         try:
             await placeholder.edit(content=None, embed=embed, view=view)
-        except Exception:
-            logger.warning("/ask placeholder edit failed; sending new message", exc_info=True)
+        except Exception as edit_err:
+            logger.warning("/ask placeholder edit failed (%s); sending new message", _ask_err(edit_err))
             await interaction.followup.send(embed=embed, view=view)
 
-    except Exception:
-        # Full details server-side only; users never see raw exception text
-        logger.error("/ask failed", exc_info=True)
+    except Exception as e:
+        # Spec R4 / AC24: class + status only. No exc_info: the traceback and its chained
+        # context (an earlier Claude/OpenRouter error) can echo the API key.
+        logger.error("/ask failed (%s)", _ask_err(e))
         try:
             if placeholder is not None:
                 await placeholder.edit(content=FRIENDLY_ERROR, embed=None, view=None)
             else:
                 await interaction.followup.send(FRIENDLY_ERROR, ephemeral=True)
-        except Exception:
-            logger.error("/ask could not deliver error message", exc_info=True)
+        except Exception as deliver_err:
+            # No exc_info: its chained __context__ is the original /ask error (Spec R4).
+            logger.error("/ask could not deliver error message (%s)", _ask_err(deliver_err))
             try:
                 await interaction.followup.send(FRIENDLY_ERROR, ephemeral=True)
             except Exception:

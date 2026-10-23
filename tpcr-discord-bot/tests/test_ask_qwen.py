@@ -527,8 +527,12 @@ def test_errors_show_only_friendly_message(bot, exc, caplog):
     assert bot.FRIENDLY_ERROR in visible
     for leak in ("secret", "127.0.0.1", "timed out", "refused", "Traceback", "HTTP 500"):
         assert leak not in visible
-    # full details only in server logs
-    assert any(r.exc_info for r in caplog.records)
+    # Spec R4: server log carries the class (+ status) only; no traceback, no message text
+    assert not any(r.exc_info for r in caplog.records)
+    fails = [r.getMessage() for r in caplog.records if r.getMessage().startswith("/ask failed")]
+    status = getattr(exc, "status", None)
+    want = f"{type(exc).__name__}, status {status}" if status is not None else type(exc).__name__
+    assert fails == [f"/ask failed ({want})"]
 
 
 def test_real_timeout_end_to_end_is_friendly(bot):
