@@ -933,3 +933,63 @@ class TestWatchdog:
         con.close()
         scores = watchdog.get_wdw_wti_today(TODAY)
         assert scores == {"MK": 20.0, "EP": 24.0, "HS": 32.0, "AK": 40.0}
+
+
+# Exact floored age text at every edge, for BOTH daily_report and the watchdog.
+AGE_TEXT_CASES = [
+    ((0, 0, 0), "0h00m"),
+    ((0, 0, 59), "0h00m"),
+    ((0, 1, 0), "0h01m"),
+    ((5, 59, 0), "5h59m"),
+    ((5, 59, 59), "5h59m"),
+    ((6, 0, 0), "6h00m"),
+    ((6, 59, 45), "6h59m"),
+    ((6, 59, 59), "6h59m"),
+    ((7, 59, 59), "7h59m"),
+]
+
+
+class TestAgeTextTable:
+    NOW = datetime(2026, 10, 12, 12, 0, tzinfo=timezone.utc)
+
+    def _claim(self, root, hms):
+        h, m, s = hms
+        _write_state(root, {"run_date": "2026-10-12", "state": "pending",
+                            "claimed_at": (self.NOW - timedelta(hours=h, minutes=m, seconds=s)).isoformat()})
+
+    @pytest.mark.parametrize("hms,text", AGE_TEXT_CASES)
+    def test_daily_report_age_text(self, hms, text, root, monkeypatch, capsys):
+        now = self.NOW
+
+        class FrozenDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
+        calls = _counting_post(monkeypatch)
+        monkeypatch.setattr(daily_report, "_dt", FrozenDT)
+        # Limit 0 so every age (including 0s) is stale and the text prints.
+        monkeypatch.setattr(daily_report, "STALE_PENDING_HOURS", 0)
+        self._claim(root, hms)
+        assert daily_report.main(TestMain.ARGS) == 9
+        out = capsys.readouterr().out
+        assert f"STALE PENDING marker (claimed {text} ago, limit 0h)" in out
+        assert calls == []
+
+    @pytest.mark.parametrize("hms,text", AGE_TEXT_CASES)
+    def test_watchdog_age_text(self, hms, text, watchdog, root, monkeypatch):
+        now = self.NOW
+
+        class FrozenDT(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now
+
+        monkeypatch.setattr(watchdog, "datetime", FrozenDT)
+        # Limit 0 so every age is stale; the text is the same either way.
+        monkeypatch.setattr(watchdog, "STALE_PENDING_HOURS", 0)
+        self._claim(root, hms)
+        ok, reason = watchdog.post_state_check(TODAY)
+        assert not ok
+        assert reason == f"post state pending {text} (stale, limit 0h)"
