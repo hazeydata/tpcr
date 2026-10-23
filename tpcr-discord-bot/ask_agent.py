@@ -416,7 +416,7 @@ _SECRET_RE = re.compile(
     r"sk" + _DASH + r"ant" + _DASH + r"(?:[A-Za-z0-9_]|" + _DASH + r")+"
     r"|(?<![A-Za-z0-9_])sk" + _DASH + r"(?:[A-Za-z0-9_]|" + _DASH + r"){16,}"
     r"|\bbearer\s+(?:" + _TOKEN + r"{16,}|(?=" + _TOKEN + r"*\d)(?=" + _TOKEN + r"*[A-Za-z])" + _TOKEN + r"{12,})(?!" + _TOKEN + r")"
-    r"|(?<![A-Za-z0-9])api(?:_|" + _DASH + r")key[\"']?\s*[:=]\s*[\"']?[^\s\"',;}]+",
+    r"|(?:(?<=\\u002d)|(?<=\\u005f)|(?<=\\x2d)|(?<=\\x5f)|(?<![A-Za-z0-9]))api(?:_|\\+u005[fF]|\\+x5[fF]|" + _DASH + r")key[\"']?\s*[:=]\s*[\"']?[^\s\"',;}]+",
     re.IGNORECASE,
 )
 _LOCK_RE = re.compile(r"\b(?:lock(?:ed|ing)?|busy|io error|could not set|blocked)\b")

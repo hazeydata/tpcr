@@ -710,3 +710,26 @@ def test_redact_keeps_words_that_only_contain_key_prefixes(text):
 def test_redact_still_strips_keys_at_word_boundaries(text, gone):
     out = aa.redact(text)
     assert gone not in out and "[REDACTED]" in out
+
+
+@pytest.mark.parametrize("text", [
+    "x\\u002dapi\\u002dkey: opaqueTOKEN999",
+    "X\\u002DAPI\\u002DKEY: opaqueTOKEN999",
+    "x\\u002dapi\\u005fkey: opaqueTOKEN999",
+    "x\\x2dapi\\x2dkey: opaqueTOKEN999",
+    "{\"x\\u005fapi\\u005fkey\": \"opaqueTOKEN999\"}",
+    "x\\\\u002dapi\\\\u002dkey=opaqueTOKEN999",
+])
+def test_redact_escaped_separator_before_api_key(text):
+    out = aa.redact(text)
+    assert "opaqueTOKEN999" not in out and "[REDACTED]" in out
+
+
+@pytest.mark.parametrize("text", [
+    "rapi_key=notasecret",
+    "column xapi-key: value",
+    "task-scheduler-identifier",
+    "DISK-CACHE-DIRECTORY-PATH",
+])
+def test_redact_api_key_needs_boundary_or_escape(text):
+    assert aa.redact(text) == text
