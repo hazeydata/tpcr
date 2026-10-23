@@ -45,7 +45,21 @@ def test_ask_agent_uses_async_http_client():
     assert "httpx.AsyncClient" in source, (
         "ask_agent should use httpx.AsyncClient for non-blocking API calls"
     )
-    assert "anthropic" not in source
+    assert "requests.post" not in source
+    tree = ast.parse(source)
+    assert not any(
+        isinstance(n, ast.Import) and any(a.name == "anthropic" for a in n.names)
+        for n in tree.body
+    )
+    # anthropic is optional: imported lazily inside _claude_loop, never at module level
+    assert not any(
+        isinstance(n, ast.Try) and any(isinstance(b, ast.Import) and any(a.name == "anthropic" for a in b.names)
+                                       for b in n.body)
+        for n in tree.body
+    )
+    lazy = [f for f in ast.walk(tree) if isinstance(f, ast.AsyncFunctionDef) and f.name == "_claude_loop"]
+    assert lazy and any(isinstance(n, ast.Import) and any(a.name == "anthropic" for a in n.names)
+                        for n in ast.walk(lazy[0]))
 
 
 def test_ask_agent_does_not_block_event_loop():
