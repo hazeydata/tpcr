@@ -47,6 +47,7 @@ from calendar_image import generate_calendar_image
 import os
 from ask_agent import ask_agent as ask_agent_anthropic
 from ask_agent_ollama import ask_agent_ollama
+from ask_status import StatusRotator, lines_for_question, render as render_status
 
 def ask_agent(*args, **kwargs):
     if os.getenv("USE_OLLAMA") == "1":
@@ -1710,8 +1711,22 @@ async def ask_command(interaction: discord.Interaction, question: str):
     if not await safe_defer(interaction):
         return
 
+    # Rotating status message (replaces the static "thinking…" indicator)
+    status_msg = None
+    rotator = None
     try:
-        answer = await ask_agent(question, str(interaction.user.id), ANTHROPIC_API_KEY or "missing-key", username=str(interaction.user))
+        status_lines = lines_for_question(question, PARK_NAMES)
+        status_msg = await interaction.followup.send(render_status(0, status_lines[0]), wait=True)
+        rotator = StatusRotator(status_msg, status_lines).start()
+    except Exception:
+        logger.warning("/ask status message unavailable; continuing without it", exc_info=True)
+
+    try:
+        try:
+            answer = await ask_agent(question, str(interaction.user.id), ANTHROPIC_API_KEY or "missing-key", username=str(interaction.user))
+        finally:
+            if rotator is not None:
+                await rotator.stop()
 
         # Build embed
         embed = discord.Embed(
@@ -1722,10 +1737,21 @@ async def ask_command(interaction: discord.Interaction, question: str):
         embed.set_footer(text="AI-powered • Data may not be 100% accurate • hazeydata.ai")
 
         view = AskFeedbackView(question, str(interaction.user.id), str(interaction.user))
+        if status_msg is not None:
+            try:
+                await status_msg.edit(content=None, embed=embed, view=view)
+                return
+            except Exception:
+                logger.warning("/ask status edit failed; sending new message", exc_info=True)
         await interaction.followup.send(embed=embed, view=view)
 
     except Exception as e:
         print(f"❌ /ask error: {e}")
+        if status_msg is not None:
+            try:
+                await status_msg.edit(content="❌ Sorry, I couldn't answer that one.", embed=None, view=None)
+            except Exception:
+                logger.warning("/ask status error edit failed", exc_info=True)
         await interaction.followup.send(
             f"❌ Sorry, I hit an error processing that question. Try rephrasing!\n`{str(e)[:100]}`",
             ephemeral=True
