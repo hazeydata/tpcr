@@ -2,19 +2,76 @@ import os
 """
 Ask Agent — AI-powered natural language query engine for TPCR Discord bot.
 
-Uses Anthropic Claude with DuckDB tool access to answer
+Uses Claude via OpenRouter (local Qwen fallback) with DuckDB tool access to answer
 theme park wait time questions from Discord users.
 """
 
 import asyncio
 import json
+import re
 import duckdb
-import anthropic
+import httpx
 from datetime import datetime, date
 from pathlib import Path
 from typing import Optional
 
 DUCKDB_PATH = os.path.expanduser("~/hazeydata/pipeline") + "/tpcr_live.duckdb"
+
+ASK_PROVIDERS = ("openrouter", "qwen")
+
+
+def ask_provider() -> str:
+    provider = os.getenv("TPCR_ASK_PROVIDER", "openrouter").strip().lower() or "openrouter"
+    if provider == "anthropic":
+        provider = "openrouter"
+    if provider not in ASK_PROVIDERS:
+        raise RuntimeError(
+            f"TPCR_ASK_PROVIDER={provider!r} is invalid; allowed values: {' or '.join(ASK_PROVIDERS)}"
+        )
+    return provider
+
+
+_DASH = r"(?:-|\\+u002[dD]|\\+x2[dD]|%2[dD])"
+_TOKEN = r"[A-Za-z0-9._~+/=\-]"
+_SECRET_RE = re.compile(
+    r"sk" + _DASH + r"ant" + _DASH + r"(?:[A-Za-z0-9_]|" + _DASH + r")+"
+    r"|sk" + _DASH + r"(?:[A-Za-z0-9_]|" + _DASH + r"){16,}"
+    r"|bearer\s+(?=" + _TOKEN + r"*\d|" + _TOKEN + r"{16})" + _TOKEN + r"+"
+    r"|api(?:_|" + _DASH + r")key[\"']?\s*[:=]\s*[\"']?[^\s\"',;}]+",
+    re.IGNORECASE,
+)
+
+
+def redact(text: str, limit: int = 300) -> str:
+    return _SECRET_RE.sub("[REDACTED]", str(text or ""))[:limit]
+
+
+MULTI_STATEMENT_MSG = "Error: Only one SQL statement per query is allowed (remove the extra ';' statement)."
+NON_SELECT_MSG = "Error: Only SELECT queries are allowed."
+
+
+def sql_guard_error(sql: str) -> Optional[str]:
+    if not is_select_start(sql):
+        return NON_SELECT_MSG
+    return None if is_single_select(sql) else MULTI_STATEMENT_MSG
+
+
+def is_select_start(sql: str) -> bool:
+    head = (sql or "").strip().upper()
+    return head.startswith("SELECT") or head.startswith("WITH")
+
+
+def is_single_select(sql: str) -> bool:
+    s = (sql or "").strip()
+    if not is_select_start(s):
+        return False
+    if s.endswith(";") and s[:-1].rstrip().endswith(";"):
+        return False
+    try:
+        statements = duckdb.extract_statements(s)
+    except duckdb.Error:
+        return False
+    return len(statements) == 1 and statements[0].type == duckdb.StatementType.SELECT
 
 # Failure patterns that trigger immediate self-healing
 _FAILURE_PATTERNS = [
@@ -249,7 +306,7 @@ def track_usage(user_id: str) -> tuple[int, int]:
     return count, -1  # No limit for now (free launch)
 
 
-def log_question(user_id: str, username: str, question: str, answer: str, duration_ms: int, model: str = "claude-sonnet-4-6"):
+def log_question(user_id: str, username: str, question: str, answer: str, duration_ms: int, model: str = "anthropic/claude-sonnet-4.6"):
     """Append question + answer to JSONL log for analysis."""
     entry = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
@@ -314,12 +371,12 @@ def run_duckdb_query(sql: str, max_retries: int = 8) -> str:
     return "Our database is momentarily busy — try your question again in a minute! The data refreshes constantly and things should clear up quickly. 🎢"
 
 
-async def ask_agent(question: str, user_id: str, api_key: str, username: str = "unknown") -> str:
+async def ask_agent(question: str, user_id: str, api_key: Optional[str] = None, username: str = "unknown") -> str:
     """
     Process a natural language question about theme park data.
-    Uses Claude with async DuckDB tool access.
+    Uses Claude via OpenRouter (default) with async DuckDB tool access, falling back to local Qwen.
 
-    All blocking work (Anthropic API, DuckDB queries, file I/O) is run
+    All blocking work (HTTP, DuckDB queries, file I/O) is run
     off the event loop so the Discord heartbeat is never starved.
     """
     await asyncio.to_thread(track_usage, user_id)
@@ -327,40 +384,27 @@ async def ask_agent(question: str, user_id: str, api_key: str, username: str = "
     import time as _time
     _start = _time.monotonic()
 
-    client = anthropic.AsyncAnthropic(api_key=api_key, timeout=60.0, max_retries=1)
-
     today = date.today()
     system_prompt = SCHEMA_CONTEXT.format(today=today.isoformat(), today_dow=today.strftime("%A"))
 
-    tools = [
-        {
-            "name": "run_query",
-            "description": "Execute a read-only SQL query against the TPCR DuckDB database. Use SELECT statements only. Returns results as formatted text.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "sql": {
-                        "type": "string",
-                        "description": "SQL SELECT query to execute"
-                    }
-                },
-                "required": ["sql"]
-            }
-        }
-    ]
+    model_used = OPENROUTER_MODEL
+    answer = None
+    provider = ask_provider()
+    if provider == "openrouter" and api_key:
+        try:
+            answer = await _openrouter_loop(api_key, system_prompt, question)
+        except Exception as e:
+            status = getattr(e, "status_code", None)
+            print(f"⚠️ /ask: OpenRouter failed ({type(e).__name__}{f', status {status}' if status else ''}: {redact(e, 160)}) — falling back to Qwen")
+    elif provider == "openrouter":
+        print("⚠️ /ask: TPCR_ASK_PROVIDER=openrouter but no api_key — using Qwen")
 
-    messages = [{"role": "user", "content": question}]
-
-    model_used = "claude-sonnet-4-6"
-    try:
-        answer = await _claude_loop(client, system_prompt, tools, messages)
-    except (anthropic.APIError, anthropic.APIConnectionError, anthropic.APITimeoutError, asyncio.TimeoutError) as e:
-        print(f"⚠️ /ask: Anthropic failed ({type(e).__name__}: {str(e)[:160]}) — falling back to Qwen")
+    if not answer:
         model_used = QWEN_LABEL
         try:
             answer = await asyncio.to_thread(_qwen_loop, system_prompt, question)
         except Exception as qe:
-            print(f"❌ /ask: Qwen fallback failed too: {qe}")
+            print(f"❌ /ask: Qwen fallback failed too: {redact(qe)}")
             answer = None
 
     if answer is not None:
@@ -421,50 +465,68 @@ def _qwen_loop(system_prompt: str, question: str) -> Optional[str]:
                 sql = json.loads(c["function"]["arguments"]).get("sql", "")
             except Exception:
                 sql = ""
-            su = sql.strip().upper()
-            result = run_duckdb_query(sql) if (su.startswith("SELECT") or su.startswith("WITH")) else "Error: Only SELECT queries are allowed."
+            result = sql_guard_error(sql) or run_duckdb_query(sql)
             msgs.append({"role": "tool", "tool_call_id": c.get("id", "x"), "content": result})
     return None
 
 
-async def _claude_loop(client, system_prompt, tools, messages) -> Optional[str]:
-    # Allow up to 5 tool-use rounds
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_MODEL = "anthropic/claude-sonnet-4.6"
+OPENROUTER_TIMEOUT = 60.0
+
+
+class OpenRouterHTTPError(Exception):
+    def __init__(self, status_code: int):
+        super().__init__(f"HTTP {status_code}")
+        self.status_code = status_code
+
+
+async def _post_openrouter(api_key: str, payload: dict) -> dict:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "X-Title": "TPCR /ask",
+    }
+    async with httpx.AsyncClient(timeout=OPENROUTER_TIMEOUT) as client:
+        resp = await client.post(OPENROUTER_URL, json=payload, headers=headers)
+    if resp.status_code >= 400:
+        raise OpenRouterHTTPError(resp.status_code)
+    return resp.json()
+
+
+async def _openrouter_loop(api_key: str, system_prompt: str, question: str) -> Optional[str]:
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": question},
+    ]
     for _ in range(5):
-        response = await client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1500,
-            system=system_prompt,
-            tools=tools,
-            messages=messages,
-        )
+        data = await _post_openrouter(api_key, {
+            "model": OPENROUTER_MODEL,
+            "max_tokens": 1500,
+            "messages": messages,
+            "tools": _QWEN_TOOLS,
+        })
+        message = data["choices"][0]["message"]
+        tool_calls = message.get("tool_calls") or []
+        if not tool_calls:
+            return (message.get("content") or "").strip() or None
 
-        # Check if we need to handle tool use
-        if response.stop_reason == "tool_use":
-            # Process all tool calls
-            tool_results = []
-            assistant_content = response.content
-
-            for block in response.content:
-                if block.type == "tool_use":
-                    sql = block.input.get("sql", "")
-
-                    # Safety: reject non-SELECT queries
-                    sql_upper = sql.strip().upper()
-                    if not sql_upper.startswith("SELECT") and not sql_upper.startswith("WITH"):
-                        result = "Error: Only SELECT queries are allowed."
-                    else:
-                        result = await asyncio.to_thread(run_duckdb_query, sql)
-
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result
-                    })
-
-            messages.append({"role": "assistant", "content": assistant_content})
-            messages.append({"role": "user", "content": tool_results})
-        else:
-            # Final text response
-            text_parts = [b.text for b in response.content if hasattr(b, "text")]
-            return "\n".join(text_parts)
+        messages.append({
+            "role": "assistant",
+            "content": message.get("content") or "",
+            "tool_calls": tool_calls,
+        })
+        for call in tool_calls:
+            fn = call.get("function", {})
+            try:
+                args = fn.get("arguments") or "{}"
+                args = json.loads(args) if isinstance(args, str) else args
+                sql = args.get("sql", "")
+            except (ValueError, AttributeError):
+                sql = ""
+            guard = sql_guard_error(sql)
+            if guard:
+                result = guard
+            else:
+                result = await asyncio.to_thread(run_duckdb_query, sql)
+            messages.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": result})
     return None

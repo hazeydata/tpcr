@@ -45,7 +45,7 @@ logger = logging.getLogger("tpcr-bot")
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)-8s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 from calendar_image import generate_calendar_image
 import os
-from ask_agent import ask_agent as ask_agent_anthropic
+from ask_agent import ask_agent as ask_agent_anthropic, ask_provider, redact
 from ask_agent_ollama import ask_agent_ollama
 
 def ask_agent(*args, **kwargs):
@@ -69,6 +69,7 @@ except ImportError as e:
 # Load token from ~/.env
 load_dotenv(os.path.expanduser("~/.env"))
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+ask_provider()
 
 # Bot setup
 intents = discord.Intents.default()
@@ -1686,15 +1687,7 @@ class AskFeedbackView(discord.ui.View):
             item.disabled = True
 
 
-ANTHROPIC_API_KEY = None
-_auth_profiles = os.path.expanduser("~/.clawdbot/agents/anthropic/agent/auth-profiles.json")
-try:
-    import json as _json
-    _data = _json.loads(open(_auth_profiles).read())
-    _profiles = _data.get("profiles", _data)  # handle nested or flat
-    ANTHROPIC_API_KEY = _profiles.get("anthropic:default", {}).get("key")
-except Exception as e:
-    print(f"⚠️ Could not load Anthropic API key: {e}")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 BOT_COMMANDS_CHANNEL = 1478240248361128079  # #bot-commands (recreated Mar 2)
 
@@ -1704,14 +1697,12 @@ BOT_COMMANDS_CHANNEL = 1478240248361128079  # #bot-commands (recreated Mar 2)
 async def ask_command(interaction: discord.Interaction, question: str):
     print(f"📥 /ask called: question='{question}' by {interaction.user}")
 
-    # No Anthropic key -> ask_agent gets an auth error and falls back to local Qwen.
-
     # Defer — this will take a few seconds
     if not await safe_defer(interaction):
         return
 
     try:
-        answer = await ask_agent(question, str(interaction.user.id), ANTHROPIC_API_KEY or "missing-key", username=str(interaction.user))
+        answer = await ask_agent(question, str(interaction.user.id), OPENROUTER_API_KEY, username=str(interaction.user))
 
         # Build embed
         embed = discord.Embed(
@@ -1725,9 +1716,9 @@ async def ask_command(interaction: discord.Interaction, question: str):
         await interaction.followup.send(embed=embed, view=view)
 
     except Exception as e:
-        print(f"❌ /ask error: {e}")
+        print(f"❌ /ask error: {redact(e)}")
         await interaction.followup.send(
-            f"❌ Sorry, I hit an error processing that question. Try rephrasing!\n`{str(e)[:100]}`",
+            f"❌ Sorry, I hit an error processing that question. Try rephrasing!\n`{redact(e, 100)}`",
             ephemeral=True
         )
 
