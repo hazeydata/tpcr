@@ -426,11 +426,28 @@ def sql_error_result(e: Exception) -> str:
     return f"Error: SQL error {type(e).__name__}: {redact(first)}"
 
 
+MULTI_STATEMENT_MSG = "Error: Only one SQL statement per query is allowed (remove the extra ';' statement)."
+NON_SELECT_MSG = "Error: Only SELECT queries are allowed."
+
+
+def sql_guard_error(sql: str) -> str | None:
+    """AC31: None if sql is a single SELECT/WITH statement, else the tool error to return."""
+    if not is_select_start(sql):
+        return NON_SELECT_MSG
+    return None if is_single_select(sql) else MULTI_STATEMENT_MSG
+
+
+def is_select_start(sql: str) -> bool:
+    head = (sql or "").strip().upper()
+    return head.startswith("SELECT") or head.startswith("WITH")
+
+
 def is_single_select(sql: str) -> bool:
-    """One SELECT/WITH statement; a trailing ';' is allowed, a second statement is not."""
-    s = (sql or "").strip().rstrip(";").strip()
-    head = s.upper()
-    if not (head.startswith("SELECT") or head.startswith("WITH")):
+    """One SELECT/WITH statement; one trailing ';' is allowed, a second statement is not."""
+    s = (sql or "").strip()
+    if s.endswith(";"):
+        s = s[:-1].rstrip()
+    if not is_select_start(s):
         return False
     # strip string literals and comments before looking for a statement separator
     bare = re.sub(r"'(?:[^']|'')*'", "''", s)
@@ -744,25 +761,6 @@ def claude_assistant_blocks(content) -> list[dict]:
     return out
 
 
-def anthropic_error_summary(e: Exception, api_key: str | None = None) -> str:
-    """'status=400 type=invalid_request_error msg=...' from an anthropic APIStatusError, redacted.
-
-    Distinguishes a bad payload from 'Your credit balance is too low' (both are 400
-    invalid_request_error; only the message differs). Empty for non-HTTP errors."""
-    status = getattr(e, "status_code", None)
-    if status is None:
-        return ""
-    body = getattr(e, "body", None)
-    err = body.get("error", body) if isinstance(body, dict) else {}
-    err = err if isinstance(err, dict) else {}
-    etype = redact(err.get("type", ""), 60)
-    msg = str(err.get("message", ""))
-    if api_key:
-        msg = msg.replace(api_key, "[REDACTED]")
-    msg = redact(msg, 200)
-    return f"status={status} type={etype or '?'} msg={msg!r}"
-
-
 async def _claude_loop(api_key: str, system_prompt: str, question: str) -> str | None:
     import anthropic
 
@@ -781,8 +779,9 @@ async def _claude_loop(api_key: str, system_prompt: str, question: str) -> str |
         for block in tool_uses:
             sql = (block.input or {}).get("sql", "")
             logger.info("ask claude round=%d sql=%s", round_num, sql)
-            if not is_single_select(sql):
-                result = "Error: Only SELECT queries are allowed."
+            guard = sql_guard_error(sql)
+            if guard:
+                result = guard
             else:
                 result = await asyncio.to_thread(run_duckdb_query, sql)
             results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
@@ -840,8 +839,9 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
                 logger.error("Claude /ask auth failed (%s, status %s); falling back to Qwen",
                              type(e).__name__, status)
             elif status is not None:
-                detail = anthropic_error_summary(e, api_key)  # redacted status/type/message
-                logger.warning("Claude /ask failed (%s, %s); falling back to Qwen", type(e).__name__, detail)
+                # AC27: class name + HTTP status only, never the provider message.
+                logger.warning("Claude /ask failed (%s, status %s); falling back to Qwen",
+                               type(e).__name__, status)
             else:
                 logger.warning("Claude /ask failed (%s); falling back to Qwen", type(e).__name__)
         else:
@@ -888,8 +888,9 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
                 logger.info("ask round=%d sql=%s", round_num, sql)
 
                 # Safety: reject non-SELECT queries
-                if not is_single_select(sql):
-                    result = "Error: Only SELECT queries are allowed."
+                guard = sql_guard_error(sql)
+                if guard:
+                    result = guard
                 else:
                     result = await asyncio.to_thread(run_duckdb_query, sql)
                     query_results.append(result)

@@ -2,6 +2,7 @@
 consistency, run_query retry cap, single-statement guard, final no-tools log line."""
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -98,11 +99,12 @@ def _status_error(code, body):
                                      body=body)
 
 
-@pytest.mark.parametrize("message,expect", [
-    ("Your credit balance is too low to access the Anthropic API.", "credit balance is too low"),
-    ("messages: text content blocks must be non-empty", "text content blocks must be non-empty"),
+@pytest.mark.parametrize("message", [
+    "Your credit balance is too low to access the Anthropic API.",
+    "messages: text content blocks must be non-empty",
 ])
-def test_400_logs_status_type_and_redacted_message(message, expect, monkeypatch, caplog):
+def test_ac27_400_logs_class_and_status_only(message, monkeypatch, caplog):
+    """AC27/AC24: class name + HTTP status only; no message text, no error type, no key."""
     monkeypatch.setenv("TPCR_ASK_PROVIDER", "anthropic")
     err = _status_error(400, {"type": "error", "error": {"type": "invalid_request_error",
                                                          "message": f"{message} key={SECRET}"}})
@@ -110,16 +112,11 @@ def test_400_logs_status_type_and_redacted_message(message, expect, monkeypatch,
          patch("ask_agent._chat", AsyncMock(return_value=chat_reply("qwen answer"))), \
          caplog.at_level(logging.DEBUG):
         assert asyncio.run(aa.ask_agent("q", "u", api_key=SECRET)) == "qwen answer"
-    line = [r.getMessage() for r in caplog.records if "Claude /ask failed" in r.getMessage()][0]
-    assert "BadRequestError" in line and "status=400" in line and "type=invalid_request_error" in line
-    assert expect in line
+    lines = [r.getMessage() for r in caplog.records if "Claude /ask failed" in r.getMessage()]
+    assert lines == ["Claude /ask failed (BadRequestError, status 400); falling back to Qwen"]
     assert "TESTSECRET123" not in caplog.text
-
-
-def test_error_summary_redacts_non_prefixed_key():
-    e = NS(status_code=400, body={"error": {"type": "invalid_request_error", "message": "bad KEYVALUE99"}})
-    assert "KEYVALUE99" not in aa.anthropic_error_summary(e, "KEYVALUE99")
-    assert aa.anthropic_error_summary(ValueError("x")) == ""
+    for fragment in (message, "credit", "content blocks", "invalid_request_error", "Error code"):
+        assert fragment not in caplog.text
 
 
 # ---------- (2) prompt vs schema ----------
@@ -241,7 +238,7 @@ def test_sql_error_result_redacts_key():
 # ---------- follow-ups ----------
 
 @pytest.mark.parametrize("sql,ok", [
-    ("SELECT 1", True), ("select 1;", True), ("WITH a AS (SELECT 1) SELECT * FROM a", True),
+    ("SELECT 1", True), ("select 1;", True), ("SELECT 1;;", False), ("SELECT 'a;b' AS x;", True), ("WITH a AS (SELECT 1) SELECT * FROM a", True),
     ("SELECT ';' AS x", True), ("SELECT 1 -- ; comment", True),
     ("SELECT 1; DROP TABLE x", False), ("SELECT 1;ATTACH 'x.db'", False), ("DROP TABLE x", False),
     ("", False), ("SELECT 1; SELECT 2", False),
@@ -268,4 +265,143 @@ def test_final_no_tools_failure_log_has_no_planted_key(monkeypatch, caplog):
     with patch("ask_agent._chat", chat), patch("ask_agent._trigger_self_heal"), caplog.at_level(logging.DEBUG):
         asyncio.run(aa.ask_agent("q", "u"))
     assert "final no-tools answer failed: RuntimeError" in caplog.text
+    assert "TESTSECRET123" not in caplog.text
+
+
+# ---------- AC28-AC32 (spec R2) ----------
+
+def _tool(sql, cid="c1"):
+    return chat_reply(tool_calls=[{"id": cid, "type": "function",
+                                   "function": {"name": "run_query", "arguments": json.dumps({"sql": sql})}}])
+
+
+def test_ac28_sql_error_message_goes_to_model_and_round_counts(tmp_path, monkeypatch, caplog):
+    db = tmp_path / "live.duckdb"
+    duckdb.connect(str(db)).execute("CREATE TABLE live_waits (entity_code VARCHAR)").close()
+    monkeypatch.setenv(aa.DUCKDB_PATH_ENV, str(db))
+    monkeypatch.setattr("time.sleep", lambda s: pytest.fail("AC28: SQL errors must not sleep/retry"))
+    seen = []
+
+    async def chat(messages, use_tools):
+        seen.append([dict(m) for m in messages])
+        return _tool("SELECT park_code FROM live_waits") if len(seen) == 1 else chat_reply("fixed answer")
+
+    with patch("ask_agent._chat", chat), caplog.at_level(logging.INFO):
+        assert asyncio.run(aa.ask_agent("q", "u")) == "fixed answer"
+    tool_msg = [m for m in seen[1] if m["role"] == "tool"][0]["content"]
+    assert tool_msg.startswith("Error: SQL error BinderException") and "park_code" in tool_msg
+    assert "after 2 rounds" in caplog.text
+
+
+@pytest.mark.parametrize("exc", ["CatalogException", "ParserException", "BinderException"])
+def test_ac28_each_sql_error_class_single_attempt(exc, monkeypatch):
+    n = []
+    cls = getattr(duckdb, exc)
+
+    def boom(path, read_only):
+        n.append(1)
+        raise cls("bad sql")
+
+    monkeypatch.setattr(aa.duckdb, "connect", boom)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    assert aa.run_duckdb_query("SELECT 1").startswith(f"Error: SQL error {exc}")
+    assert len(n) == 1
+
+
+def test_ac29_other_error_exactly_twice_then_error_to_model(monkeypatch):
+    n = []
+
+    def boom(path, read_only):
+        n.append(1)
+        raise RuntimeError("weird")
+
+    monkeypatch.setattr(aa.duckdb, "connect", boom)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    res = aa.run_duckdb_query("SELECT 1")
+    assert len(n) == 2 and aa.tool_result_status(res) == "error"
+
+
+def test_ac29_other_error_then_success(monkeypatch):
+    real = aa.duckdb.connect
+    n = []
+
+    def flaky(path, read_only):
+        n.append(1)
+        if len(n) == 1:
+            raise RuntimeError("weird")
+        return real(":memory:")
+
+    monkeypatch.setattr(aa.duckdb, "connect", flaky)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    assert aa.run_duckdb_query("SELECT 42 AS x").endswith("42") and len(n) == 2
+
+
+@pytest.mark.parametrize("msg", ["Could not set lock on file", "IO Error: database is locked", "Conflicting lock"])
+def test_ac30_lock_error_stops_at_8_then_error_to_model(msg, monkeypatch):
+    n = []
+
+    def boom(path, read_only):
+        n.append(1)
+        raise duckdb.IOException(msg)
+
+    monkeypatch.setattr(aa.duckdb, "connect", boom)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    res = aa.run_duckdb_query("SELECT 1")
+    assert len(n) == 8 and aa.tool_result_status(res) == "error"
+
+
+@pytest.mark.parametrize("sql,expect", [
+    ("SELECT 1; DROP TABLE wti", aa.MULTI_STATEMENT_MSG),
+    ("SELECT 1; SELECT 2", aa.MULTI_STATEMENT_MSG),
+    ("DROP TABLE wti", aa.NON_SELECT_MSG),
+    ("SELECT 'a;b' FROM wti;", None),
+    ("SELECT 1;", None),
+])
+def test_ac31_guard_rejects_before_execution_with_clear_error(sql, expect, monkeypatch):
+    ran = []
+    monkeypatch.setattr(aa, "run_duckdb_query", lambda q: ran.append(q) or "x\n-\n1")
+    seen = []
+
+    async def chat(messages, use_tools):
+        seen.append([dict(m) for m in messages])
+        return _tool(sql) if len(seen) == 1 else chat_reply("done")
+
+    with patch("ask_agent._chat", chat):
+        asyncio.run(aa.ask_agent("q", "u"))
+    tool_msg = [m for m in seen[1] if m["role"] == "tool"][0]["content"]
+    if expect:
+        assert tool_msg == expect and ran == []
+    else:
+        assert ran == [sql]
+
+
+@pytest.mark.parametrize("kind", ["lock", "other", "sql"])
+def test_ac32_retry_paths_never_log_key_or_rows(kind, tmp_path, monkeypatch, caplog):
+    db = tmp_path / "live.duckdb"
+    con = duckdb.connect(str(db))
+    con.execute("CREATE TABLE t (v VARCHAR)")
+    con.execute("INSERT INTO t VALUES ('ROWVALUE777')")
+    con.close()
+    monkeypatch.setenv(aa.DUCKDB_PATH_ENV, str(db))
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    real = aa.duckdb.connect
+    calls = []
+
+    def connect(path, read_only):
+        calls.append(1)
+        if kind == "lock" and len(calls) < 3:
+            raise duckdb.IOException(f"Could not set lock {SECRET} ROWVALUE777")
+        if kind == "other" and len(calls) < 2:
+            raise RuntimeError(f"weird {SECRET} ROWVALUE777")
+        return real(path, read_only=read_only)
+
+    monkeypatch.setattr(aa.duckdb, "connect", connect)
+    sql = "SELECT v FROM t" if kind != "sql" else f"SELECT nope_{'x'} FROM t WHERE v = 'ROWVALUE777'"
+    with caplog.at_level(logging.DEBUG):
+        res = aa.run_duckdb_query(sql)
+        if kind == "sql":
+            aa.run_duckdb_query(f"SELECT \"{SECRET}\" FROM t")
+    if kind != "sql":
+        assert "ROWVALUE777" in res  # rows reach the model ...
+    assert "ROWVALUE777" not in caplog.text  # ... but never the log
     assert "TESTSECRET123" not in caplog.text
