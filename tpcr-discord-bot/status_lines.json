@@ -1,35 +1,35 @@
 {
-  "_comment": "Rotating /ask status lines. DRAFT, pending Lindsay's edit. 'generic' is used for every question; 'parks' lines (keyed by the park codes in bot.py PARK_NAMES) are mixed in when the question names that park or one of its aliases. Keep lines short. Bad or missing file => built-in generic lines.",
+  "_comment": "Rotating /ask status lines. Copy pass by Lindsay, Oct 23 2026. 'generic' is used for every question; 'parks' lines (keyed by the park codes in bot.py PARK_NAMES) are mixed in when the question names that park or one of its aliases. Keep lines short. Bad or missing file => built-in generic lines.",
   "generic": [
     "Crunching the numbers…",
-    "Digging deep into the wait time files…",
+    "Digging through the wait time files…",
     "Tipping the data into the giant hopper…",
-    "Adding a pinch of salt…",
-    "Checking the crowd calendar…",
-    "Counting heads in the queue…",
     "Asking the bots. They're arguing…",
-    "Rounding nothing. Honest numbers take a second…",
+    "Counting heads in the queue…",
     "Squinting at last year's crowds…",
-    "Almost there. Not bad so far…"
+    "Checking the clock on every ride…",
+    "Doing math so you don't have to…",
+    "Good question. Thinking…",
+    "Almost there…"
   ],
   "parks": {
     "MK": [
       "Waiting for the castle photo spot to clear…",
-      "Checking how long the Seven Dwarfs line is today…",
+      "Timing the Seven Dwarfs line…",
       "Dodging a parade on Main Street…",
-      "Riding the train around for a better view…"
+      "Riding the train for a better view…"
     ],
     "EP": [
-      "I need another minute, I'm just finishing Soarin'…",
-      "Walking around World Showcase. It's a big lake…",
+      "One sec, just finishing Soarin'…",
+      "Walking World Showcase. It's a big lake…",
       "Grabbing a snack in Norway…",
-      "Waiting on Guardians. Virtual queue, naturally…"
+      "Spinning through Cosmic Rewind…"
     ],
     "HS": [
       "Boarding a Star Destroyer on Rise…",
-      "Dropping in on Tower of Terror. Back in a flash…",
+      "Dropping in on Tower of Terror…",
       "Waiting out the Slinky Dog line…",
-      "Checking the Toy Story Land numbers…"
+      "Counting heads in Toy Story Land…"
     ],
     "AK": [
       "Flying with the banshees on Pandora…",
@@ -41,49 +41,49 @@
       "Strolling down Main Street, U.S.A.…",
       "Checking the Space Mountain line…",
       "Sharing a churro with the data…",
-      "Waiting for the fireworks to clear out…"
+      "Waiting for the fireworks crowd to clear…"
     ],
     "CA": [
       "Swinging by Pixar Pier…",
       "Racing through Radiator Springs…",
-      "Swinging on the Incredicoaster…",
+      "Looping the Incredicoaster…",
       "Counting heads at Avengers Campus…"
     ],
     "UF": [
       "Escaping Gringotts with the numbers…",
-      "Waiting in line for a Butterbeer…",
+      "In line for a Butterbeer…",
       "Riding with the Minions. Loudly…",
       "Checking the Diagon Alley crowds…"
     ],
     "IA": [
       "Riding VelociCoaster. Hang on…",
       "Hagrid's line is long. Nothing new…",
-      "Drying off after Popeye's…",
+      "Drying off after the Popeye rafts…",
       "Walking the island loop…"
     ],
     "EU": [
-      "Taking a portal to Epic Universe…",
-      "Training with the dragons on Berk…",
+      "Stepping through a portal to Epic…",
+      "Training dragons on the Isle of Berk…",
       "Racing karts in Super Nintendo World…",
-      "Sorting out the Ministry of Magic queue…"
+      "Clearing security at the Ministry…"
     ],
     "UH": [
       "Riding the Studio Tour tram…",
-      "Taking the escalator down to the Lower Lot…",
+      "Escalator down to the Lower Lot…",
       "Checking Mario Kart in Hollywood…",
-      "Waiting on the Jurassic World splash…"
+      "Drying off after Jurassic World…"
     ],
     "TDL": [
       "Hopping a flight to Tokyo Disneyland…",
-      "Waiting for Beauty and the Beast to finish…",
+      "Waiting for Beauty and the Beast…",
       "Sampling popcorn flavours…",
       "Lining up for Pooh's Hunny Hunt…"
     ],
     "TDS": [
       "Sailing across Mediterranean Harbor…",
       "Checking the Fantasy Springs queue…",
-      "Journeying to the Center of the Earth…",
-      "Sampling gyoza buns at DisneySea…"
+      "Off to the Center of the Earth…",
+      "Grabbing a gyoza dog…"
     ]
   }
 }
