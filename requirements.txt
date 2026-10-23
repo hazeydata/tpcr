@@ -35,3 +35,4 @@ psutil>=5.9.0
 
 # Async HTTP client for local Qwen server (/ask)
 httpx>=0.27.0
+anthropic>=0.40.0
