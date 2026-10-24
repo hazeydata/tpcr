@@ -39,14 +39,14 @@ except ImportError:
 from pipeline.config import PipelineConfig
 from pipeline.core.eligibility import (
     SkipLog,
-    check_extinct_on_sanity,
     is_operating_in_window,
     load_dimentity_extinct,
     load_operating_calendar_indexed,
+    warn_pre2005_extinct_on,
 )
 from pipeline.core.logging import PipelineLogger
 from pipeline.core.park_codes import entity_to_park
-from pipeline.core.validation import StageFailed, ValidationError
+from pipeline.core.validation import ValidationError
 
 
 # V4 baseline features — the ONLY features used for production models
@@ -88,9 +88,9 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
     run_date = date.today()
     window_end = run_date + timedelta(days=cfg.forecast_days)
     extinct_map = load_dimentity_extinct(cfg.dimension_dir / "dimentity.csv")
-    check_extinct_on_sanity(extinct_map)
     oc_by_entity = load_operating_calendar_indexed(cfg, log)
     skips = SkipLog("s07", cfg, log, run_date=run_date)
+    skips.note_pre2005_extinct_on(len(warn_pre2005_extinct_on(extinct_map, log)))
 
     # Scan entity counts AFTER the per-park min_training_year cutoff
     with log.timed("scan entity counts"):
@@ -127,6 +127,8 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
     # Train one baseline model per entity
     successful = 0
     failed = 0
+    failed_entities: list[str] = []
+    failed_errors: dict[str, str] = {}
     total_mae = 0.0
 
     for park_code in sorted(park_entity_map.keys()):
@@ -168,6 +170,8 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
                     log.warning(f"  {entity_code}: {e}")
                     skips.record("s07", entity_code, f"error:{type(e).__name__}")
                     failed += 1
+                    failed_entities.append(entity_code)
+                    failed_errors[entity_code] = type(e).__name__
 
             del park_df
 
@@ -190,12 +194,19 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
             f"S7 post-eligibility skips ({post_skips}) != eligible ({len(eligible)}) - trained ({successful})"
         )
     if failed > 0:
-        raise StageFailed(f"S7: {failed} entities failed training with errors (see skips_s07 log)")
+        # Fred's decision: warn loudly, let S8 continue on existing models.
+        log.error(
+            f"S7 TRAINING ERRORS: {failed} entities failed (error:<class>); "
+            "S8 will use existing models for them"
+        )
+        for code in failed_entities:
+            log.error(f"  S7 failed: {code} error:{failed_errors[code]}")
 
     return {
         "rows": successful,
         "successful": successful,
         "failed": failed,
+        "failed_entities": failed_entities,
         "eligible": len(eligible),
         "skipped": skipped,
         "avg_mae": round(avg_mae, 2),

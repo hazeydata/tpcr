@@ -13,9 +13,9 @@ import pytest
 from pipeline.config import PipelineConfig
 from pipeline.core.eligibility import (
     SkipLog,
-    check_extinct_on_sanity,
     is_operating_in_window,
     load_dimentity_extinct,
+    warn_pre2005_extinct_on,
 )
 from pipeline.core.logging import PipelineLogger
 from pipeline.core.validation import StageFailed, ValidationError
@@ -125,7 +125,7 @@ def test_s7_eligibility_and_skip_log(tmp_path):
     assert ["s07", "MK02", "extinct"] in rows
 
 
-def test_s7_injected_error_fails_stage(tmp_path, monkeypatch):
+def test_s7_injected_error_warns_and_continues(tmp_path, monkeypatch):
     cfg = _s7_fixture(tmp_path)
     real = s07_training._train_baseline_model
 
@@ -136,20 +136,21 @@ def test_s7_injected_error_fails_stage(tmp_path, monkeypatch):
 
     monkeypatch.setattr(s07_training, "_train_baseline_model", boom)
     log = PipelineLogger("t7e")
-    with pytest.raises(StageFailed):
-        s07_training.run(cfg, log)
+    res = s07_training.run(cfg, log)  # must not raise
+    assert res["failed"] == 1
+    assert "MK01" in res["failed_entities"]
     msgs = [e["message"] for e in log.events]
     assert "SKIP stage=s07 entity=MK01 reason=error:RuntimeError" in msgs
-    # logging and skip CSV were finished before the raise
+    assert any(
+        e["level"] == "error" and "S7 TRAINING ERRORS: 1 entities failed" in e["message"]
+        for e in log.events
+    )
+    assert any(
+        e["level"] == "error" and "MK01" in e["message"] and "RuntimeError" in e["message"]
+        for e in log.events
+    )
     assert "SKIP_COUNT stage=s07 reason=error:RuntimeError count=1" in msgs
     assert (cfg.logs_dir / f"skips_s07_{TODAY.isoformat()}.csv").exists()
-
-
-def test_s7_fails_on_pre_2005_extinct_on(tmp_path):
-    cfg = _s7_fixture(tmp_path)
-    _write_dim(cfg, {"MK01": "2000-01-01"})
-    with pytest.raises(ValidationError, match="MK01=2000-01-01"):
-        s07_training.run(cfg, PipelineLogger("t7s"))
 
 
 # --- S8 ---------------------------------------------------------------------
@@ -293,13 +294,64 @@ def test_s8_error_counts_failed_and_raises(tmp_path, monkeypatch):
     assert (cfg.forecast_dir / "all_forecasts.parquet").exists()
 
 
-# --- eligibility helpers / AC5 ----------------------------------------------
+# --- eligibility helpers / pre-2005 extinct_on ------------------------------
 
-def test_overrides_null_hs29_and_sanity_check(tmp_path):
+PRE2005 = {
+    "CA11": "2000-01-01", "CA18": "2000-01-01", "DL83": "2000-01-01", "DL84": "2000-01-01",
+    "UH12": "2000-01-01", "EP58": "2000-01-01", "EP78": "2000-01-01", "HS09": "2000-01-01",
+    "HS29": "2000-01-01",
+    "CA32": "2003-06-15", "DL82": "2004-08-09", "MK81": "2004-10-01",
+}
+
+
+def test_warn_pre2005_extinct_on_never_raises(tmp_path):
     dim = tmp_path / "dimentity.csv"
-    dim.write_text("code,extinct_on\nHS29,2000-01-01\nMK01,2019-05-01\nMK02,\n")
-    m = load_dimentity_extinct(dim)  # repo overrides file
-    assert m["HS29"] is None
+    dim.write_text("code,extinct_on\nHS29,2000-01-01\nCA32,2003-06-15\nMK01,2019-05-01\nMK02,\n")
+    m = load_dimentity_extinct(dim)
+    assert m["HS29"] == date(2000, 1, 1)
     assert m["MK01"] == date(2019, 5, 1)
     assert m["MK02"] is None
-    check_extinct_on_sanity(m)
+    log = PipelineLogger("tw")
+    found = warn_pre2005_extinct_on(m, log)
+    assert found == [("CA32", date(2003, 6, 15)), ("HS29", date(2000, 1, 1))]
+    msgs = [e["message"] for e in log.events if e["level"] == "warning"]
+    assert "PRE2005_EXTINCT_ON entity=HS29 extinct_on=2000-01-01 treated_as=extinct sentinel=true" in msgs
+    assert "PRE2005_EXTINCT_ON entity=CA32 extinct_on=2003-06-15 treated_as=extinct" in msgs
+
+
+def test_s7_pre2005_extinct_on_production_rows(tmp_path):
+    cfg = _cfg(tmp_path)
+    normal = ["MK01", "MK03", "MK04"]
+    _write_dim(cfg, {**PRE2005, **{c: "" for c in normal}, "MK05": "2019-01-01"})
+    actuals = cfg.output_base / "matched_pairs" / "actuals_training_v2"
+    actuals.mkdir(parents=True)
+    by_park: dict[str, list[pd.DataFrame]] = {}
+    for code in [*PRE2005, *normal, "MK05"]:
+        by_park.setdefault(code[:2], []).append(_actuals(code, date(2020, 1, 1), 300))
+    for park, frames in by_park.items():
+        pd.concat(frames).to_parquet(actuals / f"{park}.parquet", index=False)
+
+    log = PipelineLogger("t7p")
+    res = s07_training.run(cfg, log)  # must not raise (incl. StageFailed)
+
+    lines = _skip_lines(log)
+    for code in PRE2005:
+        assert f"SKIP stage=s07 entity={code} reason=extinct" in lines
+    assert res["skipped"]["extinct"] == len(PRE2005) + 1  # + MK05 (2019)
+    assert res["failed"] == 0
+    assert res["eligible"] == len(normal) == res["successful"]
+    for code in normal:
+        assert (cfg.models_dir / code / "model_baseline.json").exists()
+
+    warns = [e["message"] for e in log.events
+             if e["level"] == "warning" and e["message"].startswith("PRE2005_EXTINCT_ON")]
+    assert len(warns) == 12
+    assert sum("sentinel=true" in w for w in warns) == 9
+    msgs = [e["message"] for e in log.events]
+    assert "SKIP_NOTE stage=s07 pre2005_extinct_on count=12" in msgs
+    assert any(e["level"] == "metric" and e["message"] == "s07_pre2005_extinct_on" and e["value"] == 12
+               for e in log.events)
+    with open(cfg.logs_dir / f"skips_s07_{TODAY.isoformat()}.csv") as f:
+        rows = list(csv.reader(f))
+    assert rows[0] == ["stage", "entity_code", "reason"]
+    assert all(r[2] == "extinct" for r in rows[1:] if r[1] in PRE2005)

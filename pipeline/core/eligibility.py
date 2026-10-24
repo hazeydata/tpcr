@@ -1,7 +1,7 @@
 """Entity eligibility and skip logging shared by S7 (training) and S8 (forecast).
 
-- dimentity extinct_on loading, with repo-file overrides (config/dimentity_overrides.csv)
-- sanity check: no extinct_on earlier than 2005-01-01
+- dimentity extinct_on loading
+- warning (never an error) for extinct_on earlier than 2005-01-01; those entities are treated as extinct
 - operating-calendar index + window check
 - SkipLog: every skipped entity gets a reason, plus per-reason counts at stage end
 """
@@ -17,16 +17,14 @@ import pandas as pd
 from pipeline.core.logging import PipelineLogger
 from pipeline.core.validation import ValidationError
 
-OVERRIDES_PATH = Path(__file__).resolve().parents[2] / "config" / "dimentity_overrides.csv"
 MIN_VALID_EXTINCT_ON = date(2005, 1, 1)
+EXTINCT_SENTINEL = date(2000, 1, 1)
 
 SKIP_REASONS = {"extinct", "not_operating", "no_training_data", "below_min_obs"}
 
 
-def load_dimentity_extinct(
-    dim_csv_path: Path, overrides_path: Path | None = None
-) -> dict[str, date | None]:
-    """Return entity_code -> extinct_on (date or None), with overrides applied."""
+def load_dimentity_extinct(dim_csv_path: Path) -> dict[str, date | None]:
+    """Return entity_code -> extinct_on (date or None)."""
     df = pd.read_csv(dim_csv_path, dtype=str)
     code_col = "code" if "code" in df.columns else "entity_code"
     if code_col not in df.columns:
@@ -39,26 +37,22 @@ def load_dimentity_extinct(
         str(code): (None if pd.isna(d) else d.date()) for code, d in zip(df[code_col], dates)
     }
 
-    overrides_path = OVERRIDES_PATH if overrides_path is None else overrides_path
-    if overrides_path.exists():
-        ov = pd.read_csv(overrides_path, dtype=str, keep_default_na=False)
-        for _, row in ov.iterrows():
-            if row["field"] != "extinct_on":
-                continue
-            value = row["value"].strip()
-            mapping[row["entity_code"]] = date.fromisoformat(value) if value else None
     return mapping
 
 
-def check_extinct_on_sanity(mapping: dict[str, date | None]) -> None:
-    """Raise ValidationError listing any extinct_on earlier than 2005-01-01."""
-    bad = sorted((c, d) for c, d in mapping.items() if d is not None and d < MIN_VALID_EXTINCT_ON)
-    if bad:
-        listing = ", ".join(f"{c}={d.isoformat()}" for c, d in bad)
-        raise ValidationError(
-            f"extinct_on earlier than {MIN_VALID_EXTINCT_ON}: {listing} "
-            "(fix dimentity or add a row to config/dimentity_overrides.csv)"
+def warn_pre2005_extinct_on(mapping: dict[str, date | None], log) -> list[tuple[str, date]]:
+    """Warn once per entity whose extinct_on is before 2005-01-01. Never raises.
+
+    Such entities are treated as extinct (extinct_on <= run date). The 2000-01-01
+    value is a sentinel that also means extinct. Returns the (code, date) list.
+    """
+    found = sorted((c, d) for c, d in mapping.items() if d is not None and d < MIN_VALID_EXTINCT_ON)
+    for code, d in found:
+        sentinel = " sentinel=true" if d == EXTINCT_SENTINEL else ""
+        log.warning(
+            f"PRE2005_EXTINCT_ON entity={code} extinct_on={d.isoformat()} treated_as=extinct{sentinel}"
         )
+    return found
 
 
 def load_operating_calendar_indexed(cfg, log: PipelineLogger) -> dict | None:
@@ -108,6 +102,7 @@ class SkipLog:
         self.run_date = run_date or date.today()
         self.rows: list[tuple[str, str, str]] = []
         self.counts: dict[str, int] = {}
+        self.pre2005_extinct_on: int | None = None
 
     @staticmethod
     def _valid(reason: str) -> bool:
@@ -120,6 +115,10 @@ class SkipLog:
         self.counts[reason] = self.counts.get(reason, 0) + 1
         self.log.info(f"SKIP stage={stage} entity={entity_code} reason={reason}")
 
+    def note_pre2005_extinct_on(self, count: int) -> None:
+        """Record the pre-2005 extinct_on count; summary() logs it (the CSV is unchanged)."""
+        self.pre2005_extinct_on = count
+
     def total(self) -> int:
         return len(self.rows)
 
@@ -128,6 +127,10 @@ class SkipLog:
         for reason, n in sorted(self.counts.items()):
             self.log.info(f"SKIP_COUNT stage={self.stage} reason={reason} count={n}")
             self.log.metric(f"{self.stage}_skip_{reason}", n)
+        if self.pre2005_extinct_on is not None:
+            n = self.pre2005_extinct_on
+            self.log.info(f"SKIP_NOTE stage={self.stage} pre2005_extinct_on count={n}")
+            self.log.metric(f"{self.stage}_pre2005_extinct_on", n)
         logs_dir = Path(self.cfg.logs_dir)
         logs_dir.mkdir(parents=True, exist_ok=True)
         path = logs_dir / f"skips_{self.stage}_{self.run_date.isoformat()}.csv"

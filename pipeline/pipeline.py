@@ -210,6 +210,10 @@ def main() -> int:
                 rows_out = 0
                 extra = {}
             metrics.end_step(step_name, rows_out=rows_out, **extra)
+            if isinstance(result, dict):
+                step_failed = int(result.get("failed", 0) or 0)
+                if step_failed > 0:
+                    log.warning(f"Step {step_name} completed with {step_failed} failed entities")
 
             # Update legacy pipeline_status.json
             if _HAS_PIPELINE_STATUS and not cfg.shadow:
