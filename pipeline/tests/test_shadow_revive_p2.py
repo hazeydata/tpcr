@@ -5,7 +5,9 @@ No xgboost, no network, tmp dirs, small synthetic frames. Tests that need duckdb
 or pyarrow skip when it is missing. Runs under pytest or unittest.
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import re
 import tempfile
@@ -655,26 +657,92 @@ class RetrainGatingTest(unittest.TestCase):
         stamp = "2026-10-24T10:00:00+00:00"
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
-            # production trained an extinct entity (MK99) the shadow's eligible list excludes;
+            # production trained an extinct entity (MK99) the challenger does not train (R1a);
             # an older model dir (MK77) is not part of this run
             self.make_prod_models(base, ["MK01", "MK02", "MK99"], stamp)
             self.make_prod_models(base, ["MK77"], "2026-10-01T10:00:00+00:00")
             ch = {"name": "chal-a"}
-            ok = {"trained_at": stamp, "entity_count": 3, "eligible_count": 2,
-                  "trained_entities": ["MK01", "MK02", "MK99"], "skipped": {}}
-            self.assertIsNone(self.mod.record_training(ch, ok, run_date, base))
-            self.assertEqual((ch["trained_at"], ch["entity_count"]), (stamp, 3))
+            ok = {"trained_at": stamp, "entity_count": 2, "eligible_count": 2,
+                  "trained_entities": ["MK01", "MK02"], "skipped": {}}
+            extinct = {"MK99": date(2020, 1, 1)}
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertIsNone(self.mod.record_training(ch, ok, run_date, base, extinct_on=extinct))
+            self.assertEqual((ch["trained_at"], ch["entity_count"]), (stamp, 2))
+            self.assertIn("production trained 3, extinct excluded 1", out.getvalue())
+            self.assertIn("denominator 2", out.getvalue())
 
-            # matches the shadow's own eligible list but not production: error with diff
-            bad = dict(ok, entity_count=2, trained_entities=["MK01", "MK02"],
-                       skipped={"MK03": "not_trained"})
-            err = self.mod.record_training(ch, bad, run_date, base)
-            self.assertEqual(ch["entity_count"], 2)
-            self.assertIn("missing ['MK99']", err)
+            # a non-extinct entity production trained but the challenger lacks still fails
+            self.make_prod_models(base, ["MK03"], stamp)
+            bad = dict(ok, skipped={"MK03": "not_trained"})
+            err = self.mod.record_training(ch, bad, run_date, base, extinct_on=extinct)
+            self.assertIn("missing ['MK03']", err)
             self.assertIn("MK03=not_trained", err)
+            self.assertIn("extinct excluded 1", err)
 
-            extra = dict(ok, trained_entities=["MK01", "MK02", "MK99", "MK05"])
-            self.assertIn("extra ['MK05']", self.mod.record_training(ch, extra, run_date, base))
+    def test_record_training_extinct_trained_by_challenger_is_extra(self):
+        stamp = "2026-10-24T10:00:00+00:00"
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            self.make_prod_models(base, ["MK01", "MK99"], stamp)
+            res = {"trained_at": stamp, "entity_count": 2, "trained_entities": ["MK01", "MK99"],
+                   "skipped": {}}
+            err = self.mod.record_training({"name": "chal-a"}, res, TODAY, base,
+                                           extinct_on={"MK99": date(2020, 1, 1)})
+            self.assertIn("extra ['MK99']", err)
+
+    def shared_predicate_views(self, base, extinct_on):
+        """(MK99 in eligible list, MK99 required by AC5) for the same extinct data."""
+        from pipeline.competition import eligibility as el
+
+        rep = el.eligibility_report(base, TODAY, entity_counts={"MK01": 500, "MK99": 500},
+                                    extinct_on=extinct_on, min_obs=100, ignore_parks=[])
+        res = {"trained_at": "2026-10-24T10:00:00+00:00", "entity_count": 1,
+               "trained_entities": ["MK01"], "skipped": {}}
+        with contextlib.redirect_stdout(io.StringIO()):
+            err = self.mod.record_training({"name": "chal-a"}, res, TODAY, base, extinct_on=extinct_on)
+        return "MK99" in rep["eligible"], err is not None and "missing ['MK99']" in err
+
+    def test_eligible_list_and_ac5_share_extinct_predicate(self):
+        from unittest import mock
+        from pipeline.competition import eligibility as el
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            self.make_prod_models(base, ["MK01", "MK99"], "2026-10-24T10:00:00+00:00")
+            # extinct before the run date: out of the eligible list and out of the denominator
+            self.assertEqual(self.shared_predicate_views(base, {"MK99": date(2020, 1, 1)}),
+                             (False, False))
+            # extinct only after the run date, or no date: in the eligible list and required
+            self.assertEqual(self.shared_predicate_views(base, {"MK99": TODAY + timedelta(days=1)}),
+                             (True, True))
+            self.assertEqual(self.shared_predicate_views(base, {}), (True, True))
+            # patching the predicate moves both call sites together
+            with mock.patch.object(el, "is_extinct", lambda e, d, r: e == "MK01"):
+                self.assertEqual(self.shared_predicate_views(base, {"MK99": date(2020, 1, 1)}),
+                                 (True, True))
+
+    def test_extinct_dates_from_real_dimentity_csv(self):
+        import types
+        from unittest import mock
+        from pipeline.competition import eligibility as el
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dim = base / "dimension_tables"
+            dim.mkdir()
+            (dim / "dimentity.csv").write_text("code,name,extinct_on\nMK01,A,\nMK99,B,2020-05-01\n")
+            self.make_prod_models(base, ["MK01", "MK99"], "2026-10-24T10:00:00+00:00")
+            cfg = types.SimpleNamespace(dimension_dir=dim)
+            with mock.patch.object(el, "_core", return_value=None):
+                self.assertEqual(el.load_extinct_dates(cfg), {"MK99": date(2020, 5, 1)})
+                self.assertEqual(el.extinct_entities(["MK01", "MK99"], TODAY, cfg=cfg), {"MK99"})
+                res = {"trained_at": "2026-10-24T10:00:00+00:00", "entity_count": 1,
+                       "trained_entities": ["MK01"], "skipped": {}}
+                with mock.patch("pipeline.config.PipelineConfig",
+                                lambda output_base: types.SimpleNamespace(dimension_dir=dim)), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    self.assertIsNone(self.mod.record_training({"name": "chal-a"}, res, TODAY, base))
 
     def test_record_training_errors_when_production_set_missing(self):
         with tempfile.TemporaryDirectory() as tmp:
