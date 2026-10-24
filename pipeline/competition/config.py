@@ -8,13 +8,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+DEFAULT_OUTPUT_BASE = Path.home() / "hazeydata" / "pipeline"
+DEFAULT_COMPETITION_BASE = Path.home() / "hazeydata" / "pipeline" / "competition"
+
 
 @dataclass
 class CompetitionConfig:
     """Competition framework configuration."""
     
     # Base paths
-    output_base: Path  # Same as baseline (e.g., /home/wilma/hazeydata/pipeline)
+    output_base: Path  # Same as baseline (default: ~/hazeydata/pipeline)
     competition_base: Path = None  # Derived: {output_base}/competition
     
     # Competition-specific output directories  
@@ -75,8 +78,10 @@ class CompetitionConfig:
         return self.baseline_output_base / "state"
 
 
-def load_competition_config(output_base: Path | str) -> CompetitionConfig:
-    """Create competition config with the given output base."""
+def load_competition_config(output_base: Path | str | None = None) -> CompetitionConfig:
+    """Create competition config with the given output base (default ~/hazeydata/pipeline)."""
+    if output_base is None:
+        output_base = DEFAULT_OUTPUT_BASE
     if isinstance(output_base, str):
         output_base = Path(output_base)
     return CompetitionConfig(output_base=output_base)
