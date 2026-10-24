@@ -30,6 +30,7 @@ from pipeline.core.park_codes import entity_to_park
 from pipeline.core.validation import ValidationError
 from pipeline.competition.config import load_competition_config
 from pipeline.competition.registry import load_registry
+from pipeline.competition.eligibility import eligibility_report
 
 
 # Import baseline features from s07_training
@@ -200,9 +201,16 @@ def train_challenger_model(
     return {"mae": mae, "n_samples": split, "best_trees": best_trees}
 
 
-def run_challenger_training(challenger_name: str, output_base: Path) -> dict:
-    """Train all models for a specific challenger."""
-    
+def run_challenger_training(challenger_name: str, output_base: Path,
+                            run_date: date | None = None) -> dict:
+    """Train a challenger on every entity production S7 would train for run_date.
+
+    No subsetting: the entity set is production_eligible_entities (after the
+    extinct exclusion). The result records trained_at (UTC ISO), entity_count
+    (models actually trained), eligible_count and skipped {entity: reason}.
+    """
+    run_date = run_date or date.today()
+
     if xgb is None:
         raise ValidationError("XGBoost is required. pip install xgboost")
     
@@ -247,8 +255,12 @@ def run_challenger_training(challenger_name: str, output_base: Path) -> dict:
     entity_counts = _scan_entity_counts(park_files if use_park_chunks else [actuals_single])
 
     min_obs = getattr(baseline_cfg, "training_min_obs_lite", 100)
-    eligible = [e for e, c in entity_counts.items() if c >= min_obs]
-    log.info(f"Eligible entities: {len(eligible)} (min_obs={min_obs})")
+    report = eligibility_report(output_base, run_date, cfg=baseline_cfg, entity_counts=entity_counts)
+    eligible = report["eligible"]
+    skipped: dict[str, str] = {}
+    extinct = sorted(e for e, r in report["excluded"].items() if r == "extinct")
+    log.info(f"Eligible entities: {len(eligible)} (min_obs={min_obs}, run_date={run_date}, "
+             f"extinct excluded={len(extinct)})")
 
     # Group by park
     park_entity_map: dict[str, list[str]] = {}
@@ -269,6 +281,8 @@ def run_challenger_training(challenger_name: str, output_base: Path) -> dict:
                 park_file = actuals_dir / f"{park_code}.parquet"
                 if not park_file.exists():
                     log.warning(f"  No training data for park {park_code}")
+                    for e in park_entities:
+                        skipped[e] = "no_park_data"
                     continue
                 park_df = pd.read_parquet(park_file)
             else:
@@ -294,9 +308,11 @@ def run_challenger_training(challenger_name: str, output_base: Path) -> dict:
                         total_mae += result["mae"]
                     else:
                         failed += 1
+                        skipped[entity_code] = "not_trained"
                 except Exception as e:
                     log.warning(f"  {entity_code}: {e}")
                     failed += 1
+                    skipped[entity_code] = f"error:{type(e).__name__}"
 
             del park_df
 
@@ -308,8 +324,15 @@ def run_challenger_training(challenger_name: str, output_base: Path) -> dict:
     log.info(f"Average MAE: {avg_mae:.2f} min")
     log.info("=" * 60)
 
+    for e, reason in sorted(skipped.items()):
+        log.warning(f"  skipped {e}: {reason}")
+
     return {
         "challenger_name": challenger_name,
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "entity_count": successful,
+        "eligible_count": len(eligible),
+        "skipped": skipped,
         "successful": successful,
         "failed": failed,
         "avg_mae": round(avg_mae, 2),
@@ -322,11 +345,15 @@ def main():
     parser.add_argument("--challenger", required=True, help="Challenger name (e.g., hypertuned_v1)")
     parser.add_argument("--output-base", type=Path, required=True, help="Pipeline output base directory")
     
+    parser.add_argument("--run-date", type=date.fromisoformat, default=None,
+                        help="Run date for the extinct exclusion (default: today)")
+
     args = parser.parse_args()
-    
+
     try:
-        result = run_challenger_training(args.challenger, args.output_base)
-        print(f"✅ Challenger training completed: {result}")
+        result = run_challenger_training(args.challenger, args.output_base, args.run_date)
+        print(f"✅ Challenger training completed: {result['entity_count']}/{result['eligible_count']} entities")
+        print("RESULT:" + json.dumps(result))
         return 0
     except Exception as e:
         print(f"❌ Challenger training failed: {e}")

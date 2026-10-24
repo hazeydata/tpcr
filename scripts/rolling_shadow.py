@@ -3,14 +3,19 @@
 
 Runs after the baseline pipeline completes. For each active challenger in the
 registry:
-  1. Generate shadow predictions (pipeline.competition.forecast_challenger)
+  0. Retrain on every production-eligible entity (pipeline.competition.train_challenger)
+     when the model dir is missing, trained_at is older than 7 days, or --retrain
+     is given. fallback-v2 has no model and is never retrained.
+  1. Generate shadow predictions (pipeline.competition.forecast_challenger;
+     fallback-v2 is dispatched to pipeline.competition.fallback_v2)
   2. Archive 1-day-ahead predictions for both baseline and challenger
   3. Evaluate yesterday's predictions using pipeline.competition.shadow_evaluate
      (SAME methodology as s10_accuracy.py: ACTUAL wait_time_type, TIME_BUCKET,
-      synthetic actuals fallback)
+      synthetic actuals fallback), on the identical (entity, slot) set
   4. Update registry metrics and shadow_days (only days with >= 1 matched pair)
   5. Auto-retire or flag for promotion at min_shadow_days
-  6. Post daily comparison report to Discord (removal planned: Phase 4)
+  6. Write scores/YYYY-MM-DD.parquet and summaries/YYYY-MM-DD.json (atomic)
+  7. Post daily comparison report to Discord (removal planned: Phase 4)
 
 Everything runs on this machine. Defaults:
   pipeline base : ~/hazeydata/pipeline            (--pipeline-base / TPCR_PIPELINE_BASE)
@@ -52,14 +57,25 @@ Archive files are named by REFERENCE DATE — the date the predictions are FOR.
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from pipeline.competition.io_utils import atomic_write_json, atomic_write_parquet  # noqa: E402
 
 # --- Configuration ---
 ENV_PIPELINE_BASE = "TPCR_PIPELINE_BASE"
 ENV_TPCR_DIR = "TPCR_DIR"
+
+# fallback-v2 is dispatched to pipeline.competition.fallback_v2 (no model, no retrain).
+FALLBACK_V2 = "fallback-v2"
+# Challengers scored mainly on fallback entities (name -> score_scope).
+SCORE_SCOPES = {FALLBACK_V2: "fallback"}
+RETRAIN_MAX_AGE_DAYS = 7
+RETRAIN_TIMEOUT = 7200
 
 DISCORD_CHANNEL_ID = "1479351574177513576"
 DISCORD_API = "https://discord.com/api/v10"
@@ -171,20 +187,120 @@ def post_discord(message):
     )
 
 
+def score_scope(challenger):
+    """'fallback' for fallback-v2, else 'all'. A registry `score_scope` field wins."""
+    return challenger.get("score_scope") or SCORE_SCOPES.get(challenger["name"], "all")
+
+
+def register_fallback_v2(registry):
+    """Add the fallback-v2 entry if missing. Returns True when it was added."""
+    known = {c["name"] for c in registry["challengers"] + registry["retired"]}
+    if FALLBACK_V2 in known:
+        return False
+    registry["challengers"].append({
+        "name": FALLBACK_V2, "id": FALLBACK_V2, "status": "active", "shadow_days": 0,
+        "score_scope": SCORE_SCOPES[FALLBACK_V2], "trained_at": None, "entity_count": None,
+        "notes": "TPCR-S8-FALLBACK-001 Phases 2-3 as a challenger; no model, never retrained",
+    })
+    return True
+
+
+# --- Step 0: Retrain on every production-eligible entity ---
+
+def models_dir(challenger):
+    return COMPETITION_BASE / "models" / challenger.get("module_name", challenger["name"])
+
+
+def parse_timestamp(value):
+    """ISO timestamp -> aware datetime (naive treated as UTC); None if unparseable."""
+    try:
+        ts = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+
+
+def needs_retrain(challenger, force=False, now=None):
+    """Reason string if a retrain is due, else None.
+
+    Due when forced, the model dir is missing or empty, trained_at is absent, or
+    trained_at is older than RETRAIN_MAX_AGE_DAYS. fallback-v2 has no model.
+    """
+    if challenger["name"] == FALLBACK_V2:
+        return None
+    if force:
+        return "forced (--retrain)"
+    mdir = models_dir(challenger)
+    if not mdir.is_dir() or not any(mdir.iterdir()):
+        return "model dir missing"
+    trained = parse_timestamp(challenger.get("trained_at"))
+    if trained is None:
+        return "never trained"
+    now = now or datetime.now(timezone.utc)
+    if now - trained > timedelta(days=RETRAIN_MAX_AGE_DAYS):
+        return f"trained_at older than {RETRAIN_MAX_AGE_DAYS} days"
+    return None
+
+
+def retrain_challenger(challenger, run_date):
+    """Run train_challenger on the full eligible set. Returns its RESULT dict or None."""
+    name = challenger["name"]
+    module_name = challenger.get("module_name", name)
+    print(f"  Retraining: {name} (module: {module_name})...")
+    try:
+        result = run_module(
+            "pipeline.competition.train_challenger",
+            ["--challenger", module_name, "--output-base", str(PIPELINE_BASE),
+             "--run-date", run_date.isoformat()],
+            timeout=RETRAIN_TIMEOUT,
+        )
+    except (subprocess.TimeoutExpired, OSError) as e:
+        print(f"  Retrain FAILED: {type(e).__name__}: {e}")
+        return None
+    if result.returncode != 0:
+        print(f"  Retrain FAILED: {(result.stderr or result.stdout)[-200:]}")
+        return None
+    for line in result.stdout.splitlines():
+        if line.startswith("RESULT:"):
+            return json.loads(line[7:])
+    print("  Retrain FAILED: no RESULT line")
+    return None
+
+
+def record_training(challenger, result):
+    """Write trained_at / entity_count to the registry entry.
+
+    Returns an error string when entity_count differs from the production
+    eligible count (the diff is printed), else None.
+    """
+    challenger["trained_at"] = result["trained_at"]
+    challenger["entity_count"] = result["entity_count"]
+    eligible = result.get("eligible_count")
+    if eligible is None or result["entity_count"] == eligible:
+        return None
+    skipped = result.get("skipped") or {}
+    detail = ", ".join(f"{e}={r}" for e, r in sorted(skipped.items())) or "none recorded"
+    print(f"  entity_count {result['entity_count']} != production eligible {eligible}; skipped: {detail}")
+    return (f"{challenger['name']}: entity_count {result['entity_count']} != "
+            f"production eligible count {eligible} (skipped: {detail})")
+
+
 # --- Step 1: Generate shadow forecasts ---
 
 def generate_forecasts(challenger):
-    """Run challenger forecast locally."""
+    """Run challenger forecast locally (fallback-v2 goes to its own module)."""
     name = challenger["name"]
     module_name = challenger.get("module_name", name)
     print(f"  Forecasting: {name} (module: {module_name})...")
 
+    if name == FALLBACK_V2:
+        module, args = "pipeline.competition.fallback_v2", ["--output-base", str(PIPELINE_BASE)]
+    else:
+        module = "pipeline.competition.forecast_challenger"
+        args = ["--challenger", module_name, "--output-base", str(PIPELINE_BASE)]
+
     try:
-        result = run_module(
-            "pipeline.competition.forecast_challenger",
-            ["--challenger", module_name, "--output-base", str(PIPELINE_BASE)],
-            timeout=300,
-        )
+        result = run_module(module, args, timeout=900 if name == FALLBACK_V2 else 300)
     except subprocess.TimeoutExpired:
         print("  FAILED: forecast timed out")
         return False
@@ -248,6 +364,11 @@ def archive_predictions(challenger, run_date):
 
 # --- Step 3: Evaluate using shadow_evaluate.py ---
 
+def staging_path(name, eval_date):
+    """Per-challenger score rows for one eval date, merged into scores/ at the end of the run."""
+    return COMPETITION_BASE / "scores" / f".staging-{eval_date}" / f"{name}.parquet"
+
+
 def evaluate_previous_day(challenger, run_date):
     """Evaluate yesterday's predictions against actuals.
 
@@ -264,14 +385,19 @@ def evaluate_previous_day(challenger, run_date):
     name = challenger["name"]
     reference_date = (run_date - timedelta(days=1)).isoformat()  # yesterday = the date to evaluate
 
+    scores_out = staging_path(name, reference_date)
+    scores_out.parent.mkdir(parents=True, exist_ok=True)
+    scores_out.unlink(missing_ok=True)
+
     try:
         result = run_module(
             "pipeline.competition.shadow_evaluate",
             ["--challenger", name,
              "--reference-date", reference_date,
              "--shadow-dir", str(SHADOW_DIR / name),
-             "--output-base", str(PIPELINE_BASE)],
-            timeout=120,
+             "--output-base", str(PIPELINE_BASE),
+             "--scores-out", str(scores_out)],
+            timeout=300,
         )
     except subprocess.TimeoutExpired:
         print("  Eval FAILED: timed out")
@@ -358,6 +484,82 @@ def update_registry(registry, challenger_name, metrics):
     return "not_found"
 
 
+def registry_metrics(metrics, scope):
+    """Metrics the registry should track for a challenger's score scope.
+
+    'all': unchanged. 'fallback': baseline_mae / challenger_mae become the
+    fallback-entity MAEs (all-entity values kept as all_entity_*), and a day with
+    no fallback entities counts as no matched pair.
+    """
+    if scope != "fallback" or not isinstance(metrics, dict):
+        return metrics
+    out = dict(metrics, all_entity_baseline_mae=metrics.get("baseline_mae"),
+               all_entity_challenger_mae=metrics.get("challenger_mae"))
+    if metrics.get("mae_fallback_prod") is None or metrics.get("mae_fallback_chal") is None:
+        out["n_matched"] = 0
+        return out
+    out["baseline_mae"] = metrics["mae_fallback_prod"]
+    out["challenger_mae"] = metrics["mae_fallback_chal"]
+    return out
+
+
+# --- Step 5: Daily scores + summary ---
+
+def challenger_summary(challenger, metrics):
+    """One challenger's block of the daily summary."""
+    entry = {"score_scope": score_scope(challenger),
+             "trained_at": challenger.get("trained_at"),
+             "entity_count": challenger.get("entity_count")}
+    if matched_pairs(metrics) < 1:
+        return dict(entry, matched_pairs=0, status="no_data")
+    return dict(
+        entry,
+        matched_pairs=matched_pairs(metrics),
+        n_entities=metrics.get("n_entities"),
+        coverage_pct=metrics.get("coverage_pct"),
+        mae_prod=metrics.get("baseline_mae"),
+        mae_chal=metrics.get("challenger_mae"),
+        mae_fallback_prod=metrics.get("mae_fallback_prod"),
+        mae_fallback_chal=metrics.get("mae_fallback_chal"),
+        n_fallback_entities=metrics.get("n_fallback_entities"),
+        dropped=metrics.get("dropped", {}),
+        forecast_entities=metrics.get("forecast_entities"),
+    )
+
+
+def write_day_outputs(eval_date, results, errors):
+    """Write scores/<date>.parquet and summaries/<date>.json (atomic, overwrite).
+
+    results: [(challenger, metrics)] for the challengers that ran. The scores
+    file holds every challenger's rows for the date and replaces any earlier
+    file for that date; it is left untouched when no challenger produced rows.
+    """
+    blocks = {c["name"]: challenger_summary(c, m) for c, m in results}
+    scored = [b for b in blocks.values() if b["matched_pairs"] >= 1]
+
+    staged = [staging_path(c["name"], eval_date) for c, _ in results]
+    staged = [p for p in staged if p.exists()]
+    if staged:
+        import pandas as pd
+
+        scores = pd.concat([pd.read_parquet(p) for p in staged], ignore_index=True)
+        atomic_write_parquet(scores, COMPETITION_BASE / "scores" / f"{eval_date}.parquet")
+
+    summary = {
+        "date": eval_date,
+        "matched_pairs": max((b["matched_pairs"] for b in scored), default=0),
+        "forecast_entities": max((b.get("forecast_entities") or 0 for b in scored), default=0),
+        # worst coverage across scored challengers
+        "coverage_pct": min((b.get("coverage_pct") or 0.0 for b in scored), default=0.0),
+        "challengers": blocks,
+        "run_status": "failed" if errors else "ok",
+        "errors": list(errors),
+    }
+    atomic_write_json(COMPETITION_BASE / "summaries" / f"{eval_date}.json", summary)
+    shutil.rmtree(COMPETITION_BASE / "scores" / f".staging-{eval_date}", ignore_errors=True)
+    return summary
+
+
 # --- Main ---
 
 def parse_args(argv=None):
@@ -366,6 +568,11 @@ def parse_args(argv=None):
     p.add_argument("--tpcr-dir", help="default: $TPCR_DIR or ~/theme-park-crowd-report")
     p.add_argument("--python", help="default: <tpcr-dir>/.venv/bin/python")
     p.add_argument("--run-date", type=date.fromisoformat, help="YYYY-MM-DD (default: today)")
+    p.add_argument("--retrain", action="store_true",
+                   help="retrain every active challenger now (default: only when the model dir "
+                        f"is missing or trained_at is older than {RETRAIN_MAX_AGE_DAYS} days)")
+    p.add_argument("--register-fallback-v2", action="store_true",
+                   help="add the fallback-v2 challenger to the registry if it is missing")
     return p.parse_args(argv)
 
 
@@ -392,6 +599,9 @@ def main(argv=None):
         print("ERROR: Could not load challenger registry")
         sys.exit(1)
 
+    if args.register_fallback_v2 and register_fallback_v2(registry):
+        print(f"Registered {FALLBACK_V2}")
+
     active = [c for c in registry["challengers"]
               if c["name"] not in RETIRED and c["status"] in RUNNABLE_STATUSES]
     print(f"Active challengers: {len(active)}")
@@ -404,36 +614,59 @@ def main(argv=None):
     report_lines = [f":bar_chart: **Rolling Shadow Report — {run_date.isoformat()}**\n"]
     report_lines.append(f"Active challengers: {len(active)}\n```")
 
+    errors = []
+    results = []
+
     for challenger in active:
         name = challenger["name"]
         print(f"\n--- {name} (Day {challenger.get('shadow_days', 0) + 1}) ---")
 
+        # Step 0: Retrain on every production-eligible entity when due
+        reason = needs_retrain(challenger, args.retrain)
+        if reason:
+            print(f"  Retrain due: {reason}")
+            train_result = retrain_challenger(challenger, run_date)
+            if train_result is None:
+                errors.append(f"{name}: retrain failed")
+                report_lines.append(f"{name}: RETRAIN FAILED")
+                continue
+            mismatch = record_training(challenger, train_result)
+            if mismatch:
+                errors.append(mismatch)
+            write_registry(registry)
+
         # Step 1: Generate forecasts
         forecast_ok = generate_forecasts(challenger)
         if not forecast_ok:
+            errors.append(f"{name}: forecast failed")
             report_lines.append(f"{name}: FORECAST FAILED")
             continue
 
         # Step 2: Archive predictions (named by reference_date = run_date + 1)
         archive_ok = archive_predictions(challenger, run_date)
         if not archive_ok:
+            errors.append(f"{name}: archive failed")
             report_lines.append(f"{name}: ARCHIVE FAILED")
             continue
 
         # Step 3: Evaluate previous day (reference_date = run_date - 1)
         metrics = evaluate_previous_day(challenger, run_date)
+        if metrics is None:
+            errors.append(f"{name}: evaluation failed")
+        results.append((challenger, metrics))
 
-        # Step 4: Update registry
-        status = update_registry(registry, name, metrics)
+        # Step 4: Update registry (fallback-scope challengers are tracked on fallback MAE)
+        scoped = registry_metrics(metrics, score_scope(challenger))
+        status = update_registry(registry, name, scoped)
 
         # Build report line
         day = challenger.get("shadow_days", 0)
-        if matched_pairs(metrics) >= 1:
-            b = metrics["baseline_mae"]
-            c_mae = metrics["challenger_mae"]
+        if matched_pairs(scoped) >= 1:
+            b = scoped["baseline_mae"]
+            c_mae = scoped["challenger_mae"]
             delta = b - c_mae
             winner = "+" if c_mae < b else "-"
-            n_ent = metrics.get("n_entities", "?")
+            n_ent = scoped.get("n_entities", "?")
             report_lines.append(
                 f"{name} Day {day}: base={b:.1f} chal={c_mae:.1f} "
                 f"delta={delta:+.1f} [{winner}] entities={n_ent}"
@@ -451,6 +684,13 @@ def main(argv=None):
     # Save updated registry
     write_registry(registry)
     print("\nRegistry updated.")
+
+    # Daily scores + summary for the evaluated date
+    summary = write_day_outputs(eval_ref, results, errors)
+    print(f"Wrote scores/summary for {eval_ref}: run_status={summary['run_status']}, "
+          f"matched_pairs={summary['matched_pairs']}, coverage={summary['coverage_pct']}%")
+    for err in errors:
+        print(f"  ERROR: {err}")
 
     # Post to Discord (Phase 4 removes this)
     try:

@@ -173,6 +173,9 @@ class MainRunListTest(unittest.TestCase):
             calls["evaluate"].append(ch["name"])
             return good_metrics(5)
 
+        def fake_retrain(ch, run_date):  # Phase 2 retrain step: no model dir in this sandbox
+            return {"trained_at": "2026-10-24T00:00:00+00:00", "entity_count": 3, "eligible_count": 3}
+
         mod = load_rolling_shadow()
         with tempfile.TemporaryDirectory() as d:
             base = Path(d) / "pipeline"
@@ -180,7 +183,8 @@ class MainRunListTest(unittest.TestCase):
             # xgb-dow arrives as a legacy "shadow" entry; the run must retire it.
             mod.write_registry(make_registry("xgb-dow", "chal-a"), registry_path)
 
-            with mock.patch.object(mod, "generate_forecasts", fake_forecast), \
+            with mock.patch.object(mod, "retrain_challenger", fake_retrain), \
+                    mock.patch.object(mod, "generate_forecasts", fake_forecast), \
                     mock.patch.object(mod, "archive_predictions", fake_archive), \
                     mock.patch.object(mod, "evaluate_previous_day", fake_evaluate), \
                     mock.patch.object(mod, "post_discord", lambda msg: None), \
