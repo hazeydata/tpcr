@@ -113,3 +113,18 @@ def test_bot_pops_anthropic_log_after_load_dotenv_before_ask_agent_import():
     pop = src.index('os.environ.pop("ANTHROPIC_LOG", None)')
     imp = src.index("from ask_agent import")
     assert dotenv < pop < imp
+
+
+def test_bot_import_pins_all_sdk_loggers_without_ask_path(bot):
+    """Import-time pin only: reset levels, reload bot, never call /ask."""
+    import importlib
+    saved = {n: logging.getLogger(n).level for n in PINNED}
+    try:
+        for n in PINNED:
+            logging.getLogger(n).setLevel(logging.NOTSET)
+        importlib.reload(bot)
+        for n in PINNED:
+            assert logging.getLogger(n).level == logging.WARNING, n
+    finally:
+        for n, lvl in saved.items():
+            logging.getLogger(n).setLevel(lvl)
