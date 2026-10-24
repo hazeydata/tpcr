@@ -231,68 +231,6 @@ def compare_forecasts(baseline_df: pd.DataFrame, challenger_df: pd.DataFrame,
     }
 
 
-def format_comparison_report(comparison_data: dict) -> str:
-    """Format comparison data into a Discord-ready report."""
-    if 'error' in comparison_data:
-        return f"❌ **COMPARISON FAILED**: {comparison_data['error']}"
-    
-    data = comparison_data
-    overall = data['overall_metrics']
-    entity_summary = data['entity_summary']
-    challenger_name = data['challenger_name']
-    
-    # Determine overall winner
-    if overall['challenger_wins_overall']:
-        overall_icon = "🏆"
-        overall_status = f"Challenger WINS by {abs(overall['mae_delta']):.1f} min ({abs(overall['mae_pct_change']):.1f}%)"
-    else:
-        overall_icon = "📈"
-        overall_status = f"Baseline wins by {abs(overall['mae_delta']):.1f} min ({abs(overall['mae_pct_change']):.1f}%)"
-    
-    report = [
-        f"🏆 **COMPETITION REPORT — {data['comparison_date']}**",
-        f"**{challenger_name}** vs **baseline**",
-        "",
-        f"**{overall_icon} OVERALL RESULT:**",
-        f"  {overall_status}",
-        f"  Baseline MAE: {overall['baseline_mae']} min (bias: {overall['baseline_bias']:+.1f})",
-        f"  Challenger MAE: {overall['challenger_mae']} min (bias: {overall['challenger_bias']:+.1f})",
-        "",
-        f"**📊 ENTITY BREAKDOWN:**",
-        f"  Challenger wins: {entity_summary['entities_challenger_wins']}/{data['data_summary']['entities_compared']} ({entity_summary['challenger_win_rate']:.1f}%)",
-        f"  Baseline wins: {entity_summary['entities_baseline_wins']}/{data['data_summary']['entities_compared']} ({100 - entity_summary['challenger_win_rate']:.1f}%)",
-        ""
-    ]
-    
-    # Show park breakdown
-    park_metrics = data['park_metrics']
-    if park_metrics:
-        report.append("**🗺️ PARK BREAKDOWN:**")
-        for park_code in sorted(park_metrics.keys()):
-            pm = park_metrics[park_code]
-            icon = "🏆" if pm['challenger_wins'] else "📈"
-            delta_str = f"{pm['mae_delta']:+.1f}"
-            report.append(f"  {park_code}: baseline {pm['baseline_mae']:.1f} vs challenger {pm['challenger_mae']:.1f} ({delta_str}) {icon}")
-        report.append("")
-    
-    # Show worst entities for challenger
-    worst = data['worst_entities_for_challenger']
-    if worst:
-        report.append("**⚠️ WORST ENTITIES FOR CHALLENGER:**")
-        for entity in worst[:3]:  # Top 3 worst
-            report.append(f"  {entity['entity_code']}: challenger {entity['challenger_mae']:.1f} vs baseline {entity['baseline_mae']:.1f} ({entity['mae_delta']:+.1f} min)")
-        report.append("")
-    
-    # Show data summary
-    data_summary = data['data_summary']
-    report.append(f"**📈 DATA SUMMARY:**")
-    report.append(f"  Comparisons: {data_summary['total_comparisons']:,} predictions")
-    report.append(f"  Date range: {data_summary['date_range']['start']} to {data_summary['date_range']['end']}")
-    report.append(f"  Entities: {data_summary['entities_compared']}, Parks: {data_summary['parks_compared']}")
-    
-    return "\n".join(report)
-
-
 def run_evaluation(challenger_name: str, output_base: Path, days_back: int = 7) -> dict:
     """Run head-to-head evaluation between challenger and baseline."""
     
@@ -364,18 +302,11 @@ def main():
     parser.add_argument("--challenger", required=True, help="Challenger name (e.g., hypertuned_v1)")
     parser.add_argument("--output-base", type=Path, required=True, help="Pipeline output base directory")
     parser.add_argument("--days-back", type=int, default=7, help="Days of actuals to compare against")
-    parser.add_argument("--format-report", action="store_true", help="Also output formatted Discord report")
     
     args = parser.parse_args()
     
     try:
         result = run_evaluation(args.challenger, args.output_base, args.days_back)
-        
-        if args.format_report and 'error' not in result:
-            print("\n" + "="*60)
-            print("FORMATTED REPORT:")
-            print("="*60)
-            print(format_comparison_report(result))
         
         print(f"\n✅ Evaluation completed: challenger {'WINS' if result.get('overall_metrics', {}).get('challenger_wins_overall') else 'loses'}")
         return 0

@@ -13,9 +13,12 @@ registry:
      (SAME methodology as s10_accuracy.py: ACTUAL wait_time_type, TIME_BUCKET,
       synthetic actuals fallback), on the identical (entity, slot) set
   4. Update registry metrics and shadow_days (only days with >= 1 matched pair)
-  5. Auto-retire or flag for promotion at min_shadow_days
-  6. Write scores/YYYY-MM-DD.parquet and summaries/YYYY-MM-DD.json (atomic)
-  7. Post daily comparison report to Discord (removal planned: Phase 4)
+  5. Write scores/YYYY-MM-DD.parquet and summaries/YYYY-MM-DD.json (atomic),
+     with per-challenger win / streak / bootstrap CI / gain_min / flagged
+  6. Apply the flag rule (pipeline.competition.flag_rule) to the registry status.
+     A flag only sets registry status and a summary field; nothing is promoted.
+
+Nothing is posted anywhere.
 
 Everything runs on this machine. Defaults:
   pipeline base : ~/hazeydata/pipeline            (--pipeline-base / TPCR_PIPELINE_BASE)
@@ -64,6 +67,10 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from pipeline.competition import flag_rule  # noqa: E402
+from pipeline.competition.flag_rule import (  # noqa: E402,F401
+    BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED, MIN_GAIN_MIN, MIN_STREAK,
+)
 from pipeline.competition.io_utils import atomic_write_json, atomic_write_parquet  # noqa: E402
 
 # --- Configuration ---
@@ -77,15 +84,14 @@ SCORE_SCOPES = {FALLBACK_V2: "fallback"}
 RETRAIN_MAX_AGE_DAYS = 7
 RETRAIN_TIMEOUT = 7200
 
-DISCORD_CHANNEL_ID = "1479351574177513576"
-DISCORD_API = "https://discord.com/api/v10"
-
 # Challengers that are never forecast, archived or scored: name -> reason.
 RETIRED = {"xgb-dow": "in production via #470"}
 # Registry statuses the orchestrator will run.
-RUNNABLE_STATUSES = ("active", "shadow", "promotion_candidate")
-# Legacy registry status -> current status.
-LEGACY_STATUS = {"shadow": "active", "auto_retired": "retired"}
+RUNNABLE_STATUSES = ("active", "shadow", "flagged")
+# Legacy registry status -> current status. The old promotion_candidate flag came
+# from a different rule (average MAE below baseline), so it is not carried over.
+LEGACY_STATUS = {"shadow": "active", "auto_retired": "retired", "promotion_candidate": "active"}
+STATUS_FLAGGED = "flagged"
 
 
 def default_paths(env=None):
@@ -113,16 +119,6 @@ def configure(pipeline_base=None, tpcr_dir=None, python=None):
     COMPETITION_BASE = PIPELINE_BASE / "competition"
     SHADOW_DIR = COMPETITION_BASE / "shadow"
     REGISTRY_PATH = COMPETITION_BASE / "challenger_registry.json"
-
-
-def load_env():
-    env_file = Path.home() / ".env"
-    if env_file.exists():
-        for line in env_file.read_text().splitlines():
-            if "=" in line and not line.startswith("#"):
-                key, val = line.split("=", 1)
-                if key.strip() not in os.environ:
-                    os.environ[key.strip()] = val.strip().strip('"')
 
 
 def run_module(module, args, timeout):
@@ -167,24 +163,6 @@ def write_registry(registry, path=None):
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(registry, indent=2))
     os.replace(tmp, path)
-
-
-def post_discord(message):
-    import requests  # lazy: Discord removal is Phase 4
-
-    token = os.environ.get("DISCORD_BOT_TOKEN", "")
-    if not token:
-        print("WARNING: No DISCORD_BOT_TOKEN")
-        return
-    # Discord limit is 2000 chars
-    if len(message) > 1990:
-        message = message[:1990] + "..."
-    requests.post(
-        f"{DISCORD_API}/channels/{DISCORD_CHANNEL_ID}/messages",
-        json={"content": message},
-        headers={"Authorization": f"Bot {token}", "Content-Type": "application/json"},
-        timeout=15,
-    )
 
 
 def score_scope(challenger):
@@ -467,20 +445,19 @@ def matched_pairs(metrics):
 
 
 def update_registry(registry, challenger_name, metrics, eval_date=None):
-    """Update challenger metrics and check promotion/retirement criteria.
+    """Update challenger metrics. Returns "active" or "not_found".
 
+    No retire/promote decision is made here; flagging is apply_flags (flag rule).
     shadow_days only counts evaluations with at least one matched pair.
     With eval_date, daily_metrics is keyed by date: a rerun for the same date
     replaces that day's entry and does not increment shadow_days again.
     """
-    settings = registry["settings"]
-
     for c in registry["challengers"]:
         if c["name"] != challenger_name:
             continue
 
         if matched_pairs(metrics) < 1:
-            return "shadow"
+            return "active"
 
         # Store daily metrics (one entry per date when eval_date is given)
         daily = c.get("daily_metrics", [])
@@ -505,31 +482,32 @@ def update_registry(registry, challenger_name, metrics, eval_date=None):
                 "total_days_evaluated": len(daily),
             }
 
-        # Check auto-retire / promotion at min_shadow_days
-        if c["shadow_days"] >= settings["min_shadow_days"] and c.get("metrics"):
-            avg_base = c["metrics"].get("avg_baseline_mae", 0)
-            avg_chal = c["metrics"].get("avg_challenger_mae", 0)
-
-            if avg_chal > avg_base + settings["auto_retire_if_worse_by"]:
-                c["status"] = "retired"
-                c["retired_reason"] = f"MAE {avg_chal:.2f} > baseline {avg_base:.2f} + {settings['auto_retire_if_worse_by']}"
-                registry["retired"].append(c.copy())
-                registry["challengers"] = [x for x in registry["challengers"] if x["name"] != challenger_name]
-                return "retired"
-            elif avg_chal < avg_base:
-                c["status"] = "promotion_candidate"
-                return "promotion_candidate"
-            else:
-                # Borderline — extend to 14 days
-                if c["shadow_days"] >= 14:
-                    c["status"] = "retired"
-                    c["retired_reason"] = f"Borderline after 14 days: {avg_chal:.2f} vs {avg_base:.2f}"
-                    registry["retired"].append(c.copy())
-                    registry["challengers"] = [x for x in registry["challengers"] if x["name"] != challenger_name]
-                    return "retired"
-
-        return "shadow"
+        return "active"
     return "not_found"
+
+
+def apply_flags(registry, summary):
+    """Set registry status from the day's flag decisions. Returns the flagged ids.
+
+    A challenger that is active or flagged becomes (or stays) `flagged` when its
+    summary block says flagged, and goes back to `active` when it does not (also
+    when it has no block that day). Retired challengers are never touched.
+    Changes the registry only; nothing is promoted.
+    """
+    blocks = summary.get("challengers") or {}
+    flagged = []
+    for c in registry["challengers"]:
+        if c["name"] in RETIRED or c.get("status") not in ("active", STATUS_FLAGGED):
+            continue
+        if (blocks.get(c["name"]) or {}).get("flagged") is True:
+            if c["status"] != STATUS_FLAGGED:
+                c["flagged_on"] = summary.get("date")
+            c["status"] = STATUS_FLAGGED
+            flagged.append(c["name"])
+        else:
+            c["status"] = "active"
+            c.pop("flagged_on", None)
+    return flagged
 
 
 def registry_metrics(metrics, scope):
@@ -553,15 +531,83 @@ def registry_metrics(metrics, scope):
 
 # --- Step 5: Daily scores + summary ---
 
+NO_FLAG_FIELDS = {"win": False, "streak": 0, "ci95_low": None, "ci95_high": None,
+                  "gain_min": None, "flagged": False}
+
+
+def load_window_scores(name, eval_date, out_base, days=MIN_STREAK):
+    """Pooled score rows for one challenger over the last `days` dates ending at eval_date.
+
+    The eval date's rows come from out_base (the file just written; the staging dir
+    under shadow_job). Earlier dates come from the committed competition scores/.
+    Dates without a scores file are skipped. Returns a DataFrame (maybe empty).
+    """
+    import pandas as pd
+
+    end = date.fromisoformat(eval_date)
+    frames = []
+    for back in range(days):
+        day = (end - timedelta(days=back)).isoformat()
+        path = Path(out_base if back == 0 else COMPETITION_BASE) / "scores" / f"{day}.parquet"
+        if not path.exists():
+            continue
+        df = pd.read_parquet(path)
+        frames.append(df[df["challenger_id"] == name])
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+def load_summary(day):
+    """A committed summary for an earlier date, or None when missing/unreadable."""
+    try:
+        return json.loads((COMPETITION_BASE / "summaries" / f"{day}.json").read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def flag_fields(name, block, eval_date, run_ok, out_base):
+    """win / streak / ci95_low / ci95_high / gain_min / flagged for one challenger-day.
+
+    win and gain_min use the scope's MAEs (fallback entities for fallback-v2).
+    The bootstrap pools the matched pairs of the last MIN_STREAK dates (scores/*.parquet,
+    scope-filtered) so a flag always rests on the same 7 days as the streak. A failed
+    run (run_ok False) is never a win, so it breaks the streak and cannot flag.
+    """
+    if block.get("matched_pairs", 0) < 1:
+        return dict(NO_FLAG_FIELDS)
+    fallback = block.get("score_scope") == "fallback"
+    mae_prod = block.get("mae_fallback_prod" if fallback else "mae_prod")
+    mae_chal = block.get("mae_fallback_chal" if fallback else "mae_chal")
+    win = run_ok and flag_rule.is_win(mae_prod, mae_chal)
+    gain = flag_rule.gain_min(mae_prod, mae_chal)
+    streak = flag_rule.streak_length(eval_date, win, load_summary, name)
+
+    pool = load_window_scores(name, eval_date, out_base)
+    if fallback and len(pool):
+        pool = pool[pool["is_fallback_entity"].astype(bool)]
+    low = high = None
+    if len(pool):
+        gains = flag_rule.per_entity_gain(pool["entity_code"], pool["actual"],
+                                          pool["prod_pred"], pool["chal_pred"])
+        low, high = flag_rule.bootstrap_ci(gains, BOOTSTRAP_RESAMPLES, BOOTSTRAP_SEED)
+    return {
+        "win": bool(win), "streak": streak,
+        "ci95_low": None if low is None else round(low, 6),
+        "ci95_high": None if high is None else round(high, 6),
+        "gain_min": None if gain is None else round(gain, 6),
+        "flagged": flag_rule.should_flag(win, streak, low, gain),
+    }
+
+
 def challenger_summary(challenger, metrics):
     """One challenger's block of the daily summary."""
     entry = {"score_scope": score_scope(challenger),
              "trained_at": challenger.get("trained_at"),
              "entity_count": challenger.get("entity_count")}
     if matched_pairs(metrics) < 1:
-        return dict(entry, matched_pairs=0, status="no_data")
+        return dict(entry, matched_pairs=0, status="no_data", **NO_FLAG_FIELDS)
     return dict(
         entry,
+        **NO_FLAG_FIELDS,
         matched_pairs=matched_pairs(metrics),
         n_entities=metrics.get("n_entities"),
         coverage_pct=metrics.get("coverage_pct"),
@@ -583,6 +629,11 @@ def write_day_outputs(eval_date, results, errors, out_base=None):
     results: [(challenger, metrics)] for the challengers that ran. The scores
     file holds every challenger's rows for the date and replaces any earlier
     file for that date; it is left untouched when no challenger produced rows.
+
+    Each challenger block gets win, streak, ci95_low, ci95_high, gain_min and
+    flagged (flag rule); the summary gets significant_gain and
+    significant_gain_text. Earlier days' scores and summaries are read from the
+    committed competition dir. The registry status is applied by the caller.
     """
     blocks = {c["name"]: challenger_summary(c, m) for c, m in results}
     scored = [b for b in blocks.values() if b["matched_pairs"] >= 1]
@@ -596,6 +647,11 @@ def write_day_outputs(eval_date, results, errors, out_base=None):
         scores = pd.concat([pd.read_parquet(p) for p in staged], ignore_index=True)
         atomic_write_parquet(scores, out_base / "scores" / f"{eval_date}.parquet")
 
+    run_ok = not errors
+    for name, block in blocks.items():
+        block.update(flag_fields(name, block, eval_date, run_ok, out_base))
+    flagged = [name for name, block in blocks.items() if block["flagged"]]
+
     summary = {
         "date": eval_date,
         "matched_pairs": max((b["matched_pairs"] for b in scored), default=0),
@@ -603,6 +659,8 @@ def write_day_outputs(eval_date, results, errors, out_base=None):
         # worst coverage across scored challengers
         "coverage_pct": min((b.get("coverage_pct") or 0.0 for b in scored), default=0.0),
         "challengers": blocks,
+        "significant_gain": flagged,
+        "significant_gain_text": flag_rule.significant_gain_text(flagged),
         "run_status": "failed" if errors else "ok",
         "errors": list(errors),
     }
@@ -631,14 +689,13 @@ class RegistryError(RuntimeError):
     """The challenger registry is missing or unreadable."""
 
 
-def run_day(run_date, retrain=False, register_fallback=False, out_base=None, post=True):
+def run_day(run_date, retrain=False, register_fallback=False, out_base=None):
     """Run one day. Returns the day's summary dict (None when no challenger is active).
 
     out_base: where the registry, scores/ and summaries/ are written. Default is
     the competition dir (the CLI behavior). shadow_job passes a staging dir and
     commits it itself. Models, forecasts and shadow/ archives are always written
     in place; they are keyed by date or challenger and are overwritten on rerun.
-    post: post the report to Discord (shadow_job never does; removal is Phase 4).
     """
     out_base = Path(out_base) if out_base else COMPETITION_BASE
     registry_out = out_base / REGISTRY_PATH.name
@@ -671,9 +728,6 @@ def run_day(run_date, retrain=False, register_fallback=False, out_base=None, pos
         print("No active challengers — nothing to do")
         return None
 
-    report_lines = [f":bar_chart: **Rolling Shadow Report — {run_date.isoformat()}**\n"]
-    report_lines.append(f"Active challengers: {len(active)}\n```")
-
     errors = []
     results = []
 
@@ -688,7 +742,6 @@ def run_day(run_date, retrain=False, register_fallback=False, out_base=None, pos
             train_result = retrain_challenger(challenger, run_date)
             if train_result is None:
                 errors.append(f"{name}: retrain failed")
-                report_lines.append(f"{name}: RETRAIN FAILED")
                 continue
             mismatch = record_training(challenger, train_result, run_date)
             if mismatch:
@@ -699,14 +752,12 @@ def run_day(run_date, retrain=False, register_fallback=False, out_base=None, pos
         forecast_ok = generate_forecasts(challenger)
         if not forecast_ok:
             errors.append(f"{name}: forecast failed")
-            report_lines.append(f"{name}: FORECAST FAILED")
             continue
 
         # Step 2: Archive predictions (named by reference_date = run_date + 1)
         archive_ok = archive_predictions(challenger, run_date)
         if not archive_ok:
             errors.append(f"{name}: archive failed")
-            report_lines.append(f"{name}: ARCHIVE FAILED")
             continue
 
         # Step 3: Evaluate previous day (reference_date = run_date - 1)
@@ -717,55 +768,35 @@ def run_day(run_date, retrain=False, register_fallback=False, out_base=None, pos
 
         # Step 4: Update registry (fallback-scope challengers are tracked on fallback MAE)
         scoped = registry_metrics(metrics, score_scope(challenger))
-        status = update_registry(registry, name, scoped, eval_ref)
+        update_registry(registry, name, scoped, eval_ref)
 
-        # Build report line
+        # Console line (log only)
         day = challenger.get("shadow_days", 0)
         if matched_pairs(scoped) >= 1:
             b = scoped["baseline_mae"]
             c_mae = scoped["challenger_mae"]
-            delta = b - c_mae
-            winner = "+" if c_mae < b else "-"
-            n_ent = scoped.get("n_entities", "?")
-            report_lines.append(
-                f"{name} Day {day}: base={b:.1f} chal={c_mae:.1f} "
-                f"delta={delta:+.1f} [{winner}] entities={n_ent}"
-            )
+            print(f"  {name} Day {day}: base={b:.1f} chal={c_mae:.1f} delta={b - c_mae:+.1f} "
+                  f"[{'+' if c_mae < b else '-'}] entities={scoped.get('n_entities', '?')}")
         else:
-            report_lines.append(f"{name} Day {day}: no comparison data yet")
+            print(f"  {name} Day {day}: no comparison data yet")
 
-        if status == "retired":
-            report_lines.append(f"  >> AUTO-RETIRED: {challenger.get('retired_reason', '?')}")
-        elif status == "promotion_candidate":
-            report_lines.append("  >> PROMOTION CANDIDATE — flagged for review")
-
-    report_lines.append("```")
-
-    # Save updated registry
-    write_registry(registry, registry_out)
-    print("\nRegistry updated.")
-
-    # Daily scores + summary for the evaluated date
+    # Daily scores + summary for the evaluated date (includes the flag decisions)
     summary = write_day_outputs(eval_ref, results, errors, out_base)
     print(f"Wrote scores/summary for {eval_ref}: run_status={summary['run_status']}, "
           f"matched_pairs={summary['matched_pairs']}, coverage={summary['coverage_pct']}%")
     for err in errors:
         print(f"  ERROR: {err}")
 
-    # Post to Discord (Phase 4 removes this)
-    if post:
-        try:
-            post_discord("\n".join(report_lines))
-            print("Report posted to Discord.")
-        except Exception as e:
-            print(f"WARNING: Discord post failed: {e}")
+    # Flag rule -> registry status (changes nothing in production), then save the registry
+    apply_flags(registry, summary)
+    write_registry(registry, registry_out)
+    print(f"Registry updated. {summary['significant_gain_text']}")
     return summary
 
 
 def main(argv=None):
     args = parse_args(argv)
     configure(args.pipeline_base, args.tpcr_dir, args.python)
-    load_env()
     try:
         run_day(args.run_date or date.today(), retrain=args.retrain,
                 register_fallback=args.register_fallback_v2)

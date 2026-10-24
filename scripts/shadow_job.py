@@ -60,7 +60,7 @@ RUN_SKIPPED_LOCK = "skipped_lock"
 # --- Pipeline completion marker (read-only) ---
 
 def marker_path(pipeline_base, run_date):
-    """Same file pipeline/pipeline.py writes and tpcr-discord-bot/daily_report.py reads."""
+    """Same file pipeline/pipeline.py writes at the end of a full run (the daily report waits for it too)."""
     return Path(pipeline_base) / "logs" / f"pipeline_metrics_{run_date.isoformat()}.json"
 
 
@@ -148,7 +148,8 @@ def skip_summary(eval_date, run_date, run_status, errors=(), detail=None):
     summary = {
         "date": eval_date, "run_date": run_date.isoformat(),
         "matched_pairs": 0, "forecast_entities": 0, "coverage_pct": 0.0,
-        "challengers": {}, "run_status": run_status, "errors": list(errors),
+        "challengers": {}, "significant_gain": [], "significant_gain_text": "None yet",
+        "run_status": run_status, "errors": list(errors),
     }
     if detail:
         summary["detail"] = detail
@@ -231,7 +232,7 @@ def main(argv=None, sleep=None, clock=None, poll_s=60):
             return 0
 
         shutil.rmtree(stage, ignore_errors=True)
-        summary = rs.run_day(run_date, out_base=stage, post=False)
+        summary = rs.run_day(run_date, out_base=stage)
         if summary is None:  # no active challenger: registry normalization only
             summary = rs.write_day_outputs(eval_date, [], [], stage)
 
