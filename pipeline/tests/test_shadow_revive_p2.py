@@ -644,19 +644,44 @@ class RetrainGatingTest(unittest.TestCase):
     def test_fallback_v2_is_never_retrained(self):
         self.assertIsNone(self.mod.needs_retrain({"name": "fallback-v2"}, force=True, now=self.now))
 
-    def test_record_training_sets_registry_fields_and_flags_mismatch(self):
-        ch = {"name": "chal-a"}
-        ok = {"trained_at": "2026-10-24T01:00:00+00:00", "entity_count": 333, "eligible_count": 333,
-              "skipped": {}}
-        self.assertIsNone(self.mod.record_training(ch, ok))
-        self.assertEqual((ch["trained_at"], ch["entity_count"]), (ok["trained_at"], 333))
+    def make_prod_models(self, base, entities, trained_at):
+        for e in entities:
+            d = base / "models" / e
+            d.mkdir(parents=True)
+            (d / "metadata_baseline.json").write_text(json.dumps({"trained_at": trained_at}))
 
-        bad = dict(ok, entity_count=331, skipped={"MK01": "not_trained", "MK02": "error:ValueError"})
-        err = self.mod.record_training(ch, bad)
-        self.assertEqual(ch["entity_count"], 331)
-        self.assertIn("331", err)
-        self.assertIn("333", err)
-        self.assertIn("MK01=not_trained", err)
+    def test_record_training_compares_to_production_trained_set(self):
+        run_date = date(2026, 10, 24)
+        stamp = "2026-10-24T10:00:00+00:00"
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            # production trained an extinct entity (MK99) the shadow's eligible list excludes;
+            # an older model dir (MK77) is not part of this run
+            self.make_prod_models(base, ["MK01", "MK02", "MK99"], stamp)
+            self.make_prod_models(base, ["MK77"], "2026-10-01T10:00:00+00:00")
+            ch = {"name": "chal-a"}
+            ok = {"trained_at": stamp, "entity_count": 3, "eligible_count": 2,
+                  "trained_entities": ["MK01", "MK02", "MK99"], "skipped": {}}
+            self.assertIsNone(self.mod.record_training(ch, ok, run_date, base))
+            self.assertEqual((ch["trained_at"], ch["entity_count"]), (stamp, 3))
+
+            # matches the shadow's own eligible list but not production: error with diff
+            bad = dict(ok, entity_count=2, trained_entities=["MK01", "MK02"],
+                       skipped={"MK03": "not_trained"})
+            err = self.mod.record_training(ch, bad, run_date, base)
+            self.assertEqual(ch["entity_count"], 2)
+            self.assertIn("missing ['MK99']", err)
+            self.assertIn("MK03=not_trained", err)
+
+            extra = dict(ok, trained_entities=["MK01", "MK02", "MK99", "MK05"])
+            self.assertIn("extra ['MK05']", self.mod.record_training(ch, extra, run_date, base))
+
+    def test_record_training_errors_when_production_set_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            res = {"trained_at": "2026-10-24T01:00:00+00:00", "entity_count": 1,
+                   "trained_entities": ["MK01"], "skipped": {}}
+            err = self.mod.record_training({"name": "chal-a"}, res, date(2026, 10, 24), Path(tmp))
+            self.assertIn("not found", err)
 
     def test_register_fallback_v2_is_idempotent(self):
         reg = self.mod.normalize_registry({"settings": {}, "challengers": [], "retired": []})
