@@ -570,6 +570,62 @@ def test_symlinked_file_refused(env, tmp_path):
     assert sha(env["db"]) == before
 
 
+def test_offpath_dir_symlink_under_clean_refused(env, tmp_path, capsys):
+    outside = tmp_path / "outside_dir"
+    write_csv(outside / "mk_2026-09-01.csv", day_rows("2026-09-01"))
+    (env["clean"].parent / "2026-09").symlink_to(outside, target_is_directory=True)
+    before = sha(env["db"])
+    assert run(env, "--apply") == 2
+    assert "REFUSED" in capsys.readouterr().out
+    assert sha(env["db"]) == before and counts(env["db"]) == {}
+
+
+@pytest.mark.parametrize("mode", [["--apply"], []])
+def test_offpath_file_symlink_under_clean_refused(env, tmp_path, capsys, mode):
+    outside = tmp_path / "outside_10.csv"
+    shutil.move(str(env["clean"] / "mk_2026-10-10.csv"), str(outside))
+    (env["clean"] / "mk_2026-10-10.csv").symlink_to(outside)
+    before = sha(env["db"])
+    assert run(env, *mode) == 2
+    assert "REFUSED" in capsys.readouterr().out
+    assert sha(env["db"]) == before and counts(env["db"]) == {}
+
+
+CLASSES = ("null_key", "bad_observed_at", "wait_nonpositive", "duplicate_keys", "park_date_mismatch")
+D4 = "2026-10-04"
+
+
+@pytest.mark.parametrize("extra, want", [
+    pytest.param(("", "not-a-time", "POSTED", 10),
+                 dict(null_key=2, bad_observed_at=0, wait_nonpositive=1, duplicate_keys=1, park_date_mismatch=1),
+                 id="null_key+bad_observed_at"),
+    pytest.param(("", ts(D4, "19:00"), "POSTED", 0),
+                 dict(null_key=2, bad_observed_at=0, wait_nonpositive=1, duplicate_keys=1, park_date_mismatch=1),
+                 id="null_key+wait_nonpositive"),
+    pytest.param(("A", "not-a-time", "POSTED", 0),
+                 dict(null_key=1, bad_observed_at=1, wait_nonpositive=1, duplicate_keys=1, park_date_mismatch=1),
+                 id="bad_observed_at+wait_nonpositive"),
+    pytest.param(("B", ts(D4, "14:00"), "POSTED", 0),
+                 dict(null_key=1, bad_observed_at=0, wait_nonpositive=2, duplicate_keys=1, park_date_mismatch=1),
+                 id="wait_nonpositive+duplicate"),
+    pytest.param(("A", ts(D4, "08:00"), "POSTED", 8),
+                 dict(null_key=1, bad_observed_at=0, wait_nonpositive=1, duplicate_keys=2, park_date_mismatch=1),
+                 id="duplicate+wrong_day"),
+    pytest.param(("", ts(D4, "08:30"), "POSTED", 5),
+                 dict(null_key=2, bad_observed_at=0, wait_nonpositive=1, duplicate_keys=1, park_date_mismatch=1),
+                 id="null_key+wrong_day"),
+])
+def test_r2_class_order_earlier_class_wins(env, capsys, extra, want):
+    write_csv(env["clean"] / f"mk_{D4}.csv", day_rows(D4) + [extra])
+    assert run(env) == 0
+    out = capsys.readouterr().out
+    line = next(l for l in out.splitlines() if l.startswith(f"  {D4}: "))
+    for c in CLASSES:
+        assert f" {c}={want[c]} " in line, (c, line)
+    assert " expected=4 " in line
+    assert "MISMATCH" not in out
+
+
 def test_bad_file_name_and_park_code_refused(env, capsys):
     write_csv(env["clean"] / "a_b_2026-10-03.csv", day_rows("2026-10-03"))
     assert run(env) == 2

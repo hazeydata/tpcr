@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import re
 import sys
 from datetime import datetime, time, timezone
@@ -105,20 +106,24 @@ class RefusedPath(Exception):
 # --------------------------------------------------------------------------- paths
 
 
+def _refuse_symlinks_under(clean_root: Path) -> None:
+    """Fail closed: raise RefusedPath if any file or dir, at any depth, under clean_root is a symlink.
+
+    Walks the whole tree (on or off the read path) and never follows links.
+    """
+    for dirpath, dirnames, filenames in os.walk(clean_root, followlinks=False):
+        for name in (*dirnames, *filenames):
+            entry = Path(dirpath) / name
+            if entry.is_symlink():
+                raise RefusedPath(f"{entry} is a symlink; refusing")
+
+
 def _check_under_clean(path: Path, clean_root: Path) -> Path:
-    """Return resolved path; raise RefusedPath if it (or any dir above it, up to clean_root) escapes clean."""
+    """Return resolved path; raise RefusedPath if it resolves outside clean (defense in depth)."""
+    # run_load already refused symlinks in fact_tables, clean and everything under clean
     resolved = path.resolve()
-    # run_load already refused a symlinked fact_tables or clean; here every component below clean_root is checked
     if not resolved.is_relative_to(clean_root.resolve()):
         raise RefusedPath(f"{path} resolves to {resolved}, outside {clean_root.resolve()}")
-    # No symlinked directory between clean_root and the file (e.g. clean/2026-10 -> elsewhere)
-    if not path.is_relative_to(clean_root):
-        raise RefusedPath(f"{path} is not under {clean_root}")
-    cur = clean_root
-    for part in path.relative_to(clean_root).parts:
-        cur = cur / part
-        if cur.is_symlink():
-            raise RefusedPath(f"{cur} is a symlink; refusing")
     return resolved
 
 
@@ -411,10 +416,11 @@ def build_parser() -> argparse.ArgumentParser:
 def run_load(args, ob: Path, db: Path, now, state: dict) -> int:
     clean_root = ob / "fact_tables" / "clean"
     try:
-        # The spec is silent on symlinks; refusing is the safer choice.
+        # The spec is silent on symlinks; fail closed: none in fact_tables, clean, or anywhere under clean.
         for d in (ob / "fact_tables", clean_root):
             if d.is_symlink():
                 raise RefusedPath(f"{d} is a symlink; refusing")
+        _refuse_symlinks_under(clean_root)
         by_day = day_files(clean_root)
         missing = [d for d in DAYS if not by_day[d]]
         print(f"MISSING DAYS: {','.join(missing) if missing else 'none'}")

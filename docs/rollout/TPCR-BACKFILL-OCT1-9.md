@@ -10,7 +10,7 @@
 - Run it mid-afternoon ET, outside the protected windows below.
 - While `--apply` holds the write connection, the scraper's live write retries, then parks its batches in `state/live_waits_pending/` (replayed later). That retry/park behavior is #524 (TPCR-S11-LOCK-001) code; it is only on the Mini once #524 has passed its own gate and merged (see Deploy). Keep the run short and in the afternoon.
 - Use the pipeline venv python. `$OB` is the production output base, `$DB` is `$OB/tpcr_live.duckdb`.
-- Deploy: only gated, merged commits; never `git pull` a PR branch. This branch contains #524's scraper changes (merge commits `a1c86020a`, `355a7610c`), so: (1) #524 must pass its gate and merge onto `backup/mini-live-b4e6edd` first; (2) this PR then passes its gate and merges there; (3) on the Mini, with `LIVE=backup/mini-live-b4e6edd` and `MERGED_SHA=<full 40-char merge SHA of this PR on $LIVE>`: `git fetch origin "$LIVE" && [ "$(git rev-parse "origin/$LIVE")" = "$MERGED_SHA" ] && [ "$(git rev-parse --abbrev-ref HEAD)" = "$LIVE" ] && [ -z "$(git status --porcelain --untracked-files=no)" ] && git merge-base --is-ancestor HEAD "$MERGED_SHA" && git merge --ff-only "$MERGED_SHA" && [ "$(git rev-parse HEAD)" = "$MERGED_SHA" ]`. If any check fails, stop and report. If #524 is not merged and gated, do not deploy (the script needs `src/live_waits_common.py`, which ships with it).
+- Deploy: only gated, merged commits; never deploy an unmerged PR branch. This branch contains #524's scraper changes (merge commits `a1c86020a`, `355a7610c`), so: (1) #524 must pass its gate and merge onto `backup/mini-live-b4e6edd` first; (2) this PR then passes its gate and merges there; (3) on the Mini, with `LIVE=backup/mini-live-b4e6edd` and `MERGED_SHA=<full 40-char merge SHA of this PR on $LIVE>`: `git fetch origin "$LIVE" && [ "$(git rev-parse "origin/$LIVE")" = "$MERGED_SHA" ] && [ "$(git rev-parse --abbrev-ref HEAD)" = "$LIVE" ] && [ -z "$(git status --porcelain --untracked-files=no)" ] && git merge-base --is-ancestor HEAD "$MERGED_SHA" && git merge --ff-only "$MERGED_SHA" && [ "$(git rev-parse HEAD)" = "$MERGED_SHA" ]`. If any check fails, stop and report. If #524 is not merged and gated, do not deploy (the script needs `src/live_waits_common.py`, which ships with it).
 - **Backup.** Copy `$DB` while no writer has it open (or DuckDB `EXPORT DATABASE` to a dated directory): `cp "$DB" "$OB/tpcr_live.duckdb.bak-$(date +%Y%m%d)"`. Check that sizes match (`ls -l`) and that a read-only `SELECT count(*) FROM live_waits` on the backup equals the source. If the scraper wrote during the copy, redo it.
 
 ## Protected windows (America/New_York, half-open `[start, end)`)
@@ -64,7 +64,7 @@ First `MISSING DAYS: none` (else exit 4 with the list, before any DB access). Th
 - `expected` rows are the distinct keys eligible for that day. `already_in_live`: of those, already in `live_waits`. Expect 0.
 - After `--apply`, per day `VERIFY PASS|FAIL <day>: live_posted=.. expected=..` (exact equality), then `LOAD KEY inserted_at=<value>` again and `CLEAN CHECKSUMS UNCHANGED (<n> files)`.
 
-The dry run (the default) opens the DB read-only. Symlinks: the run refuses (exit 2, nothing written) if `fact_tables`, `clean`, or any dir/file below `clean` is a symlink, or anything resolves outside `clean` (the spec is silent on symlinks; refusing is the safer choice).
+The dry run (the default) opens the DB read-only. Symlinks: the run refuses with exit 2 and writes nothing if `fact_tables` or `clean` is a symlink, if any symlink (file or dir, at any depth, on or off the read path) exists anywhere under `clean`, or if anything resolves outside `clean` (the spec is silent on symlinks; refusing is the safer choice).
 
 A `VERIFY FAIL` exits 5 and prints the exact rollback commands (dry run, then `--apply`). Data stays loaded until you roll back.
 
@@ -75,7 +75,7 @@ Clean files are sha256-hashed at start, before the first write and at the end. A
 | Code | Meaning |
 |------|---------|
 | 0 | Success (dry run, load, or rollback) |
-| 2 | Bad input: path outside `fact_tables/clean`, symlinked `fact_tables`/`clean`/dir/file below clean, bad file name or park code, missing DB, bad `--load-key`, load key already present, `live_waits` has no `inserted_at`, `--rollback` without `--load-key` |
+| 2 | Bad input: path outside `fact_tables/clean`, symlinked `fact_tables`/`clean`, any symlink (file or dir, any depth) under `clean`, bad file name or park code, missing DB, bad `--load-key`, load key already present, `live_waits` has no `inserted_at`, `--rollback` without `--load-key` |
 | 4 | A day 2026-10-01..09 has no clean CSV; no DB access |
 | 5 | `VERIFY FAIL` for at least one day (data stays loaded), or the rollback count check failed |
 | 6 | A clean file's checksum changed (`CHECKSUM CHANGED: <file>`) |
