@@ -8,9 +8,9 @@
 
 - Fred's separate go. Do not start without it.
 - Run it mid-afternoon ET, outside the protected windows below.
-- While `--apply` holds the write connection, the scraper's live write retries, then parks its batches in `state/live_waits_pending/` (replayed later). Nothing is lost, but keep the run short and in the afternoon.
+- While `--apply` holds the write connection, the scraper's live write retries, then parks its batches in `state/live_waits_pending/` (replayed later). That retry/park behavior is #524 (TPCR-S11-LOCK-001) code; it is only on the Mini once #524 has passed its own gate and merged (see Deploy). Keep the run short and in the afternoon.
 - Use the pipeline venv python. `$OB` is the production output base, `$DB` is `$OB/tpcr_live.duckdb`.
-- Deploy: `git pull` the branch on the Mini (the script needs `src/live_waits_common.py`).
+- Deploy: only gated, merged commits; never `git pull` a PR branch. This branch contains #524's scraper changes (merge commits `a1c86020a`, `355a7610c`), so: (1) #524 must pass its gate and merge onto `backup/mini-live-b4e6edd` first; (2) this PR then passes its gate and merges there; (3) on the Mini, with `LIVE=backup/mini-live-b4e6edd` and `MERGED_SHA=<full 40-char merge SHA of this PR on $LIVE>`: `git fetch origin "$LIVE" && [ "$(git rev-parse "origin/$LIVE")" = "$MERGED_SHA" ] && [ "$(git rev-parse --abbrev-ref HEAD)" = "$LIVE" ] && [ -z "$(git status --porcelain --untracked-files=no)" ] && git merge-base --is-ancestor HEAD "$MERGED_SHA" && git merge --ff-only "$MERGED_SHA" && [ "$(git rev-parse HEAD)" = "$MERGED_SHA" ]`. If any check fails, stop and report. If #524 is not merged and gated, do not deploy (the script needs `src/live_waits_common.py`, which ships with it).
 - **Backup.** Copy `$DB` while no writer has it open (or DuckDB `EXPORT DATABASE` to a dated directory): `cp "$DB" "$OB/tpcr_live.duckdb.bak-$(date +%Y%m%d)"`. Check that sizes match (`ls -l`) and that a read-only `SELECT count(*) FROM live_waits` on the backup equals the source. If the scraper wrote during the copy, redo it.
 
 ## Protected windows (America/New_York, half-open `[start, end)`)
