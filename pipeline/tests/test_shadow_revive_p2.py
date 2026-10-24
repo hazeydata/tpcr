@@ -751,6 +751,20 @@ class RetrainGatingTest(unittest.TestCase):
             err = self.mod.record_training({"name": "chal-a"}, res, date(2026, 10, 24), Path(tmp))
             self.assertIn("not found", err)
 
+    def test_production_trained_set_uses_utc_run_date(self):
+        """Must hold under TZ=America/Toronto: trained_at is compared on its UTC date."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            # 23:30 Toronto on the 24th is 03:30Z on the 25th
+            self.make_prod_models(base, ["MK01"], "2026-10-24T23:30:00-04:00")
+            self.make_prod_models(base, ["MK02"], "2026-10-25T12:00:00+00:00")
+            # naive timestamps are treated as UTC
+            self.make_prod_models(base, ["MK03"], "2026-10-25T00:30:00")
+            self.assertEqual(self.mod.production_trained_entities(date(2026, 10, 25), base),
+                             {"MK01", "MK02", "MK03"})
+            # the local (Toronto) date does not count
+            self.assertIsNone(self.mod.production_trained_entities(date(2026, 10, 24), base))
+
     def test_register_fallback_v2_is_idempotent(self):
         reg = self.mod.normalize_registry({"settings": {}, "challengers": [], "retired": []})
         self.assertTrue(self.mod.register_fallback_v2(reg))
