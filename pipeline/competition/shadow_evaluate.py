@@ -26,14 +26,14 @@ ARCHIVE FILE NAMING CONVENTION (Session 27):
     --reference-date 2026-04-03 opens baseline_2026-04-03.parquet
     which contains predictions FOR 2026-04-03, compared against actuals from 2026-04-03.
 
-Usage (CLI on wilma-server):
-    cd /home/wilma/theme-park-crowd-report
+Usage (CLI):
+    cd ~/theme-park-crowd-report
     source .venv/bin/activate
     python -m pipeline.competition.shadow_evaluate \
         --challenger xgb-highLR \
         --reference-date 2026-04-03 \
-        --shadow-dir /home/wilma/hazeydata/pipeline/competition/shadow/xgb-highLR \
-        --output-base /home/wilma/hazeydata/pipeline
+        --shadow-dir ~/hazeydata/pipeline/competition/shadow/xgb-highLR \
+        --output-base ~/hazeydata/pipeline
 
 Output: JSON report to stdout (RESULT:{...}) for parsing by the orchestrator.
 """
@@ -67,7 +67,7 @@ def evaluate_shadow_day(
                         Archive files are named with this date.
         challenger_parquet: Path to archived challenger predictions for reference_date.
         baseline_parquet: Path to archived baseline predictions for reference_date.
-        output_base: Pipeline output base (e.g., /home/wilma/hazeydata/pipeline).
+        output_base: Pipeline output base (e.g., ~/hazeydata/pipeline).
 
     Returns:
         Dict with evaluation metrics, or None if insufficient data.
