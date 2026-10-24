@@ -315,6 +315,20 @@ python scripts/inspect_entity_index.py --limit 50
 
 **Options**: `--output-base`, `--needing-modeling` (show only entities needing re-modeling), `--limit` (default: 20).
 
+### `backfill_live_waits_oct1_9.py` (one-off, TPCR-BACKFILL-OCT1-9)
+
+Backfills `tpcr_live.duckdb` `live_waits` for park dates 2026-10-01..09 from `fact_tables/clean/2026-10/{park}_{date}.csv`. Rows are prepped with the scraper's own `prepare_live_waits_rows` (6 AM rule, wait > 0, non-empty keys) and inserted with `insert_missing_live_waits` (anti-join on `entity_code, observed_at, wait_time_type`), so it is idempotent. Reads only under `fact_tables/clean` (anything resolving elsewhere, symlinked dirs, or `raw/` is refused); never writes a CSV.
+
+**Parity gate (always runs first, also with `--dry-run`):** the clean CSVs for `--parity-date` (default 2026-10-12) are compared with `live_waits` for that date, read-only: row count (`--row-tol`, 2%), entity set (`--entity-tol`, 2%), `wait_time_type` mix, and TouringPlans POSTED rows mixed into the clean files (`--tp-posted-tol`, 1%). On failure nothing is loaded.
+
+```bash
+python scripts/backfill_live_waits_oct1_9.py --dry-run   # parity + per-day files/raw/prepped/already present/would insert
+python scripts/backfill_live_waits_oct1_9.py             # live run (needs the DuckDB write lock)
+```
+
+Options: `--output-base`, `--db`, `--glob`, `--parity-date`, `--dry-run`, `--row-tol`, `--entity-tol`, `--tp-posted-tol`.
+Exit codes: `0` ok, `2` bad input / path refused, `3` source parity failed (nothing loaded). Rollout: [docs/rollout/TPCR-BACKFILL-OCT1-9.md](../docs/rollout/TPCR-BACKFILL-OCT1-9.md).
+
 ## Additional Scripts (summary)
 
 - **Modeling pipeline**: `build_posted_aggregates.py`, `train_batch_entities.py`, `train_entity_model.py`, `generate_forecast.py`, `generate_backfill.py`, `calculate_wti.py`, `test_modeling_pipeline.py` — see [README.md](../README.md) and [docs/MODELING_AND_WTI_METHODOLOGY.md](../docs/MODELING_AND_WTI_METHODOLOGY.md).
