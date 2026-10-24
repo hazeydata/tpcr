@@ -64,7 +64,7 @@ First `MISSING DAYS: none` (else exit 4 with the list, before any DB access). Th
 - `expected` rows are the distinct keys eligible for that day. `already_in_live`: of those, already in `live_waits`. Expect 0.
 - After `--apply`, per day `VERIFY PASS|FAIL <day>: live_posted=.. expected=..` (exact equality), then `LOAD KEY inserted_at=<value>` again and `CLEAN CHECKSUMS UNCHANGED (<n> files)`.
 
-The dry run (the default) opens the DB read-only. Symlinks: the run refuses with exit 2 and writes nothing if `fact_tables` or `clean` is a symlink, if any symlink (file or dir, at any depth, on or off the read path) exists anywhere under `clean`, if a dir under `clean` is unreadable (walk error) or a file under `clean` isn't readable (`os.access` R_OK, checked during the walk), or on any OSError while hashing or reading the clean files (Spec R3a; exit 2 naming the path, before any DB open), or if anything resolves outside `clean` (the spec is silent on symlinks; refusing is the safer choice). The walk runs before any DB open.
+The dry run (the default) opens the DB read-only. Symlinks: the run refuses with exit 2 and writes nothing if `fact_tables` or `clean` is a symlink, if any symlink (file or dir, at any depth, on or off the read path) exists anywhere under `clean`, or, per Spec R3a, because any OSError during the pre-open scan exits 2 (the scan covers the symlink walk, every per-entry stat/is_symlink/access check (an unreadable or unsearchable dir and an unreadable file also refuse), listing, hashing and reading the clean files; the refusal names the path and nothing is written), or if anything resolves outside `clean` (the spec is silent on symlinks; refusing is the safer choice). The walk runs before any DB open.
 
 A `VERIFY FAIL` exits 5 and prints the exact rollback commands (dry run, then `--apply`). Data stays loaded until you roll back.
 
@@ -75,7 +75,7 @@ Clean files are sha256-hashed at start, before the first write and at the end. A
 | Code | Meaning |
 |------|---------|
 | 0 | Success (dry run, load, or rollback) |
-| 2 | Bad input: path outside `fact_tables/clean`, symlinked `fact_tables`/`clean`, any symlink (file or dir, any depth) under `clean`, an unreadable dir under `clean` (walk error) or a file under `clean` that isn't readable (`os.access` R_OK, checked during the walk), plus any OSError while hashing or reading the clean files (Spec R3a; refuses naming the path, before any DB open), bad file name or park code, missing DB, bad `--load-key`, load key already present, `live_waits` has no `inserted_at`, `--rollback` without `--load-key` |
+| 2 | Bad input: path outside `fact_tables/clean`, symlinked `fact_tables`/`clean`, any symlink (file or dir, any depth) under `clean`, Spec R3a: any OSError during the pre-open scan exits 2 (the scan covers the symlink walk, every per-entry stat/is_symlink/access check (an unreadable or unsearchable dir and an unreadable file also refuse), listing, hashing and reading the clean files; the refusal names the path and nothing is written), bad file name or park code, missing DB, bad `--load-key`, load key already present, `live_waits` has no `inserted_at`, `--rollback` without `--load-key` |
 | 4 | A day 2026-10-01..09 has no clean CSV; no DB access |
 | 5 | `VERIFY FAIL` for at least one day (data stays loaded), or the rollback count check failed |
 | 6 | A clean file's checksum changed (`CHECKSUM CHANGED: <file>`) |

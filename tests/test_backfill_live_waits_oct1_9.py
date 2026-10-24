@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import os
+import pathlib
 import re
 import shutil
 import subprocess
@@ -726,6 +727,102 @@ def test_offpath_symlink_refused_before_any_connect(env, tmp_path, capsys, conne
     write_csv(outside / "mk_2026-09-01.csv", day_rows("2026-09-01"))
     (env["clean"].parent / "2026-09").symlink_to(outside, target_is_directory=True)
     assert run(env, *mode) == 2
+    assert "REFUSED" in capsys.readouterr().out
+    assert connect_spy == []
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+@pytest.mark.parametrize("with_file", [False, True])
+@pytest.mark.parametrize("mode", [["--apply"], []])
+def test_unsearchable_dir_under_clean_refused(env, capsys, connect_spy, mode, with_file):
+    d = env["clean"].parent / "2026-09"
+    d.mkdir()
+    if with_file:
+        write_csv(d / "mk_2026-09-01.csv", day_rows("2026-09-01"))
+    before = sha(env["db"])
+    d.chmod(0o600)
+    try:
+        rc = run(env, *mode)
+    finally:
+        d.chmod(0o755)
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "REFUSED" in out and str(d) in out
+    assert connect_spy == []
+    assert sha(env["db"]) == before and counts(env["db"]) == {}
+
+
+@pytest.mark.parametrize("mode", [["--apply"], []])
+def test_simulated_is_symlink_error_refused(env, capsys, monkeypatch, connect_spy, mode):
+    target = env["clean"].parent / "2026-09" / "mk_2026-09-01.csv"
+    write_csv(target, day_rows("2026-09-01"))
+    real = pathlib.Path.is_symlink
+
+    def fake(self):
+        if self == target:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self)
+
+    monkeypatch.setattr(pathlib.Path, "is_symlink", fake)
+    before = sha(env["db"])
+    rc = run(env, *mode)
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "cannot check" in out and str(target) in out
+    assert connect_spy == []
+    assert sha(env["db"]) == before and counts(env["db"]) == {}
+
+
+@pytest.mark.parametrize("which", ["lstat", "stat"])
+@pytest.mark.parametrize("mode", [["--apply"], []])
+def test_simulated_lstat_stat_error_during_scan_refused(env, capsys, monkeypatch, connect_spy, mode, which):
+    # lstat: an off-path entry the walk checks; stat: the month dir that day_files stats (exists/is_dir)
+    target = env["clean"].parent / "2026-09" / "mk_2026-09-01.csv"
+    write_csv(target, day_rows("2026-09-01"))
+    if which == "stat":
+        target = env["clean"]
+    real = getattr(os, which)
+
+    def fake(p, *a, **k):
+        if isinstance(p, (str, bytes, os.PathLike)) and Path(os.fsdecode(p)) == target:
+            raise PermissionError(13, "Permission denied", str(p))
+        return real(p, *a, **k)
+
+    monkeypatch.setattr(os, which, fake)
+    before = sha(env["db"])
+    rc = run(env, *mode)
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "REFUSED" in out and str(target) in out
+    assert connect_spy == []
+    assert sha(env["db"]) == before and counts(env["db"]) == {}
+
+
+@pytest.mark.parametrize("mode", [["--apply"], []])
+def test_day_files_oserror_refused_before_connect(env, capsys, monkeypatch, connect_spy, mode):
+    def boom(*a, **k):
+        raise PermissionError(13, "Permission denied", str(env["clean"]))
+
+    monkeypatch.setattr(bf, "day_files", boom)
+    rc = run(env, *mode)
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "any OSError during the pre-open scan exits 2" in out and str(env["clean"]) in out
+    assert connect_spy == []
+    assert counts(env["db"]) == {}
+
+
+def test_rollback_db_oserror_refused(env, capsys, monkeypatch, connect_spy):
+    real = pathlib.Path.is_file
+
+    def fake(self):
+        if self == env["db"]:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real(self)
+
+    monkeypatch.setattr(pathlib.Path, "is_file", fake)
+    rc = run(env, "--rollback", "--apply", "--load-key", "2026-10-24 06:00:00.000000")
+    assert rc == 2
     assert "REFUSED" in capsys.readouterr().out
     assert connect_spy == []
 

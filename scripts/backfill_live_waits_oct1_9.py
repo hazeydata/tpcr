@@ -109,9 +109,10 @@ class RefusedPath(Exception):
 def _refuse_symlinks_under(clean_root: Path) -> None:
     """Fail closed: raise RefusedPath if any file or dir, at any depth, under clean_root is a symlink.
 
-    Walks the whole tree (on or off the read path) and never follows links. Any OSError during the walk
-    (an unreadable dir) also refuses (Spec R3a), as does any non-symlink file that is not readable
-    (os.access R_OK). Runs before any DB open.
+    Walks the whole tree (on or off the read path) and never follows links. Spec R3a: any OSError during the
+    pre-open scan exits 2. Here: a walk error (onerror), a dir that is not readable and searchable, a file
+    that is not readable, or any OSError from an entry's is_symlink/access check refuses, naming the path.
+    run_load also wraps the whole pre-open scan in one except OSError. Runs before any DB open.
     """
     def _unreadable(err: OSError) -> None:
         raise RefusedPath(f"{err.filename}: cannot read ({err.strerror}); refusing")
@@ -119,12 +120,26 @@ def _refuse_symlinks_under(clean_root: Path) -> None:
     for dirpath, dirnames, filenames in os.walk(clean_root, followlinks=False, onerror=_unreadable):
         for name in (*dirnames, *filenames):
             entry = Path(dirpath) / name
-            if entry.is_symlink():
+            try:
+                is_link = entry.is_symlink()
+            except OSError as e:
+                raise RefusedPath(f"{entry}: cannot check ({e.strerror}); refusing") from e
+            if is_link:
                 raise RefusedPath(f"{entry} is a symlink; refusing")
+        for name in dirnames:
+            entry = Path(dirpath) / name
+            try:
+                if not entry.is_symlink() and not os.access(entry, os.R_OK | os.X_OK):
+                    raise RefusedPath(f"{entry}: dir not readable or not searchable; refusing")
+            except OSError as e:
+                raise RefusedPath(f"{entry}: cannot check ({e.strerror}); refusing") from e
         for name in filenames:
             entry = Path(dirpath) / name
-            if not entry.is_symlink() and not os.access(entry, os.R_OK):
-                raise RefusedPath(f"{entry}: file not readable; refusing")
+            try:
+                if not entry.is_symlink() and not os.access(entry, os.R_OK):
+                    raise RefusedPath(f"{entry}: file not readable; refusing")
+            except OSError as e:
+                raise RefusedPath(f"{entry}: cannot check ({e.strerror}); refusing") from e
 
 
 def _check_under_clean(path: Path, clean_root: Path) -> Path:
@@ -366,7 +381,13 @@ def run_rollback(args, ob: Path, db: Path) -> int:
         if args.load_key is None:
             raise RefusedPath("--rollback requires --load-key")
         key = parse_load_key(args.load_key)
-        if not db.is_file():
+        try:
+            db_ok = db.is_file()
+        except OSError as e:
+            raise RefusedPath(
+                f"{e.filename if e.filename is not None else e}: {e.strerror or e}; "
+                "any OSError during the pre-open scan exits 2") from e
+        if not db_ok:
             raise RefusedPath(f"database not found: {db}")
     except RefusedPath as e:
         print(f"REFUSED: {e}")
@@ -425,25 +446,30 @@ def build_parser() -> argparse.ArgumentParser:
 def run_load(args, ob: Path, db: Path, now, state: dict) -> int:
     clean_root = ob / "fact_tables" / "clean"
     try:
-        # The spec is silent on symlinks; fail closed: none in fact_tables, clean, or anywhere under clean.
-        for d in (ob / "fact_tables", clean_root):
-            if d.is_symlink():
-                raise RefusedPath(f"{d} is a symlink; refusing")
-        _refuse_symlinks_under(clean_root)
-        by_day = day_files(clean_root)
-        missing = [d for d in DAYS if not by_day[d]]
-        print(f"MISSING DAYS: {','.join(missing) if missing else 'none'}")
-        if missing:
-            print("Missing days; refusing. No DB access.")
-            return EXIT_MISSING
-        if not db.is_file():
-            raise RefusedPath(f"database not found: {db}")
-        key = parse_load_key(args.load_key) if args.load_key is not None else new_load_key()
-        files = [f for d in DAYS for f in by_day[d]]
         try:
-            hashes = hash_files(files)
+            # The spec is silent on symlinks; fail closed: none in fact_tables, clean, or anywhere under clean.
+            for d in (ob / "fact_tables", clean_root):
+                if d.is_symlink():
+                    raise RefusedPath(f"{d} is a symlink; refusing")
+            _refuse_symlinks_under(clean_root)
+            by_day = day_files(clean_root)
+            missing = [d for d in DAYS if not by_day[d]]
+            print(f"MISSING DAYS: {','.join(missing) if missing else 'none'}")
+            if missing:
+                print("Missing days; refusing. No DB access.")
+                return EXIT_MISSING
+            if not db.is_file():
+                raise RefusedPath(f"database not found: {db}")
+            key = parse_load_key(args.load_key) if args.load_key is not None else new_load_key()
+            files = [f for d in DAYS for f in by_day[d]]
+            try:
+                hashes = hash_files(files)
+            except OSError as e:
+                raise RefusedPath(f"{e.filename}: cannot read ({e.strerror}); refusing") from e
         except OSError as e:
-            raise RefusedPath(f"{e.filename}: cannot read ({e.strerror}); refusing") from e
+            raise RefusedPath(
+                f"{e.filename if e.filename is not None else e}: {e.strerror or e}; "
+                "any OSError during the pre-open scan exits 2") from e
     except (RefusedPath, ValueError) as e:
         print(f"REFUSED: {e}")
         return EXIT_PATH
