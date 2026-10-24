@@ -705,7 +705,9 @@ def test_hash_oserror_refused_before_connect(env, capsys, monkeypatch, connect_s
     monkeypatch.setattr(bf, "hash_files", boom)
     before = sha(env["db"])
     rc = run(env, *mode)
-    _assert_refused_untouched(env, rc, capsys.readouterr().out, path, connect_spy, before)
+    out = capsys.readouterr().out
+    _assert_refused_untouched(env, rc, out, path, connect_spy, before)
+    assert "cannot read" in out
 
 
 @pytest.mark.parametrize("mode", [["--apply"], []])
@@ -796,6 +798,10 @@ def test_simulated_lstat_stat_error_during_scan_refused(env, capsys, monkeypatch
     assert "REFUSED" in out and str(target) in out
     assert connect_spy == []
     assert sha(env["db"]) == before and counts(env["db"]) == {}
+    if which == "lstat":
+        assert "cannot check" in out
+    else:
+        assert "any OSError during the pre-open scan exits 2" in out
 
 
 @pytest.mark.parametrize("mode", [["--apply"], []])
