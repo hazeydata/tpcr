@@ -100,6 +100,12 @@ Exits with an error if any script fails.
   python src/get_wait_times_from_queue_times.py --interval 600
   ```
 
+**Live DuckDB write (`tpcr_live.duckdb` `live_waits`):** each batch is also inserted into the live DB (only if the file exists), skipping rows already present by `(entity_code, observed_at, wait_time_type)`. Rows with a null/empty key column are dropped but counted and logged as a WARNING (`live_waits prep: dropped N row(s) with null/empty key`). A locked DB (e.g. s11 deploy ~6:15 AM ET) is retried with backoff for ~3 minutes. If still locked, the batch CSV is kept in `output_base/state/live_waits_pending/` (never deleted on failure) and flushed by the next write; after an exhausted batch, new batches are parked without retrying for 60s. In continuous mode, once per America/New_York day at the first cycle at/after 04:30 ET (before the morning ETL removes yesterday's staging), `src/replay_live_waits.py` backfills missing rows from staging. Run it manually (idempotent):
+  ```bash
+  python src/replay_live_waits.py --output-base /path/to/output --days 2
+  python src/replay_live_waits.py --date 2026-10-22 --date 2026-10-23 --budget-s 180
+  ```
+
 **`run_queue_times_loop.ps1`** is a thin wrapper that runs the fetcher with `--interval 300` (5 minutes) by default. It uses the same **output_base** as the rest of the pipeline (from `config/config.json` or default) unless you pass `-OutputBase`. You can run it in a console or register a Windows task “At log on” / “At startup” to keep it running across reboots. The fetcher uses **dimparkhours** (`opening_time` / `closing_time` when present) to only scrape parks in-window (open−90 to close+90 in park TZ); use `--no-hours-filter` to disable. The fetcher always bypasses HTTP/HTTPS proxy; run the loop from **PowerShell or Command Prompt** (not Cursor's terminal) if your IDE forces a local proxy.
 
 ```powershell

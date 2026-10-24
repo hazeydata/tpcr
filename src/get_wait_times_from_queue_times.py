@@ -58,8 +58,10 @@ import logging
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import time
+import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -81,7 +83,6 @@ if str(Path(__file__).parent) not in sys.path:
 from get_tp_wait_time_data_from_s3 import (
     PARK_CODE_MAP,
     acquire_lock,
-    derive_park_date,
     ensure_sqlite,
     get_output_directories,
     get_park_code,
@@ -90,6 +91,7 @@ from get_tp_wait_time_data_from_s3 import (
     setup_logging,
     write_grouped_csvs,
 )
+from live_waits_common import prepare_live_waits_rows
 from utils import get_output_base
 
 # =============================================================================
@@ -147,21 +149,107 @@ QUEUE_TIMES_PARK_MAP: Dict[int, str] = {
 # DUCKDB DUAL-WRITE (live_waits for bot + dashboard)
 # =============================================================================
 
+LIVE_WRITE_RETRY_BUDGET_S = 180      # total time to keep retrying a locked live DB (s11 holds it ~110s)
+LIVE_WRITE_ATTEMPT_TIMEOUT_S = 30    # per-attempt subprocess timeout
+LIVE_WRITE_BACKOFF_START_S = 2
+LIVE_WRITE_BACKOFF_MAX_S = 30
+LIVE_WRITE_COOLDOWN_S = 60           # after a batch exhausts its budget, park new batches without retrying
+LIVE_WAITS_PENDING_SUBDIR = Path("state") / "live_waits_pending"
+LIVE_WAITS_LOCK_KEYWORDS = ("lock", "busy", "io error", "could not set", "blocked")
+REPLAY_DUE_HOUR_ET = 4
+REPLAY_DUE_MINUTE_ET = 30
+REPLAY_TIMEOUT_S = 240
+
+_live_write_cooldown_until = 0.0  # time.monotonic() deadline; in-process only
+
+# Anti-join on the key (not INSERT OR IGNORE): the live table may have been rebuilt without a PK.
+_LIVE_WRITE_SCRIPT = """import duckdb, os, sys
+db_path, csv_path = sys.argv[1], sys.argv[2]
+try:
+    con = duckdb.connect(db_path)
+    csv_sql = csv_path.replace("'", "''")
+    con.execute(f'''
+        INSERT INTO live_waits (entity_code, observed_at, wait_time_type, wait_time_minutes, park_date)
+        SELECT entity_code, observed_at, wait_time_type, wait_time_minutes, park_date
+        FROM (
+            SELECT DISTINCT ON (entity_code, observed_at, wait_time_type)
+                   entity_code, observed_at::TIMESTAMPTZ AS observed_at, wait_time_type,
+                   wait_time_minutes::INTEGER AS wait_time_minutes, park_date::DATE AS park_date
+            FROM read_csv_auto('{csv_sql}')
+        ) n
+        WHERE NOT EXISTS (
+            SELECT 1 FROM live_waits w
+            WHERE w.entity_code = n.entity_code AND w.observed_at = n.observed_at
+              AND w.wait_time_type = n.wait_time_type
+        )
+    ''')
+    con.execute('''
+        INSERT OR REPLACE INTO data_freshness (source, last_updated, row_count, notes)
+        VALUES ('scraper', CURRENT_TIMESTAMP, (SELECT COUNT(*) FROM live_waits), 'queue-times')
+    ''')
+    con.close()
+    os.unlink(csv_path)
+    print("OK")
+except Exception as e:
+    print(f"ERR:{e}", file=sys.stderr)
+    sys.exit(1)
+"""
+
+
+def _is_lock_error(e: Exception) -> bool:
+    if isinstance(e, subprocess.TimeoutExpired):
+        return True
+    error_str = str(e).lower()
+    return any(kw in error_str for kw in LIVE_WAITS_LOCK_KEYWORDS)
+
+
+def _run_live_write_once(db_path: Path, csv_path: Path, timeout_s: float) -> None:
+    """One subprocess attempt. Raises on failure. The subprocess deletes csv_path only on success."""
+    result = subprocess.run(
+        [sys.executable, "-c", _LIVE_WRITE_SCRIPT, str(db_path), str(csv_path)],
+        capture_output=True, text=True, timeout=timeout_s,
+    )
+    if result.returncode == 0 and "OK" in result.stdout:
+        return
+    raise RuntimeError(result.stderr[:300] if result.stderr else "subprocess failed")
+
+
+def _flush_pending_live_waits(db_path: Path, pending_dir: Path, logger: logging.Logger) -> None:
+    """Try each pending CSV once (oldest first); delete only on success; stop at first lock failure."""
+    files = sorted(pending_dir.glob("*.csv"))
+    if not files:
+        return
+    flushed = 0
+    for f in files:
+        try:
+            _run_live_write_once(db_path, f, LIVE_WRITE_ATTEMPT_TIMEOUT_S)
+            flushed += 1
+        except Exception as e:
+            if _is_lock_error(e):
+                break
+            logger.warning(f"Pending live_waits file {f.name} failed (kept): {e}")
+    logger.info(f"live_waits pending flush: {flushed} flushed, {len(files) - flushed} still pending")
+
+
 def _write_to_live_duckdb(
     df: pd.DataFrame,
     park_tz: ZoneInfo,
     output_base: Path,
     logger: logging.Logger,
-    max_retries: int = 5,
+    retry_budget_s: float = LIVE_WRITE_RETRY_BUDGET_S,
+    attempt_timeout_s: float = LIVE_WRITE_ATTEMPT_TIMEOUT_S,
 ) -> bool:
     """
     Append new wait time rows to tpcr_live.duckdb live_waits table.
     Uses subprocess to ensure DuckDB file handles are fully released after each write.
     The subprocess imports duckdb, writes, and exits — no persistent lock (#463).
+
+    Lock failures are retried with backoff for up to retry_budget_s. The batch is never
+    dropped: on failure its CSV stays in state/live_waits_pending/ and is flushed by a later
+    call (the daily staging replay backstops anything else).
     """
+    global _live_write_cooldown_until
     import time as _time
-    import subprocess
-    import tempfile
 
     if duckdb is None or df.empty:
         return False
@@ -172,75 +260,88 @@ def _write_to_live_duckdb(
 
     # Prepare data
     try:
-        df = df.copy()
-        df["park_date"] = derive_park_date(df["observed_at"], park_tz)
-        df = df.dropna(subset=["park_date"])
-        if df.empty:
-            return False
-        df = df[df["wait_time_minutes"] > 0]
-        if df.empty:
-            return False
+        df = prepare_live_waits_rows(df, park_tz, logger)
     except Exception as e:
         logger.warning(f"DuckDB data prep failed: {e}")
         return False
 
-    # Write data to temp CSV, then use subprocess to INSERT into DuckDB
-    # Subprocess ensures DuckDB connection is fully closed (no persistent file handles)
+    pending_dir = output_base / LIVE_WAITS_PENDING_SUBDIR
     try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as tmp:
-            tmp_path = tmp.name
-            df[["entity_code", "observed_at", "wait_time_type", "wait_time_minutes", "park_date"]].to_csv(tmp, index=False)
-    except Exception as e:
-        logger.warning(f"Failed to write temp CSV: {e}")
+        pending_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.warning(f"Could not create live_waits pending dir: {e}")
         return False
 
-    write_script = f'''import duckdb, os, sys
-try:
-    con = duckdb.connect("{db_path}")
-    con.execute("""
-        INSERT OR IGNORE INTO live_waits (entity_code, observed_at, wait_time_type, wait_time_minutes, park_date)
-        SELECT entity_code, observed_at::TIMESTAMPTZ, wait_time_type,
-               wait_time_minutes::INTEGER, park_date::DATE
-        FROM read_csv_auto("{tmp_path}")
-    """)
-    con.execute("""
-        INSERT OR REPLACE INTO data_freshness (source, last_updated, row_count, notes)
-        VALUES ('scraper', CURRENT_TIMESTAMP, (SELECT COUNT(*) FROM live_waits), 'queue-times')
-    """)
-    con.close()
-    os.unlink("{tmp_path}")
-    print("OK")
-except Exception as e:
-    print(f"ERR:{{e}}", file=sys.stderr)
-    sys.exit(1)
-'''
+    # Flush older pending batches first (single attempt each, so the cycle is not blocked)
+    in_cooldown = _time.monotonic() < _live_write_cooldown_until
+    if not in_cooldown:
+        _flush_pending_live_waits(db_path, pending_dir, logger)
 
-    for attempt in range(max_retries):
+    if df.empty:
+        return False
+
+    # Write data to a persistent pending CSV, then use subprocess to INSERT into DuckDB.
+    # The subprocess deletes the file only on success.
+    stamp = datetime.now(ZoneInfo("UTC")).strftime("%Y%m%dT%H%M%S")
+    tmp_path = pending_dir / f"{stamp}_{uuid.uuid4().hex}.csv"
+    try:
+        df.to_csv(tmp_path, index=False)
+    except Exception as e:
+        logger.warning(f"Failed to write pending CSV: {e}")
+        return False
+
+    if in_cooldown:
+        n_pending = len(list(pending_dir.glob("*.csv")))
+        logger.warning(f"live_waits cool-down active; parked {len(df)} rows in {tmp_path.name} ({n_pending} pending)")
+        return False
+
+    start = _time.monotonic()
+    backoff = LIVE_WRITE_BACKOFF_START_S
+    attempt = 0
+    while True:
+        attempt += 1
+        remaining = retry_budget_s - (_time.monotonic() - start)
         try:
-            result = subprocess.run(
-                [sys.executable, "-c", write_script],
-                capture_output=True, text=True, timeout=30,
-            )
-            if result.returncode == 0 and "OK" in result.stdout:
-                logger.debug(f"Wrote {len(df)} rows to live_waits (subprocess)")
-                return True
-            raise RuntimeError(result.stderr[:300] if result.stderr else "subprocess failed")
+            _run_live_write_once(db_path, tmp_path, min(attempt_timeout_s, max(1.0, remaining)))
+            logger.debug(f"Wrote {len(df)} rows to live_waits (subprocess, attempt {attempt})")
+            return True
         except Exception as e:
-            error_str = str(e).lower()
-            is_lock = any(kw in error_str for kw in ("lock", "busy", "io error", "could not set", "blocked"))
-            if is_lock and attempt < max_retries - 1:
-                wait_s = 1.0 * (attempt + 1)
-                logger.debug(f"DuckDB write lock (attempt {attempt + 1}/{max_retries}), retrying in {wait_s}s...")
-                _time.sleep(wait_s)
-                continue
-            logger.warning(f"DuckDB write failed after {attempt + 1} attempts: {e}")
-            try:
-                import os as _os
-                _os.unlink(tmp_path)
-            except OSError:
-                pass
-            return False
+            remaining = retry_budget_s - (_time.monotonic() - start)
+            if not _is_lock_error(e):
+                logger.warning(f"DuckDB write failed (no retry); batch kept in {tmp_path}: {e}")
+                return False
+            if remaining <= 0:
+                _live_write_cooldown_until = _time.monotonic() + LIVE_WRITE_COOLDOWN_S
+                logger.warning(
+                    f"DuckDB write lock persisted {retry_budget_s:.0f}s ({attempt} attempts); "
+                    f"batch kept in pending file {tmp_path}"
+                )
+                return False
+            wait_s = min(backoff, LIVE_WRITE_BACKOFF_MAX_S, remaining)
+            logger.debug(f"DuckDB write lock (attempt {attempt}), retrying in {wait_s:.1f}s...")
+            _time.sleep(wait_s)
+            backoff = min(backoff * 2, LIVE_WRITE_BACKOFF_MAX_S)
 
+
+def replay_due(now_et: datetime, last_replay_date: Optional[date]) -> bool:
+    """True once per ET calendar date, at/after 04:30 ET (before morning ETL merges staging)."""
+    if (now_et.hour, now_et.minute) < (REPLAY_DUE_HOUR_ET, REPLAY_DUE_MINUTE_ET):
+        return False
+    return last_replay_date != now_et.date()
+
+
+def _run_live_waits_replay(output_base: Path, logger: logging.Logger) -> bool:
+    """Run replay_live_waits.py as a subprocess; never raises."""
+    cmd = [sys.executable, str(Path(__file__).parent / "replay_live_waits.py"),
+           "--output-base", str(output_base), "--days", "2"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=REPLAY_TIMEOUT_S)
+        if result.returncode == 0:
+            logger.info(f"live_waits replay OK: {(result.stdout or '').strip()[-300:]}")
+            return True
+        logger.warning(f"live_waits replay failed (rc={result.returncode}): {(result.stderr or result.stdout)[-300:]}")
+    except Exception as e:
+        logger.warning(f"live_waits replay error: {e}")
     return False
 
 def load_queue_times_mapping(config_dir: Path) -> Optional[pd.DataFrame]:
@@ -921,6 +1022,7 @@ def main() -> None:
     if args.interval:
         logger.info(f"Continuous mode: interval={args.interval}s. Ctrl+C to stop.")
         run = 0
+        last_replay_date: Optional[date] = None
         try:
             while True:
                 run += 1
@@ -932,7 +1034,16 @@ def main() -> None:
                     logger.info(f"Sleeping {args.interval}s...")
                     time.sleep(args.interval)
                     continue
-                
+
+                # Daily live_waits replay from staging (backstop for batches lost to the s11 write lock)
+                try:
+                    now_et = datetime.now(ZoneInfo("America/New_York"))
+                    if replay_due(now_et, last_replay_date):
+                        last_replay_date = now_et.date()
+                        _run_live_waits_replay(output_base, logger)
+                except Exception as e:
+                    logger.warning(f"live_waits replay check failed: {e}")
+
                 try:
                     total_rows = run_once()
                     if total_rows > 0:
