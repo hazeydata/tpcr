@@ -286,17 +286,19 @@ Creates a single table: for every (entity_code, park_date) combination, is that 
 `pipeline/steps/s04_aggregates.py` rebuilds `aggregates/model_aggregates.parquet` on every production run, using `pipeline/core/model_aggregates.py` (also behind `scripts/build_model_aggregates.py`):
 
 - **Input:** `fact_tables/parquet/*.parquet` POSTED rows with wait > 0, park dates through yesterday, all history; `dimdategroupid.csv`; `dimentity.csv` (fastpass booths excluded).
-- **Dedupe:** one row per natural key (entity_code, observed_at, wait_time_type) before aggregating.
+- **Dedupe:** one row per natural key (entity_code, observed_at, wait_time_type, park_date) before aggregating.
 - **Grouping:** entity_code × date_group_id × 15-minute clock slot (`time_slot` 0–95 = hour*4 + minute//15) and hour_of_day.
 - **Stats:** median, mean, p25, p75, std, min, max, a 2-year half-life weighted mean, sample_count, date_count, min/max park_date.
 - **Minimum count:** cells with fewer than 5 observations are not written (absent, never 0).
 - **Write:** to a temp file, validated (schema, 96 slots, 24 hours, max park_date ≥ yesterday), then atomically renamed. Sidecar `model_aggregates.meta.json` records build time, row count and input max date.
 - **Failure:** the previous file is left untouched, S4 raises, the run stops and exits nonzero.
-- **Readers:** S8 forecast (`wait_median` as posted_time; every fallback to 5 minutes is logged with entity and reason, and counted) and `dashboard/api.py`.
+- **Shadow mode:** S4 does not rebuild. It validates the production file (row count and freshness: sidecar/max park_date ≥ yesterday) and fails if stale.
+- **Readers:** S8 forecast (`wait_median` as posted_time; every fallback to 5 minutes is logged with entity and reason, and counted; warns, does not fail, on a stale file or a missing sidecar) and `dashboard/api.py`.
 - **Output:** ~6.4M rows, ~85 MB.
 
 ---
 
+<a name="step-4-wait-time-db-report"></a>
 ## Step 4: Wait Time DB Report
 
 **Script:** `scripts/report_wait_time_db.py`  

@@ -35,6 +35,7 @@ except ImportError:
 from pipeline.config import PipelineConfig
 from pipeline.core.db import read_connection
 from pipeline.core.logging import PipelineLogger
+from pipeline.core.model_aggregates import check_aggregates_freshness
 from pipeline.core.park_codes import PARK_TIMEZONE, entity_to_park
 from pipeline.core.validation import ValidationError, require_file
 
@@ -490,6 +491,10 @@ def _load_aggregates_indexed(cfg: PipelineConfig, log: PipelineLogger) -> dict:
     if not agg_path.exists():
         log.warning(f"No aggregates file at {agg_path}: every entity will use posted_time={POSTED_DEFAULT} (logged per entity)")
         return {}
+
+    fresh, _max_date, reason = check_aggregates_freshness(agg_path)
+    if not fresh:
+        log.warning(f"Aggregates file is stale: {reason} (posted_time may be out of date)")
 
     with read_connection() as con:
         df = con.execute(f"""

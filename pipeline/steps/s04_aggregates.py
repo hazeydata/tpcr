@@ -1,6 +1,6 @@
 """Step 4: Posted Aggregates.
 
-Rebuilds aggregates/model_aggregates.parquet every run: the posted-wait
+Rebuilds aggregates/model_aggregates.parquet every production run: the posted-wait
 median, mean, percentiles and 2-year half-life weighted mean for each
 entity x date_group_id x 15-minute clock slot (0-95), over all history
 through yesterday. Input is de-duplicated on the natural key, cells with
@@ -12,14 +12,19 @@ fails and the run exits nonzero. There is no 'missing' success path.
 A sidecar model_aggregates.meta.json records build time, row count and
 input max date. Read by S8 (posted_time) and the dashboard API.
 
-Shadow mode only validates the production file.
+Shadow mode does not rebuild: it validates the production file's row count
+AND freshness (sidecar/max park_date >= yesterday) and fails if stale.
 """
 
 from __future__ import annotations
 
 from pipeline.config import PipelineConfig
 from pipeline.core.logging import PipelineLogger
-from pipeline.core.model_aggregates import AggregateBuildError, build_model_aggregates
+from pipeline.core.model_aggregates import (
+    AggregateBuildError,
+    build_model_aggregates,
+    check_aggregates_freshness,
+)
 from pipeline.core.validation import ValidationError, require_parquet_rows
 
 
@@ -36,8 +41,12 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
         log.info("Shadow mode: validating production aggregates")
         try:
             n_rows = require_parquet_rows(agg_path, min_rows=10000, description="Model aggregates")
-            log.info(f"Aggregates: {n_rows:,} entries \u2714")
-            return {"rows": n_rows, "action": "validated"}
+            fresh, max_date, reason = check_aggregates_freshness(agg_path)
+            if not fresh:
+                log.error(f"Aggregates are stale: {reason}")
+                raise ValidationError(f"S4 aggregate build failed: stale aggregates file: {reason}")
+            log.info(f"Aggregates: {n_rows:,} entries, {reason} \u2714")
+            return {"rows": n_rows, "action": "validated", "max_park_date": max_date.isoformat()}
         except Exception as e:
             log.error(f"Aggregates validation failed: {e}")
             raise

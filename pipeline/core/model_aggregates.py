@@ -8,7 +8,7 @@ half-life weighted mean over all history. Two changes from that builder,
 both from the spec:
 
 * The input is de-duplicated on the natural key
-  (entity_code, observed_at, wait_time_type) before aggregating, so a
+  (entity_code, observed_at, wait_time_type, park_date) before aggregating, so a
   re-appended row (the Oct 10-11 duplicates) counts once.
 * A cell with fewer than ``min_count`` observations is not written.
 
@@ -279,6 +279,44 @@ def _validate(con, path: Path, yesterday: date, require_full_day: bool) -> dict:
     if maxd is None or maxd < yesterday:
         raise AggregateBuildError(f"stale input: max park_date {maxd} < yesterday {yesterday}")
     return {"rows": int(rows), "entities": int(ents), "max_park_date": maxd, "min_sample_count": int(minn)}
+
+
+def check_aggregates_freshness(
+    path: Path, as_of: date | None = None
+) -> tuple[bool, date | None, str]:
+    """Is the aggregates file current? Same rule as _validate: max park_date >= yesterday.
+
+    Prefers the sidecar's output_max_park_date (and checks its row_count against
+    the file); without a readable sidecar, falls back to the parquet itself.
+    Returns (fresh, max_park_date, reason).
+    """
+    yesterday = (as_of or date.today()) - timedelta(days=1)
+    sidecar = sidecar_path_for(path)
+    meta = None
+    if sidecar.exists():
+        try:
+            meta = json.loads(sidecar.read_text())
+            max_date = date.fromisoformat(meta["output_max_park_date"])
+        except Exception:
+            meta = None
+    con = duckdb.connect()
+    try:
+        src = f"read_parquet('{_q(path)}')"
+        if meta is None:
+            max_date = con.execute(f"SELECT MAX(max_park_date) FROM {src}").fetchone()[0]
+            note = "no sidecar" if not sidecar.exists() else "unreadable sidecar"
+        else:
+            note = "sidecar"
+            expected = meta.get("row_count")
+            if expected is not None:
+                rows = con.execute(f"SELECT COUNT(*) FROM {src}").fetchone()[0]
+                if int(expected) != int(rows):
+                    return False, max_date, f"sidecar row_count {expected} != file rows {rows}"
+    finally:
+        con.close()
+    if max_date is None or max_date < yesterday:
+        return False, max_date, f"max park_date {max_date} < yesterday {yesterday} ({note})"
+    return True, max_date, f"max park_date {max_date} ({note})"
 
 
 def _unlink(p: Path) -> None:

@@ -17,7 +17,8 @@ import pytest
 from pipeline.config import load_config
 from pipeline.core.logging import PipelineLogger
 from pipeline.core.model_aggregates import (
-    EXPECTED_SCHEMA, AggregateBuildError, build_model_aggregates, sidecar_path_for,
+    EXPECTED_SCHEMA, AggregateBuildError, build_model_aggregates, check_aggregates_freshness,
+    sidecar_path_for,
 )
 from pipeline.core.validation import ValidationError
 from pipeline.steps import s04_aggregates, s08_forecast
@@ -255,3 +256,104 @@ def test_time_slot_is_park_local_wall_clock(tmp_path):
     want = facts[facts.observed_at.str.slice(11, 16) == "10:30"].wait_time_minutes.median()
     row = df[df.time_slot == 42].iloc[0]
     assert row.hour_of_day == 10 and row.wait_median == want
+
+
+def test_rows_dated_today_are_excluded(tmp_path):
+    facts = _small_facts()
+    today = facts[facts.park_date == YESTERDAY].copy()
+    today["park_date"] = AS_OF
+    today["observed_at"] = today.observed_at.str.replace(YESTERDAY.isoformat(), AS_OF.isoformat())
+    today["wait_time_minutes"] = 999
+    base = _base(tmp_path / "with", pd.concat([facts, today], ignore_index=True))
+    build_model_aggregates(base, as_of=AS_OF)
+    got = _read(base)
+    assert got.max_park_date.max() == YESTERDAY and got.wait_max.max() < 999
+    ref = _base(tmp_path / "without", facts)
+    build_model_aggregates(ref, as_of=AS_OF)
+    pd.testing.assert_frame_equal(got, _read(ref))
+
+
+def test_zero_waits_are_excluded(tmp_path):
+    facts = _small_facts()
+    zeros = facts[facts.entity_code == "MK01"].copy()
+    zeros["observed_at"] = zeros.observed_at.str.replace(":00-04:00", ":30-04:00")  # distinct keys
+    zeros["wait_time_minutes"] = 0
+    base = _base(tmp_path / "with", pd.concat([facts, zeros], ignore_index=True))
+    build_model_aggregates(base, as_of=AS_OF)
+    got = _read(base)
+    assert (got.wait_min > 0).all()
+    ref = _base(tmp_path / "without", facts)
+    build_model_aggregates(ref, as_of=AS_OF)
+    pd.testing.assert_frame_equal(got, _read(ref))
+
+
+# ------------------------------------------------ shadow freshness / S8 warning
+
+def _write_agg(base: Path, max_date: date, sidecar: bool = True, rows: int = 10000) -> Path:
+    path = base / "aggregates" / "model_aggregates.parquet"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df = pd.DataFrame({
+        "entity_code": [f"E{i % 50:02d}" for i in range(rows)],
+        "date_group_id": "DG000", "time_slot": np.arange(rows) % 96,
+        "hour_of_day": (np.arange(rows) % 96) // 4, "wait_median": 10.0, "wait_mean": 10.0,
+        "wait_p25": 5.0, "wait_p75": 15.0, "wait_std": 1.0, "wait_min": 5, "wait_max": 20,
+        "wait_mean_weighted": 10.0, "sample_count": 9, "date_count": 3,
+        "min_park_date": date(2026, 1, 1), "max_park_date": max_date,
+    })
+    df.to_parquet(path, index=False)
+    if sidecar:
+        sidecar_path_for(path).write_text(json.dumps(
+            {"row_count": rows, "output_max_park_date": max_date.isoformat()}))
+    return path
+
+
+def _today_is_as_of(monkeypatch):
+    monkeypatch.setattr("pipeline.core.model_aggregates.date",
+                        type("D", (date,), {"today": staticmethod(lambda: AS_OF)}))
+
+
+def test_check_aggregates_freshness_rules(tmp_path):
+    path = _write_agg(tmp_path, YESTERDAY)
+    assert check_aggregates_freshness(path, AS_OF)[:2] == (True, YESTERDAY)
+    assert check_aggregates_freshness(path, AS_OF + timedelta(days=1))[0] is False
+    sidecar_path_for(path).write_text(json.dumps(
+        {"row_count": 5, "output_max_park_date": YESTERDAY.isoformat()}))
+    fresh, _, reason = check_aggregates_freshness(path, AS_OF)
+    assert not fresh and "sidecar row_count 5 != file rows 10000" in reason
+
+
+@pytest.mark.parametrize("sidecar", [True, False])
+def test_shadow_s4_fails_on_stale_file(tmp_path, monkeypatch, sidecar):
+    _today_is_as_of(monkeypatch)
+    base = tmp_path / "pipeline"
+    _write_agg(base, date(2026, 2, 10), sidecar=sidecar)
+    cfg = load_config(output_base=base, shadow=True)
+    with pytest.raises(ValidationError, match="stale"):
+        s04_aggregates.run(cfg, PipelineLogger("s04_test"))
+
+
+def test_shadow_s4_fresh_file_passes(tmp_path, monkeypatch):
+    _today_is_as_of(monkeypatch)
+    base = tmp_path / "pipeline"
+    _write_agg(base, YESTERDAY)
+    res = s04_aggregates.run(load_config(output_base=base, shadow=True), PipelineLogger("s04_test"))
+    assert res["action"] == "validated" and res["max_park_date"] == YESTERDAY.isoformat()
+
+
+def test_shadow_s4_stale_without_sidecar_fails(tmp_path, monkeypatch):
+    _today_is_as_of(monkeypatch)
+    base = tmp_path / "pipeline"
+    _write_agg(base, date(2026, 2, 10), sidecar=False)
+    with pytest.raises(ValidationError, match="no sidecar"):
+        s04_aggregates.run(load_config(output_base=base, shadow=True), PipelineLogger("s04_test"))
+
+
+def test_s8_warns_on_stale_aggregates_without_sidecar(tmp_path, monkeypatch, caplog):
+    _today_is_as_of(monkeypatch)
+    base = tmp_path / "pipeline"
+    _write_agg(base, date(2026, 2, 10), sidecar=False)
+    with caplog.at_level(logging.WARNING):
+        out = s08_forecast._load_aggregates_indexed(load_config(output_base=base), PipelineLogger("s08_test"))
+    assert out
+    warn = " ".join(r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
+    assert "stale" in warn and "no sidecar" in warn
