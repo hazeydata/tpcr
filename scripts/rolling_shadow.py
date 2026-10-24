@@ -287,12 +287,12 @@ def production_trained_entities(run_date, base=None):
     return trained or None
 
 
-def record_training(challenger, result, run_date, base=None):
+def record_training(challenger, result, run_date, base=None, extinct_on=None):
     """Write trained_at / entity_count to the registry entry.
 
     Returns an error string when the challenger's trained entity set differs from
-    the production S7 trained set of the same run (the diff is printed), or when
-    that set cannot be found; else None.
+    the production S7 trained set of the same run minus extinct entities (R1a; the
+    diff is printed), or when that set cannot be found; else None.
     """
     challenger["trained_at"] = result["trained_at"]
     challenger["entity_count"] = result["entity_count"]
@@ -301,16 +301,25 @@ def record_training(challenger, result, run_date, base=None):
     if prod is None:
         print(f"  No production S7 trained set found for {run_date}")
         return f"{name}: production S7 trained set not found for {run_date}"
+    from pipeline.competition import eligibility  # lazy: same is_extinct as the eligible list
+
+    excluded = eligibility.extinct_entities(prod, run_date, output_base=base or PIPELINE_BASE,
+                                            extinct_on=extinct_on)
+    required = prod - excluded
+    codes = f" {sorted(excluded)}" if 0 < len(excluded) <= 20 else ""
+    print(f"  AC5: production trained {len(prod)}, extinct excluded {len(excluded)}{codes}, "
+          f"denominator {len(required)}")
     trained = set(result.get("trained_entities") or [])
-    if trained == prod:
+    if trained == required:
         return None
-    missing, extra = sorted(prod - trained), sorted(trained - prod)
+    missing, extra = sorted(required - trained), sorted(trained - required)
     skipped = result.get("skipped") or {}
     detail = ", ".join(f"{e}={r}" for e, r in sorted(skipped.items())) or "none recorded"
-    print(f"  entity set != production S7 trained set ({len(trained)} vs {len(prod)}); "
-          f"missing: {missing}; extra: {extra}; skipped: {detail}")
-    return (f"{name}: entity set != production S7 trained set for {run_date} "
-            f"(missing {missing}, extra {extra}; skipped: {detail})")
+    print(f"  entity set != production S7 trained set minus extinct ({len(trained)} vs "
+          f"{len(required)}); missing: {missing}; extra: {extra}; skipped: {detail}")
+    return (f"{name}: entity set != production S7 trained set minus extinct for {run_date} "
+            f"(missing {missing}, extra {extra}; extinct excluded {len(excluded)}; "
+            f"skipped: {detail})")
 
 
 # --- Step 1: Generate shadow forecasts ---
