@@ -97,3 +97,52 @@ def test_bot_pops_anthropic_log_after_load_dotenv_before_ask_agent_import():
     pop = src.index('os.environ.pop("ANTHROPIC_LOG", None)')
     imp = src.index("from ask_agent import")
     assert dotenv < pop < imp
+
+
+_PINNED = ("anthropic", "httpx", "httpcore", "httpx2", "httpcore2")
+
+
+def test_bot_import_pins_all_sdk_loggers_without_ask_path(bot):
+    """Import-time pin only: reset levels, reload bot, never call /ask."""
+    import importlib
+    saved = {n: logging.getLogger(n).level for n in _PINNED}
+    try:
+        for n in _PINNED:
+            logging.getLogger(n).setLevel(logging.NOTSET)
+        importlib.reload(bot)
+        for n in _PINNED:
+            assert logging.getLogger(n).level == logging.WARNING, n
+    finally:
+        for n, lvl in saved.items():
+            logging.getLogger(n).setLevel(lvl)
+
+
+def test_ac33_claude_loop_repins_anthropic_logger(bot, monkeypatch, caplog):
+    """Something lowering the anthropic logger after bot import must not survive an /ask call."""
+    monkeypatch.setenv("TPCR_ASK_PROVIDER", "anthropic")
+    monkeypatch.setattr(bot, "ANTHROPIC_API_KEY", SECRET)
+    real = anthropic.AsyncAnthropic
+    seen = []
+
+    def client(*a, **k):
+        k["http_client"] = httpx.AsyncClient(transport=httpx.MockTransport(_handler))
+        c = real(*a, **k)
+        seen.append(c)
+        return c
+
+    saved = logging.getLogger("anthropic").level
+    try:
+        logging.getLogger("anthropic").setLevel(logging.DEBUG)
+        with patch("anthropic.AsyncAnthropic", client), \
+             patch("ask_agent._chat", AsyncMock(side_effect=aa.QwenHTTPError(500, "down"))), \
+             patch("ask_agent.track_usage", return_value=(1, -1)), \
+             patch("ask_agent.log_question"), \
+             caplog.at_level(logging.DEBUG):
+            call_ask(bot, make_interaction([]))
+        assert seen, "the anthropic SDK path was not exercised"
+        assert logging.getLogger("anthropic").level == logging.WARNING
+        leaked = [(r.name, r.getMessage()) for r in caplog.records
+                  if r.levelno == logging.DEBUG and r.name.split(".")[0] in _PINNED]
+        assert leaked == [], leaked
+    finally:
+        logging.getLogger("anthropic").setLevel(saved)
