@@ -31,6 +31,7 @@ import pandas as pd
 from pipeline.config import PipelineConfig
 from pipeline.core.db import read_connection
 from pipeline.core.logging import PipelineLogger
+from pipeline.models import bias_guard
 
 
 def _extract_date(filename: str) -> str | None:
@@ -522,6 +523,24 @@ def _generate_summary(cfg: PipelineConfig, log: PipelineLogger) -> dict:
     return summary
 
 
+def _update_bias_guard(cfg: PipelineConfig, log: PipelineLogger, run_date: str) -> list[str]:
+    slot_path = cfg.accuracy_dir / "slot_accuracy.parquet"
+    if not slot_path.exists():
+        log.info("Bias guard: no slot_accuracy.parquet yet")
+        return []
+    cols = ["entity_code", "park_date", "time_slot", "prediction_method",
+            "signed_error", "absolute_error", "evaluation_date"]
+    slot_df = pd.read_parquet(slot_path, columns=cols)
+    as_of = datetime.strptime(run_date, "%Y-%m-%d").date() - timedelta(days=1)
+    result = bias_guard.evaluate(slot_df, as_of, bias_guard.load(cfg.state_dir).get("entities"))
+    bias_guard.save(result, cfg.state_dir, cfg.accuracy_dir)
+    for code in result["guarded"]:
+        e = result["entities"][code]
+        log.warning(f"Bias guard: {code} -> fallback (bias={e['bias']:+.1f}, mae={e['mae']:.1f}, n={e['n_slots']}, {e['basis']})")
+    log.info(f"Bias guard: {len(result['guarded'])} entities routed to fallback ({bias_guard.REASON})")
+    return result["guarded"]
+
+
 def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
     """Evaluate forecast accuracy and archive current forecast."""
 
@@ -565,11 +584,15 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
     with log.timed("generate summary"):
         summary = _generate_summary(cfg, log)
 
+    with log.timed("bias guard"):
+        guarded = _update_bias_guard(cfg, log, run_date)
+
     return {
         "rows": total_new,
         "eval_dates": len(eval_dates),
         "entity_rows": len(entity_df) if entity_df is not None else 0,
         "wti_rows": len(wti_df) if wti_df is not None else 0,
+        "bias_guarded": guarded,
         "summary": {k: v for k, v in summary.items()
                     if k in ("overall_mae", "overall_bias", "dates_evaluated", "entities_evaluated")},
     }
