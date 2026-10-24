@@ -58,7 +58,7 @@ def insert_missing_live_waits(con, df: pd.DataFrame) -> int:
         return 0
     con.register("_live_waits_new", df[list(LIVE_WAITS_COLUMNS)])
     try:
-        row = con.execute("""
+        rows = con.execute("""
             INSERT INTO live_waits (entity_code, observed_at, wait_time_type, wait_time_minutes, park_date)
             SELECT entity_code, observed_at, wait_time_type, wait_time_minutes, park_date
             FROM (
@@ -76,7 +76,7 @@ def insert_missing_live_waits(con, df: pd.DataFrame) -> int:
                   AND w.observed_at = n.observed_at
                   AND w.wait_time_type = n.wait_time_type
             )
-        """).fetchone()
-        return int(row[0]) if row else 0
+        """).fetchall()
+        return int(rows[0][0]) if rows else 0
     finally:
         con.unregister("_live_waits_new")
