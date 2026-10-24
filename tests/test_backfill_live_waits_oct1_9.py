@@ -648,6 +648,78 @@ def test_simulated_permission_error_refused_before_connect(env, capsys, monkeypa
     assert sha(env["db"]) == before
 
 
+def _unreadable_target(env, which):
+    if which == "read":
+        return env["clean"] / "mk_2026-10-05.csv"
+    path = env["clean"].parent / "2026-09" / "mk_2026-09-01.csv"
+    write_csv(path, day_rows("2026-09-01"))
+    return path
+
+
+def _assert_refused_untouched(env, rc, out, path, connect_spy, before):
+    assert rc == 2
+    assert "REFUSED" in out and str(path) in out
+    assert connect_spy == []
+    assert sha(env["db"]) == before and counts(env["db"]) == {}
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permissions")
+@pytest.mark.parametrize("which", ["read", "unread"])
+@pytest.mark.parametrize("mode", [["--apply"], []])
+def test_unreadable_file_under_clean_refused(env, capsys, connect_spy, mode, which):
+    path = _unreadable_target(env, which)
+    before = sha(env["db"])
+    path.chmod(0o000)
+    try:
+        rc = run(env, *mode)
+    finally:
+        path.chmod(0o644)
+    _assert_refused_untouched(env, rc, capsys.readouterr().out, path, connect_spy, before)
+
+
+@pytest.mark.parametrize("which", ["read", "unread"])
+@pytest.mark.parametrize("mode", [["--apply"], []])
+def test_simulated_unreadable_file_refused(env, capsys, monkeypatch, connect_spy, mode, which):
+    path = _unreadable_target(env, which)
+    real_access = os.access
+
+    def fake_access(p, m, *a, **k):
+        if Path(p) == path:
+            return False
+        return real_access(p, m, *a, **k)
+
+    monkeypatch.setattr(bf.os, "access", fake_access)
+    before = sha(env["db"])
+    rc = run(env, *mode)
+    _assert_refused_untouched(env, rc, capsys.readouterr().out, path, connect_spy, before)
+
+
+@pytest.mark.parametrize("mode", [["--apply"], []])
+def test_hash_oserror_refused_before_connect(env, capsys, monkeypatch, connect_spy, mode):
+    path = env["clean"] / "mk_2026-10-05.csv"
+
+    def boom(*a, **k):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(bf, "hash_files", boom)
+    before = sha(env["db"])
+    rc = run(env, *mode)
+    _assert_refused_untouched(env, rc, capsys.readouterr().out, path, connect_spy, before)
+
+
+@pytest.mark.parametrize("mode", [["--apply"], []])
+def test_read_day_oserror_refused_before_connect(env, capsys, monkeypatch, connect_spy, mode):
+    path = env["clean"] / "mk_2026-10-05.csv"
+
+    def boom(*a, **k):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(bf, "read_day", boom)
+    before = sha(env["db"])
+    rc = run(env, *mode)
+    _assert_refused_untouched(env, rc, capsys.readouterr().out, path, connect_spy, before)
+
+
 @pytest.mark.parametrize("mode", [["--apply"], []])
 def test_offpath_symlink_refused_before_any_connect(env, tmp_path, capsys, connect_spy, mode):
     outside = tmp_path / "outside_dir"

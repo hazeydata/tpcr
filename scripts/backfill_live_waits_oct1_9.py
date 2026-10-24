@@ -110,7 +110,8 @@ def _refuse_symlinks_under(clean_root: Path) -> None:
     """Fail closed: raise RefusedPath if any file or dir, at any depth, under clean_root is a symlink.
 
     Walks the whole tree (on or off the read path) and never follows links. Any OSError during the walk
-    (unreadable dir or entry) also refuses (Spec R3a). Runs before any DB open.
+    (an unreadable dir) also refuses (Spec R3a), as does any non-symlink file that is not readable
+    (os.access R_OK). Runs before any DB open.
     """
     def _unreadable(err: OSError) -> None:
         raise RefusedPath(f"{err.filename}: cannot read ({err.strerror}); refusing")
@@ -120,6 +121,10 @@ def _refuse_symlinks_under(clean_root: Path) -> None:
             entry = Path(dirpath) / name
             if entry.is_symlink():
                 raise RefusedPath(f"{entry} is a symlink; refusing")
+        for name in filenames:
+            entry = Path(dirpath) / name
+            if not entry.is_symlink() and not os.access(entry, os.R_OK):
+                raise RefusedPath(f"{entry}: file not readable; refusing")
 
 
 def _check_under_clean(path: Path, clean_root: Path) -> Path:
@@ -435,7 +440,10 @@ def run_load(args, ob: Path, db: Path, now, state: dict) -> int:
             raise RefusedPath(f"database not found: {db}")
         key = parse_load_key(args.load_key) if args.load_key is not None else new_load_key()
         files = [f for d in DAYS for f in by_day[d]]
-        hashes = hash_files(files)
+        try:
+            hashes = hash_files(files)
+        except OSError as e:
+            raise RefusedPath(f"{e.filename}: cannot read ({e.strerror}); refusing") from e
     except (RefusedPath, ValueError) as e:
         print(f"REFUSED: {e}")
         return EXIT_PATH
@@ -447,7 +455,11 @@ def run_load(args, ob: Path, db: Path, now, state: dict) -> int:
         return bool(changed)
 
     print(f"output base: {ob}\ndb: {db}\ntarget files: {len(files)}\nmode: {'LOAD' if args.apply else 'DRY RUN'}")
-    plans = {d: read_day(by_day[d], d) for d in DAYS}
+    try:
+        plans = {d: read_day(by_day[d], d) for d in DAYS}
+    except OSError as e:
+        print(f"REFUSED: {e.filename}: cannot read ({e.strerror}); nothing written")
+        return EXIT_PATH
     if checksum_changed():
         print("Clean files changed during the run; aborting before any write.")
         return EXIT_CHECKSUM
