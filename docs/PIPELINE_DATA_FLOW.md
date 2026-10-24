@@ -293,7 +293,7 @@ Creates a single table: for every (entity_code, park_date) combination, is that 
 - **Write:** to a temp file, validated (schema, 96 slots, 24 hours, max park_date ≥ yesterday), then atomically renamed. Sidecar `model_aggregates.meta.json` records build time, row count and input max date.
 - **Failure:** the previous file is left untouched, S4 raises, the run stops and exits nonzero.
 - **Shadow mode:** S4 does not rebuild. It validates the production file (row count and freshness: sidecar/max park_date ≥ yesterday) and fails if stale.
-- **Readers:** S8 forecast (`wait_median` as posted_time; every fallback to 5 minutes is logged with entity and reason, and counted; warns, does not fail, on a stale file or a missing sidecar) and `dashboard/api.py`.
+- **Readers:** S8 forecast (`wait_median` as posted_time; every fallback to 5 minutes is logged with entity and reason, and counted; warns, does not fail, only when the file is stale, i.e. max park_date < yesterday, read from the sidecar or, if the sidecar is missing or unreadable, from the parquet itself; a fresh file with no sidecar gives no warning) and `dashboard/api.py`.
 - **Output:** ~6.4M rows, ~85 MB.
 
 ---

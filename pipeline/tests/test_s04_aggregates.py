@@ -287,6 +287,53 @@ def test_zero_waits_are_excluded(tmp_path):
     pd.testing.assert_frame_equal(got, _read(ref))
 
 
+def test_non_posted_rows_are_excluded(tmp_path):
+    facts = _small_facts(entities=("MK01", "EP02"), days=6)
+    slot10 = facts.observed_at.str.slice(11, 16) == "02:30"  # slot 10
+    short_days = [YESTERDAY - timedelta(days=k) for k in (4, 5)]
+    # MK01 slot 10 keeps 4 POSTED obs; two ACTUAL obs would lift it to min_count if counted.
+    drop = (facts.entity_code == "MK01") & slot10 & facts.park_date.isin(short_days)
+    actual_short = facts[drop].copy()
+    posted = facts[~drop].reset_index(drop=True)
+    # ACTUAL rows at every POSTED slot with very different waits (same observed_at, distinct key).
+    actual = posted.copy()
+    actual["wait_time_type"] = "ACTUAL"
+    actual["wait_time_minutes"] = 900
+    actual_short["wait_time_type"] = "ACTUAL"
+    actual_short["wait_time_minutes"] = 900
+    base = _base(tmp_path / "with", pd.concat([posted, actual, actual_short], ignore_index=True), groups=1)
+    build_model_aggregates(base, as_of=AS_OF)
+    got = _read(base)
+    assert got.wait_max.max() < 900
+    assert got[(got.entity_code == "MK01") & (got.time_slot == 10)].empty
+    mk = got[(got.entity_code == "MK01") & (got.time_slot == 42)].iloc[0]
+    want = posted[(posted.entity_code == "MK01")
+                  & (posted.observed_at.str.slice(11, 16) == "10:30")].wait_time_minutes
+    assert mk.sample_count == len(want) == 6 and mk.wait_median == want.median()
+    ref = _base(tmp_path / "without", posted, groups=1)
+    build_model_aggregates(ref, as_of=AS_OF)
+    pd.testing.assert_frame_equal(got, _read(ref))
+
+
+def test_duplicate_keys_keep_max_wait(tmp_path):
+    low = _small_facts(entities=("MK01",), days=6)
+    low["wait_time_minutes"] = low.wait_time_minutes % 60 + 1  # 1..60
+    high = low.copy()
+    high["wait_time_minutes"] = low.wait_time_minutes + 40  # same key, larger wait
+    base = _base(tmp_path / "with", low, groups=1)
+    _write_facts(base, high, "wait_times_2026-10_restaged.parquet")
+    res = build_model_aggregates(base, as_of=AS_OF)
+    assert res.duplicate_rows_dropped == len(low)
+    got = _read(base)
+    sel = high[high.observed_at.str.slice(11, 16) == "10:30"].wait_time_minutes
+    row = got[got.time_slot == 42].iloc[0]
+    assert row.sample_count == len(sel) == 6
+    assert row.wait_min == sel.min() and row.wait_median == sel.median() and row.wait_max == sel.max()
+    ref = _base(tmp_path / "without", high, groups=1)
+    build_model_aggregates(ref, as_of=AS_OF)
+    pd.testing.assert_frame_equal(got, _read(ref))
+
+
 # ------------------------------------------------ shadow freshness / S8 warning
 
 def _write_agg(base: Path, max_date: date, sidecar: bool = True, rows: int = 10000) -> Path:
