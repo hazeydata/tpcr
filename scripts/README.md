@@ -323,29 +323,25 @@ python scripts/inspect_entity_index.py --limit 50
 
 ### `backfill_live_waits_oct1_9.py` (one-off, TPCR-BACKFILL-OCT1-9)
 
-Backfills `tpcr_live.duckdb` `live_waits` for park dates 2026-10-01..09 from `fact_tables/clean/2026-10/{park}_{date}.csv`. Rows are prepped with the scraper's own `prepare_live_waits_rows` (6 AM rule, wait > 0, non-empty keys) and inserted with `insert_missing_live_waits` (anti-join on `entity_code, observed_at, wait_time_type`), so it is idempotent. Reads only under `fact_tables/clean` (anything resolving elsewhere, symlinked dirs, or `raw/` is refused); never writes a CSV.
-
-**Parity gate (always runs first, also with `--dry-run`):** the clean CSVs for `--parity-date` (default 2026-10-12) are compared with `live_waits` for that date, read-only: row count (`--row-tol`, 2%), entity set (`--entity-tol`, 2%), `wait_time_type` mix, and TouringPlans POSTED rows mixed into the clean files (`--tp-posted-tol`, 1%). On failure nothing is loaded.
+Loads the Oct 1-9 2026 **POSTED** waits from `fact_tables/clean/2026-10/{park}_{date}.csv` into `tpcr_live.duckdb` `live_waits`, exactly once. Days are fixed (2026-10-01..09). PRIORITY/ACTUAL rows are out of scope (counted per day as `excluded_*`, never inserted). Rows are prepped with the scraper's `prepare_live_waits_rows` and inserted with `insert_missing_live_waits` (exact-key anti-join), so a rerun inserts 0. Reads only under `fact_tables/clean` (anything resolving elsewhere or through a symlinked dir/file is refused); never writes a CSV. Prep approved, **not run**; running needs Fred's go.
 
 ```bash
-python scripts/backfill_live_waits_oct1_9.py --dry-run   # parity + per-day files/raw/prepped/already present/would insert
-python scripts/backfill_live_waits_oct1_9.py             # live run (needs the DuckDB write lock)
+python scripts/backfill_live_waits_oct1_9.py --output-base "$OB"            # dry run (default, read-only)
+python scripts/backfill_live_waits_oct1_9.py --output-base "$OB" --apply    # load (needs the DuckDB write lock)
+python scripts/backfill_live_waits_oct1_9.py --output-base "$OB" --rollback --load-key '<logged value>'          # rollback dry run
+python scripts/backfill_live_waits_oct1_9.py --output-base "$OB" --rollback --load-key '<logged value>' --apply  # rollback
 ```
 
-Other ranges: `--start YYYY-MM-DD --end YYYY-MM-DD` (inclusive park dates, both required, may span months, mutually exclusive with `--glob`, must not include `--parity-date`; violations exit 2, before any file is read). Files are globbed per date as `fact_tables/clean/<YYYY-MM>/*_<date>.csv` and each is still path-validated. Example (Oct 14-22 S11 lock loss; parity on Oct 12 because Oct 23 is not in clean yet): `--start 2026-10-14 --end 2026-10-22 --parity-date 2026-10-12 --dry-run`. Live load of that range is HOLD until OQ2 (control-day gap) is explained and Fred gives his go; chief runs it on the Mini.
+- `MISSING DAYS: <d1>,<d2>` (or `none`); any missing day: exit `4` before any DB access.
+- Per day it prints `clean_posted`, `excluded_PRIORITY/ACTUAL/other`, `null_key`, `dropped_nonpositive_or_unparseable`, `duplicate_keys`, `park_date_mismatch` (not inserted), `expected`, `already_in_live`, `would_insert` (`inserted` with `--apply`), and the reconciliation.
+- `--apply` tags every inserted row with one `inserted_at` (UTC, microseconds; `--load-key 'YYYY-MM-DD HH:MM:SS.ffffff'` overrides), logged as `LOAD KEY inserted_at=<value>` at start and end. A key already present, or no `inserted_at` column, is refused (exit 2).
+- `VERIFY PASS|FAIL <day>: live_posted=.. expected=..` is an exact match; any FAIL exits `5` and prints the rollback commands.
+- Rollback deletes only rows with `inserted_at` equal to the key; without `--apply` it is a dry run (`ROLLBACK DRY RUN: would delete <n> rows ...`).
+- sha256 of the clean files at start, before the first write and at the end; a change prints `CHECKSUM CHANGED: <file>` and exits `6`.
+- Refused inside the ETL (05:30-07:00 ET) and replay (04:30-04:40 ET) windows, at start and before each day's insert (exit `8`). DB locked: exit `9` at once, no retry. While `--apply` holds the write connection the scraper parks batches in `state/live_waits_pending/`; run mid-afternoon ET.
 
-Range safeguards:
-- `MISSING DAYS: <d1>,<d2>` (or `none`) lists days with no clean CSV; they are skipped. If any, exit `4` before any DB access unless `--allow-missing`. All days missing: exit `2`.
-- sha256 of every target clean file and the parity-date files at start, after parity (before any write) and at the end; a change prints `CHECKSUM CHANGED: <file>` and exits `6`. Success prints `CLEAN CHECKSUMS UNCHANGED (<n> files)`.
-- Parity failure still prints the per-day counts read-only (`DRY RUN (parity failed; counts only)`), then exits `3`; nothing is written. Parity failure wins over HOLD.
-- Live load needs an `inserted_at` column on `live_waits`; without it: `HOLD: live_waits has no inserted_at column (OQ1); no live load`, exit `7`. All rows of a load get one `inserted_at` (UTC, microseconds; `--load-key 'YYYY-MM-DD HH:MM:SS.ffffff'` overrides), logged as `LOAD KEY inserted_at=<value>` at start and end; a key already present is refused (exit 2).
-- Per-day log adds `candidates=` (rows read), `dropped_null_key=`, `skipped_existing=` after the existing fields.
-- After a live load, `VERIFY PASS|FAIL <day>` compares the day's `live_waits` count with the distinct clean keys for that park date within `--row-tol`; any FAIL exits `5` (data stays loaded).
-
-Rollback by key: `--rollback --load-key '<logged value>' [--dry-run] [--start D --end D]` deletes only rows with `inserted_at` equal to the key (NULL never matches) in one transaction, then verifies 0 remain. `--dry-run` prints `ROLLBACK DRY RUN: would delete <n> rows with inserted_at=<key>` plus per-park-date counts, read-only; the count must equal the load's inserted total. No parity check, no file reads; exit 2 without `--load-key` or without an `inserted_at` column.
-
-Options: `--output-base`, `--db`, `--glob`, `--start`, `--end`, `--parity-date`, `--dry-run`, `--allow-missing`, `--load-key`, `--rollback`, `--row-tol`, `--entity-tol`, `--tp-posted-tol`.
-Exit codes: `0` ok, `2` bad input / path refused, `3` source parity failed (nothing loaded), `4` missing days without `--allow-missing`, `5` post-load VERIFY failed (or rollback count check failed), `6` clean checksum changed, `7` HOLD (no `inserted_at`). Rollout: [docs/rollout/TPCR-BACKFILL-OCT1-9.md](../docs/rollout/TPCR-BACKFILL-OCT1-9.md).
+Options: `--output-base`, `--db`, `--apply`, `--load-key`, `--rollback`.
+Exit codes: `0` ok, `2` bad input / path refused / no `inserted_at` / key clash / rollback without key, `4` missing days, `5` VERIFY or rollback check failed, `6` clean checksum changed, `8` protected window, `9` DB locked. Rollout: [docs/rollout/TPCR-BACKFILL-OCT1-9.md](../docs/rollout/TPCR-BACKFILL-OCT1-9.md).
 
 ## Additional Scripts (summary)
 
