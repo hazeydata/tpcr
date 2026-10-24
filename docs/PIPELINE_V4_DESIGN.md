@@ -148,6 +148,10 @@ pipeline/                           # was: pipeline_v3/
 **Does:** Trains one XGBoost model per entity using real actuals (weighted 10×) + synthetic actuals (weighted 1×). Geo-decay weighting. Per-park min_training_year cutoff. Saves as `model_baseline.json`.
 **Inputs:** `synthetic_actuals/`, `fact_tables/parquet/`, `dimension_tables/`, `state/encoding_mappings.json`
 **Outputs:** `models/{entity_code}/model_baseline.json`, `models/{entity_code}/metadata_baseline.json`
+**Eligibility (TPCR-S8-FALLBACK-001):** computed after the per-park min_training_year cutoff, in this order: `extinct` (dimentity `extinct_on` ≤ run date) → `not_operating` (no operating-calendar day in [today, today+forecast_days]) → `below_min_obs` (post-cutoff rows < `training_min_obs_lite`). Ignored-park entities are out of scope. During training, `no_training_data` (park file missing, no valid rows/features) and `below_min_obs` (valid rows < min_obs or validation split < 10) are skips, not failures.
+**Skip log:** every skip logs `SKIP stage=<s07|s08> entity=<code> reason=<reason>` (reason ∈ extinct, not_operating, no_training_data, below_min_obs, `error:<ExceptionClass>`), then one `SKIP_COUNT stage=… reason=… count=…` per reason, and writes `logs/skips_<stage>_<run_date>.csv` (`stage,entity_code,reason`). Post-eligibility skip counts sum to eligible − trained.
+**`failed`:** counts only real errors (`error:<class>`). If failed > 0 the stage finishes its logging and outputs, then raises `StageFailed` (nonzero exit). Return dict includes `eligible` and `skipped` (reason → count).
+**`extinct_on` overrides and check:** `config/dimentity_overrides.csv` (`entity_code,field,value,reason,source`; empty value = NULL) is applied when S7 reads `extinct_on`. Any `extinct_on` before 2005-01-01 after overrides fails S7 and the calendar build (S8 does not check; the calendar does not yet consume the overrides, so S8 output is unchanged) (HS29's 2000-01-01 sentinel is overridden to NULL until its true date is verified).
 **Features:** mins_since_6am, mins_since_open, date_group_id_encoded, season_encoded, season_year_encoded
 **Hyperparameters:** max_depth=10, eta=0.1, n_estimators=2000, subsample=0.8, colsample_bytree=0.8, early_stopping=20, geo_decay_halflife=730
 
@@ -156,6 +160,7 @@ pipeline/                           # was: pipeline_v3/
 **Does:** Generates predictions for all entities × all dates × all time slots. Loads `model_baseline.json` (or fallback to aggregate if no model).
 **Inputs:** `models/{entity}/model_baseline.json`, `dimension_tables/`, `aggregates/`, `operating_calendar/`
 **Outputs:** `forecasts/all_forecasts.parquet`
+**Skips:** every input entity with no output is logged with a reason (`extinct` = calendar entry with zero operating dates; `not_operating` = no dates in the forecast window; `error:<class>` = exception, counted as failed). Skip counts sum to input entities − output entities; failed > 0 raises `StageFailed` after outputs are written. Same log format as S7. Forecast values and rows are unchanged by this (fixture before/after test). Single-rider parent model and daily fallback_ratios rebuild (spec phases 2–3) are deferred to shadow challengers under TPCR-SHADOW-REVIVE-001; S8 still uses `state/fallback_ratios.json` / global 0.678.
 **NO POST-PROCESSING.** Raw model output only. No bias correction, no quantile mapping.
 
 ### Step 9: WTI

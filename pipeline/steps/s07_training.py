@@ -25,7 +25,7 @@ See: docs/PIPELINE_V4_DESIGN.md
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -37,9 +37,16 @@ except ImportError:
     xgb = None
 
 from pipeline.config import PipelineConfig
+from pipeline.core.eligibility import (
+    SkipLog,
+    check_extinct_on_sanity,
+    is_operating_in_window,
+    load_dimentity_extinct,
+    load_operating_calendar_indexed,
+)
 from pipeline.core.logging import PipelineLogger
 from pipeline.core.park_codes import entity_to_park
-from pipeline.core.validation import ValidationError
+from pipeline.core.validation import StageFailed, ValidationError
 
 
 # V4 baseline features — the ONLY features used for production models
@@ -78,13 +85,38 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
 
     log.info(f"Training data: {'per-park chunks' if use_park_chunks else 'single file'}")
 
-    # Scan entity counts
+    run_date = date.today()
+    window_end = run_date + timedelta(days=cfg.forecast_days)
+    extinct_map = load_dimentity_extinct(cfg.dimension_dir / "dimentity.csv")
+    check_extinct_on_sanity(extinct_map)
+    oc_by_entity = load_operating_calendar_indexed(cfg, log)
+    skips = SkipLog("s07", cfg, log, run_date=run_date)
+
+    # Scan entity counts AFTER the per-park min_training_year cutoff
     with log.timed("scan entity counts"):
-        entity_counts = _scan_entity_counts(park_files if use_park_chunks else [actuals_single])
+        entity_counts = _scan_post_cutoff_counts(
+            park_files if use_park_chunks else [actuals_single], cfg
+        )
 
     min_obs = getattr(cfg, "training_min_obs_lite", 100)
-    eligible = [e for e, c in entity_counts.items() if c >= min_obs]
-    log.info(f"Eligible entities: {len(eligible)} (min_obs={min_obs})")
+
+    # Ignored parks (water parks) are out of scope: excluded before eligibility
+    in_scope = {e: c for e, c in entity_counts.items() if entity_to_park(e) not in cfg.ignore_parks}
+    log.info(f"Ignored-park entities excluded: {len(entity_counts) - len(in_scope)}")
+
+    eligible = []
+    for e in sorted(in_scope):
+        extinct_on = extinct_map.get(e)
+        if extinct_on is not None and extinct_on <= run_date:
+            skips.record("s07", e, "extinct")
+        elif not is_operating_in_window(e, oc_by_entity, run_date, window_end):
+            skips.record("s07", e, "not_operating")
+        elif in_scope[e] < min_obs:
+            skips.record("s07", e, "below_min_obs")
+        else:
+            eligible.append(e)
+    pre_skips = skips.total()
+    log.info(f"Eligible entities: {len(eligible)} (min_obs={min_obs}, pre-eligibility skips={pre_skips})")
 
     # Group by park
     park_entity_map: dict[str, list[str]] = {}
@@ -98,8 +130,6 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
     total_mae = 0.0
 
     for park_code in sorted(park_entity_map.keys()):
-        if park_code in cfg.ignore_parks:
-            continue
         park_entities = park_entity_map[park_code]
 
         with log.timed(f"train park {park_code} ({len(park_entities)} entities)"):
@@ -107,6 +137,8 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
                 park_file = actuals_dir / f"{park_code}.parquet"
                 if not park_file.exists():
                     log.warning(f"  No training data for park {park_code}")
+                    for entity_code in park_entities:
+                        skips.record("s07", entity_code, "no_training_data")
                     continue
                 park_df = pd.read_parquet(park_file)
             else:
@@ -127,13 +159,14 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
                     result = _train_baseline_model(
                         entity_code, park_df, cfg, min_obs
                     )
-                    if result is not None:
+                    if isinstance(result, str):
+                        skips.record("s07", entity_code, result)
+                    else:
                         successful += 1
                         total_mae += result["mae"]
-                    else:
-                        failed += 1
                 except Exception as e:
                     log.warning(f"  {entity_code}: {e}")
+                    skips.record("s07", entity_code, f"error:{type(e).__name__}")
                     failed += 1
 
             del park_df
@@ -147,12 +180,24 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
     log.metric("training_successful", successful)
     log.metric("training_failed", failed)
     log.metric("training_avg_mae", round(avg_mae, 2))
+    log.metric("training_eligible", len(eligible))
+    skipped = skips.summary()
     log.info("=" * 60)
+
+    post_skips = skips.total() - pre_skips
+    if post_skips != len(eligible) - successful:
+        raise ValidationError(
+            f"S7 post-eligibility skips ({post_skips}) != eligible ({len(eligible)}) - trained ({successful})"
+        )
+    if failed > 0:
+        raise StageFailed(f"S7: {failed} entities failed training with errors (see skips_s07 log)")
 
     return {
         "rows": successful,
         "successful": successful,
         "failed": failed,
+        "eligible": len(eligible),
+        "skipped": skipped,
         "avg_mae": round(avg_mae, 2),
     }
 
@@ -162,14 +207,19 @@ def _train_baseline_model(
     park_df: pd.DataFrame,
     cfg: PipelineConfig,
     min_samples: int,
-) -> dict | None:
-    """Train a single 5-feature XGBoost model for one entity."""
+) -> dict | str:
+    """Train a single baseline XGBoost model for one entity.
+
+    Returns the result dict, or a skip-reason string (no_training_data / below_min_obs).
+    """
 
     entity_df = park_df[park_df["entity_code"] == entity_code].copy()
     entity_df = entity_df.reset_index(drop=True)  # CRITICAL: align index with position
 
+    if len(entity_df) == 0:
+        return "no_training_data"
     if len(entity_df) < min_samples:
-        return None
+        return "below_min_obs"
 
     # Compute derived features if requested but not in data
     if "day_of_week" in BASELINE_FEATURES and "day_of_week" not in entity_df.columns:
@@ -178,7 +228,7 @@ def _train_baseline_model(
     # Validate features exist
     missing = [f for f in BASELINE_FEATURES if f not in entity_df.columns]
     if missing:
-        return None
+        return "no_training_data"
 
     # Clean numeric columns
     for col in BASELINE_FEATURES:
@@ -191,8 +241,10 @@ def _train_baseline_model(
 
     # Filter invalid rows
     valid_mask = ~np.isnan(y_all) & (y_all > 0) & ~np.any(np.isnan(X_all), axis=1)
+    if valid_mask.sum() == 0:
+        return "no_training_data"
     if valid_mask.sum() < min_samples:
-        return None
+        return "below_min_obs"
 
     # Apply mask to get clean arrays
     X = X_all[valid_mask]
@@ -215,7 +267,7 @@ def _train_baseline_model(
     n = len(y)
     split = int(n * 0.85)
     if n - split < 10:
-        return None
+        return "below_min_obs"
 
     X_train, X_val = X[:split], X[split:]
     y_train, y_val = y[:split], y[split:]
@@ -286,4 +338,32 @@ def _scan_entity_counts(parquet_files: list[Path]) -> dict[str, int]:
         df = pd.read_parquet(path, columns=["entity_code"])
         for entity, count in df["entity_code"].value_counts().items():
             counts[entity] = counts.get(entity, 0) + count
+    return counts
+
+
+def _scan_post_cutoff_counts(parquet_files: list[Path], cfg: PipelineConfig) -> dict[str, int]:
+    """Count rows per entity AFTER the per-park min_training_year cutoff.
+
+    Every scanned entity is a key (count 0 if the cutoff removed all its rows).
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+    import pyarrow.parquet as pq
+
+    counts: dict[str, int] = {}
+    for path in parquet_files:
+        if not path.exists():
+            continue
+        table = pq.read_table(path, columns=["entity_code", "park_date"])
+        pd_col = table.column("park_date")
+        if not (pa.types.is_date(pd_col.type) or pa.types.is_timestamp(pd_col.type)):
+            pd_col = pc.cast(pd_col, "timestamp[ns]")
+        years = pc.year(pd_col).to_numpy(zero_copy_only=False)
+        enc = pc.dictionary_encode(table.column("entity_code")).combine_chunks()
+        uniq = enc.dictionary.to_pylist()
+        idx = enc.indices.to_numpy(zero_copy_only=False)
+        cut = np.array([cfg.get_min_training_year(entity_to_park(e)) for e in uniq])
+        kept = np.bincount(idx[years >= cut[idx]], minlength=len(uniq))
+        for entity, count in zip(uniq, kept):
+            counts[entity] = counts.get(entity, 0) + int(count)
     return counts

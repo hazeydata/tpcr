@@ -48,6 +48,7 @@ Thumbs.db
 # Project specific
 *.parquet
 *.csv
+!config/dimentity_overrides.csv
 web/figma_node.json
 
 # Data directories (but keep README files)

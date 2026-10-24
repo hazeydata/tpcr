@@ -41,6 +41,11 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
+_repo_root = Path(__file__).resolve().parent.parent
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
+
+from pipeline.core.eligibility import check_extinct_on_sanity, load_dimentity_extinct
 from utils import get_output_base
 from utils.forecast_horizon import get_forecast_end_date
 
@@ -216,6 +221,10 @@ def main() -> None:
         FROM read_csv('{dim_str}', AUTO_DETECT=TRUE)
     """
     entities = con.execute(entities_sql).fetchdf()
+    # Fail the build on implausible extinct_on (after config/dimentity_overrides.csv).
+    # The overrides are NOT written into the calendar yet, so S8 output is unchanged.
+    extinct_map = load_dimentity_extinct(dim_path)
+    check_extinct_on_sanity(extinct_map)
     logger.info("Loaded %d entities from dimentity", len(entities))
 
     # Step 2: Load temporary closures (if any)

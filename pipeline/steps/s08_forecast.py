@@ -34,9 +34,13 @@ except ImportError:
 
 from pipeline.config import PipelineConfig
 from pipeline.core.db import read_connection
+from pipeline.core.eligibility import (
+    SkipLog,
+    load_operating_calendar_indexed as _load_operating_calendar_indexed,
+)
 from pipeline.core.logging import PipelineLogger
 from pipeline.core.park_codes import PARK_TIMEZONE, entity_to_park
-from pipeline.core.validation import ValidationError, require_file
+from pipeline.core.validation import StageFailed, ValidationError, require_file
 
 # Feature columns by model type
 FEATURES_BASELINE = [
@@ -71,6 +75,9 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
 
     start_date = date.today()  # Include today — users ask about "today" and need predicted values
     end_date = start_date + timedelta(days=cfg.forecast_days)
+
+    skips = SkipLog("s08", cfg, log, run_date=start_date)
+
     log.info(f"Forecast range: {start_date} to {end_date} ({cfg.forecast_days} days)")
 
     # Load shared data (small, loaded once)
@@ -90,6 +97,7 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
             continue
         park_entities.setdefault(park, []).append(entity)
 
+    input_entities = sum(len(v) for v in park_entities.values())
     log.info(f"Total entities: {len(entity_list)} across {len(park_entities)} parks")
 
     # Process one park at a time
@@ -117,6 +125,8 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
 
             if time_grid is None or len(time_grid) == 0:
                 log.warning(f"  {park_code}: no time grid generated, skipping")
+                for entity_code in entities:
+                    skips.record("s08", entity_code, "not_operating")
                 continue
 
             # Pre-compute park hours lookup for mins_since_open (vectorized)
@@ -139,8 +149,14 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
                         park_results.append(result)
                         total_entities += 1
                         method_feature_counts[feat_key] = method_feature_counts.get(feat_key, 0) + 1
+                    else:
+                        skips.record(
+                            "s08", entity_code,
+                            "extinct" if feat_key == "extinct" else "not_operating",
+                        )
                 except Exception as e:
                     log.warning(f"  {entity_code}: failed — {e}")
+                    skips.record("s08", entity_code, f"error:{type(e).__name__}")
                     failed_entities += 1
 
             # Flush this park to temp parquet
@@ -191,9 +207,20 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
     log.metric("forecast_predictions", total_predictions)
     log.metric("forecast_entities", total_entities)
     log.metric("forecast_failed", failed_entities)
+    skipped = skips.summary()
     log.info("=" * 60)
 
-    return {"rows": total_predictions, "entities": total_entities, "failed": failed_entities}
+    if skips.total() != input_entities - total_entities:
+        raise ValidationError(
+            f"S8 skip counts ({skips.total()}) != input ({input_entities}) - output ({total_entities})"
+        )
+    if failed_entities > 0:
+        raise StageFailed(f"S8: {failed_entities} entities failed with errors (see skips_s08 log)")
+
+    return {
+        "rows": total_predictions, "entities": total_entities,
+        "failed": failed_entities, "skipped": skipped,
+    }
 
 
 # =========================================================================
@@ -493,31 +520,6 @@ def _load_entity_list(cfg: PipelineConfig, log: PipelineLogger) -> list[str]:
 
     log.info(f"Entity list: {len(entities)} entities")
     return sorted(entities)
-
-
-def _load_operating_calendar_indexed(cfg: PipelineConfig, log: PipelineLogger) -> dict | None:
-    """Load operating calendar PRE-INDEXED by entity code.
-    
-    Returns dict[entity_code_upper] → set(dates) or None if no OC.
-    O(1) lookup per entity instead of scanning 9.3M tuples.
-    """
-    oc_path = cfg.output_base / "operating_calendar" / "operating_calendar.parquet"
-    if not oc_path.exists():
-        log.info("No operating calendar — assuming all entities operating")
-        return None
-
-    oc_df = pd.read_parquet(oc_path)
-    oc_df = oc_df[oc_df["is_operating"] == True]
-    oc_df["entity_upper"] = oc_df["entity_code"].astype(str).str.upper()
-    oc_df["date_val"] = pd.to_datetime(oc_df["park_date"]).dt.date
-
-    # Pre-index: entity → set of operating dates
-    indexed = {}
-    for entity, group in oc_df.groupby("entity_upper"):
-        indexed[entity] = set(group["date_val"])
-
-    log.info(f"Operating calendar: {len(oc_df):,} entries, {len(indexed)} entities indexed")
-    return indexed
 
 
 def _load_fallback_ratios(cfg: PipelineConfig, log: PipelineLogger) -> dict:
