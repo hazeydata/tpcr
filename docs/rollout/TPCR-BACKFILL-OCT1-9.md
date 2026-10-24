@@ -50,7 +50,7 @@ Last resort: restore the backup file over `$DB` while no writer has it open. Scr
 
 First `MISSING DAYS: none` (else exit 4 with the list, before any DB access). Then one line per day:
 
-`<day>: clean_posted= excluded_PRIORITY= excluded_ACTUAL= excluded_other= null_key= dropped_nonpositive_or_unparseable= duplicate_keys= park_date_mismatch= expected= already_in_live= would_insert=`
+`<day>: clean_posted=<n> excluded_PRIORITY=<n> excluded_ACTUAL=<n> excluded_other=<n> null_key=<n> dropped_nonpositive_or_unparseable=<n> duplicate_keys=<n> park_date_mismatch=<n> expected=<n> already_in_live=<n> would_insert=<n>`
 
 (`inserted=` instead of `would_insert=` after `--apply`.) A reconcile line follows: `clean_posted - null_key - dropped_nonpositive_or_unparseable - duplicate_keys - park_date_mismatch = expected`.
 
