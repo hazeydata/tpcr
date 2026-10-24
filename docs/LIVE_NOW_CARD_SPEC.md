@@ -44,7 +44,7 @@ User runs `/now mk` → gets beautiful image → screenshots → posts to Reddit
   - Range: historical min/max WTI for this park on this day-type
   - Needle: current average wait across headliners
 - **↑/↓ arrows:** Green ↓ when below avg, red ↑ when above avg, no arrow if within ±10%
-- **AVG column:** Historical median for this entity + day-type + hour (from posted_aggregates)
+- **AVG column:** Historical median for this entity + day-type + hour (from model_aggregates.parquet: wait_median for the entity, today's date_group_id and the 15-min clock slot)
 - **Context line:** "X% above/below average for a [day-of-week]"
 - **Alert line (conditional):** Spring break / holiday detection from date_group_id
 
@@ -63,9 +63,9 @@ User runs `/now mk` → gets beautiful image → screenshots → posts to Reddit
 - **No API key required** (public API)
 
 ### 2. Historical "Typical" Values
-- **Source:** `/mnt/data/pipeline/aggregates/posted_aggregates.parquet`
-- **Schema:** entity_code, date_group_id, hour, posted_median, posted_count
-- **Lookup:** entity_code + today's date_group_id + current hour → posted_median
+- **Source:** `aggregates/model_aggregates.parquet` (rebuilt daily by S4). `posted_aggregates.parquet` is a dead v2 file and must not be used.
+- **Schema (used columns):** entity_code, date_group_id, time_slot (15-min clock slot, 0-95 = hour*4 + minute//15), hour_of_day, wait_median, sample_count
+- **Lookup:** entity_code + today's date_group_id + current 15-min slot → wait_median. Cells with fewer than 5 observations are absent (show no AVG, never 0).
 - **This IS the "AVG" column** — what's typical for this ride, on this type of day, at this hour
 
 ### 3. Entity Names

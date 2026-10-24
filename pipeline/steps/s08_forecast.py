@@ -52,6 +52,9 @@ FEATURES_LEGACY_V2 = [
 ]
 
 # All possible features that might be in a time grid row
+# posted_time used when model_aggregates has no value (OQ3: kept, but logged and counted).
+POSTED_DEFAULT = 5.0
+
 ALL_POSSIBLE_FEATURES = [
     "mins_since_6am", "mins_since_open",
     "date_group_id_encoded", "season_encoded", "season_year_encoded",
@@ -102,6 +105,7 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
     total_entities = 0
     failed_entities = 0
     method_feature_counts: dict[str, int] = {}  # Track which feature sets are used
+    fallbacks: list[tuple[str, str, str, int]] = []  # (entity, kind, reason, rows)
     batch_files = []
 
     for park_code in sorted(park_entities.keys()):
@@ -133,7 +137,7 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
                     result, feat_key = _forecast_entity_fast(
                         entity_code, park_code, time_grid,
                         cfg.models_dir, agg_by_entity, park_open_mins,
-                        fallback_ratios, oc_by_entity,
+                        fallback_ratios, oc_by_entity, fallbacks,
                     )
                     if result is not None and len(result) > 0:
                         park_results.append(result)
@@ -184,6 +188,8 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
         for feat_key, count in sorted(method_feature_counts.items()):
             log.info(f"  {feat_key}: {count} entities")
 
+    fb = _log_fallbacks(fallbacks, log)
+
     log.info("=" * 60)
     log.info("FORECAST COMPLETE")
     log.info(f"Entities: {total_entities} successful, {failed_entities} failed")
@@ -193,7 +199,27 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
     log.metric("forecast_failed", failed_entities)
     log.info("=" * 60)
 
-    return {"rows": total_predictions, "entities": total_entities, "failed": failed_entities}
+    return {"rows": total_predictions, "entities": total_entities, "failed": failed_entities, **fb}
+
+
+def _log_fallbacks(fallbacks: list[tuple[str, str, str, int]], log: PipelineLogger) -> dict:
+    """Log every S8 fallback with its entity and reason, and count them."""
+    posted = [f for f in fallbacks if f[1] == "posted_default"]
+    ratio = [f for f in fallbacks if f[1] == "ratio"]
+    for entity, kind, reason, rows in fallbacks:
+        log.warning(f"  S8 fallback {kind}: {entity}: {reason} ({rows:,} rows)",
+                    entity=entity, kind=kind, reason=reason, rows=rows)
+    log.info(
+        f"S8 fallbacks: posted_default {len(posted)} entities "
+        f"({sum(f[3] for f in posted):,} rows), ratio {len(ratio)} entities"
+    )
+    log.metric("forecast_posted_fallback_entities", len(posted))
+    log.metric("forecast_posted_fallback_rows", sum(f[3] for f in posted))
+    log.metric("forecast_ratio_fallback_entities", len(ratio))
+    return {
+        "posted_fallback_entities": sorted({f[0] for f in posted}),
+        "ratio_fallback_entities": sorted({f[0] for f in ratio}),
+    }
 
 
 # =========================================================================
@@ -226,8 +252,15 @@ def _forecast_entity_fast(
     park_open_mins: dict,
     fallback_ratios: dict,
     oc_by_entity: dict | None,
+    fallbacks: list | None = None,
 ) -> tuple[pd.DataFrame | None, str]:
     """Generate forecast for a single entity. O(1) lookups, no scanning.
+
+    Every fallback is appended to ``fallbacks`` as
+    (entity_code, kind, reason, rows) so the caller can log and count it
+    (TPCR-S4-AGG-001 AC6): kind 'posted_default' means posted_time was set
+    to POSTED_DEFAULT for those rows; kind 'ratio' means no model existed
+    and predictions are posted_time * fallback_ratio.
 
     Returns (DataFrame, feature_key) where feature_key describes which
     feature set was used (for diagnostic logging).
@@ -264,10 +297,15 @@ def _forecast_entity_fast(
             on=["date_group_id", "time_slot_15min"],
             how="left",
         )
-        df["posted_time"] = df["wait_median"].fillna(5.0)
+        n_missing = int(df["wait_median"].isna().sum())
+        if n_missing and fallbacks is not None:
+            fallbacks.append((entity_code, "posted_default", "no aggregate for (date_group_id, slot)", n_missing))
+        df["posted_time"] = df["wait_median"].fillna(POSTED_DEFAULT)
         df.drop(columns=["wait_median"], inplace=True)
     else:
-        df["posted_time"] = 5.0
+        if fallbacks is not None:
+            fallbacks.append((entity_code, "posted_default", "entity not in model_aggregates", len(df)))
+        df["posted_time"] = POSTED_DEFAULT
 
     # Vectorized mins_since_open
     df["_open_mins"] = df["park_date"].map(park_open_mins).fillna(6 * 60)
@@ -323,6 +361,9 @@ def _forecast_entity_fast(
 
     else:
         # No model — vectorized fallback
+        if fallbacks is not None:
+            src = "entity ratio" if entity_code in fallback_ratios else "global ratio"
+            fallbacks.append((entity_code, "ratio", f"no model file; {src} {fallback_ratio}", len(df)))
         df["predicted_actual"] = (df["posted_time"] * fallback_ratio).round().astype(int)
         df["prediction_method"] = "fallback_ratio"
         return df[["entity_code", "park_date", "time_slot", "predicted_actual", "prediction_method"]], "fallback"
@@ -447,7 +488,7 @@ def _load_aggregates_indexed(cfg: PipelineConfig, log: PipelineLogger) -> dict:
     """
     agg_path = cfg.output_base / "aggregates" / "model_aggregates.parquet"
     if not agg_path.exists():
-        log.warning(f"No aggregates file at {agg_path}")
+        log.warning(f"No aggregates file at {agg_path}: every entity will use posted_time={POSTED_DEFAULT} (logged per entity)")
         return {}
 
     with read_connection() as con:

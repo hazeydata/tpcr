@@ -1,20 +1,30 @@
 """Step 4: Posted Aggregates.
 
-Builds median posted wait times by entity, date_group_id, and time_slot.
-Used by forecast step for posted_time estimates and fallback predictions.
+Rebuilds aggregates/model_aggregates.parquet every run: the posted-wait
+median, mean, percentiles and 2-year half-life weighted mean for each
+entity x date_group_id x 15-minute clock slot (0-95), over all history
+through yesterday. Input is de-duplicated on the natural key, cells with
+fewer than 5 observations are not written, and the file is written to a
+temp path, validated and atomically renamed (TPCR-S4-AGG-001).
 
-During shadow phase: reads from production aggregates.
+A failed build raises: the previous file is left byte-identical, the step
+fails and the run exits nonzero. There is no 'missing' success path.
+A sidecar model_aggregates.meta.json records build time, row count and
+input max date. Read by S8 (posted_time) and the dashboard API.
+
+Shadow mode only validates the production file.
 """
 
 from __future__ import annotations
 
 from pipeline.config import PipelineConfig
 from pipeline.core.logging import PipelineLogger
-from pipeline.core.validation import require_file, require_parquet_rows
+from pipeline.core.model_aggregates import AggregateBuildError, build_model_aggregates
+from pipeline.core.validation import ValidationError, require_parquet_rows
 
 
 def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
-    """Build or validate posted aggregates."""
+    """Rebuild (production) or validate (shadow) the posted aggregates."""
 
     log.info("=" * 60)
     log.info("STEP 4: POSTED AGGREGATES")
@@ -32,13 +42,23 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
             log.error(f"Aggregates validation failed: {e}")
             raise
 
-    # Production mode: build aggregates
-    # TODO: implement direct aggregate build (currently wraps existing script)
-    log.info("Production aggregate build not yet implemented in v3")
-    log.info("Using production aggregates from existing pipeline")
+    try:
+        with log.timed("build model_aggregates.parquet"):
+            res = build_model_aggregates(cfg.output_base, log=log)
+    except AggregateBuildError as e:
+        log.error(f"S4 aggregate build FAILED, previous file kept: {e}")
+        raise ValidationError(f"S4 aggregate build failed: {e}") from e
 
-    if agg_path.exists():
-        n_rows = require_parquet_rows(agg_path, min_rows=1, description="Aggregates")
-        return {"rows": n_rows, "action": "used_existing"}
-
-    return {"rows": 0, "action": "missing"}
+    log.info(
+        f"Aggregates rebuilt: {res.rows:,} rows, {res.entities} entities, "
+        f"input max date {res.input_max_date}, {res.duplicate_rows_dropped:,} duplicates dropped"
+    )
+    log.metric("aggregates_rows", res.rows)
+    log.metric("aggregates_duplicates_dropped", res.duplicate_rows_dropped)
+    log.metric("aggregates_build_sec", res.duration_sec)
+    return {
+        "rows": res.rows,
+        "action": "rebuilt",
+        "input_max_date": res.input_max_date.isoformat(),
+        "duplicates_dropped": res.duplicate_rows_dropped,
+    }

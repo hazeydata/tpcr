@@ -105,7 +105,7 @@ Each entity is one type. We decide from dimentity and then train for ACTUAL or P
 
 ## Forecast, Backfill, and WTI
 
-- **Predicted POSTED:** From **aggregates** — median (or similar) of historical POSTED by (entity, dategroupid, hour). Built by `scripts/build_posted_aggregates.py` → `output_base/aggregates/posted_aggregates.parquet`. Forecast uses this for every 5‑minute slot; no ML for POSTED.
+- **Predicted POSTED:** From **aggregates**: the median historical POSTED wait by (entity, date_group_id, 15-minute clock slot). Rebuilt every run by pipeline step S4 (`pipeline/steps/s04_aggregates.py`, logic in `pipeline/core/model_aggregates.py`) → `output_base/aggregates/model_aggregates.parquet`. S8 forecast looks up `wait_median` by (date_group_id, 15-min slot); a missing value falls back to 5 minutes, and each fallback is logged with its entity and reason. `posted_aggregates.parquet` (hourly, v2) is no longer read by anything.
 - **Predicted ACTUAL:** From the **without-POSTED** model (and predicted POSTED as input when we want “with-POSTED” style in future). Rounded to nearest integer for output.
 - **Forecast script:** `scripts/generate_forecast.py` — writes future curves (actual_predicted, posted_predicted) for a given entity/date range.
 - **Backfill script:** `scripts/generate_backfill.py` — writes historical ACTUAL curves using observed POSTED + model where we have POSTED.
@@ -123,7 +123,7 @@ Each entity is one type. We decide from dimentity and then train for ACTUAL or P
 | `src/build_entity_index.py` | Build/rebuild entity index from all fact CSVs. |
 | `scripts/train_entity_model.py` | Train one entity (XGBoost or mean). |
 | `scripts/train_batch_entities.py` | Train many entities (from index or from a list); uses min_observations (e.g. 500) so POSTED-only entities are skipped. |
-| `scripts/build_posted_aggregates.py` | Build (entity, dategroupid, hour) → posted aggregates. |
+| `scripts/build_model_aggregates.py` | Manual run of the S4 build: (entity, date_group_id, 15-min slot) → model_aggregates.parquet. `build_posted_aggregates*.py` write the unused posted_aggregates.parquet. |
 | `scripts/generate_forecast.py` | Produce future actual_predicted and posted_predicted curves. |
 | `scripts/generate_backfill.py` | Produce historical ACTUAL curves. |
 | `scripts/calculate_wti.py` | Compute WTI per park-day. |
