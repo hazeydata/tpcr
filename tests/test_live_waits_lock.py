@@ -33,6 +33,7 @@ from live_waits_common import (
     park_tz_for_park_code,
     prepare_live_waits_rows,
 )
+import replay_live_waits as replay_mod
 from replay_live_waits import replay_staging_to_live
 
 ET = ZoneInfo("America/New_York")
@@ -287,3 +288,69 @@ def test_replay_due():
     assert scraper.replay_due(et(9, 0), date(2026, 10, 20)) is True
     assert scraper.replay_due(et(9, 0), date(2026, 10, 21)) is False
     assert scraper.replay_due(et(3, 0, d=22), date(2026, 10, 21)) is False
+
+
+def _make_pending(tmp_path: Path, n: int = 3) -> Path:
+    pending_dir = tmp_path / "state" / "live_waits_pending"
+    pending_dir.mkdir(parents=True)
+    for i in range(n):
+        mk_df(2, start_hour=10 + i).to_csv(pending_dir / f"batch_{i}.csv", index=False)
+    return pending_dir
+
+
+def test_attempt_timeout_treated_as_lock(tmp_path, monkeypatch):
+    assert scraper._is_lock_error(subprocess.TimeoutExpired(cmd="x", timeout=1)) is True
+
+    pending_dir = _make_pending(tmp_path)
+    calls = []
+
+    def fake_once(db_path, csv_path, timeout_s):
+        calls.append(csv_path)
+        raise subprocess.TimeoutExpired(cmd="x", timeout=timeout_s)
+
+    monkeypatch.setattr(scraper, "_run_live_write_once", fake_once)
+    scraper._flush_pending_live_waits(tmp_path / "tpcr_live.duckdb", pending_dir, LOG)
+    assert len(calls) == 1
+    assert len(sorted(pending_dir.glob("*.csv"))) == 3
+
+
+def test_flush_stops_at_first_lock_error(tmp_path, monkeypatch):
+    pending_dir = _make_pending(tmp_path)
+    calls = []
+
+    def fake_once(db_path, csv_path, timeout_s):
+        calls.append(csv_path)
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(scraper, "_run_live_write_once", fake_once)
+    scraper._flush_pending_live_waits(tmp_path / "tpcr_live.duckdb", pending_dir, LOG)
+    assert len(calls) == 1
+    assert len(sorted(pending_dir.glob("*.csv"))) == 3
+
+
+def test_replay_connect_retries_on_lock(tmp_path, monkeypatch):
+    sentinel = object()
+    calls = []
+
+    def flaky_connect(path, *a, **k):
+        calls.append(path)
+        if len(calls) <= 2:
+            raise Exception("Could not set lock on file")
+        return sentinel
+
+    monkeypatch.setattr(replay_mod.duckdb, "connect", flaky_connect)
+    monkeypatch.setattr(replay_mod.time, "sleep", lambda s: None)
+    db = tmp_path / "tpcr_live.duckdb"
+    assert replay_mod._connect_with_retry(db, budget_s=60, logger=LOG) is sentinel
+    assert len(calls) == 3
+
+    calls.clear()
+
+    def bad_connect(path, *a, **k):
+        calls.append(path)
+        raise Exception("Catalog Error: something else")
+
+    monkeypatch.setattr(replay_mod.duckdb, "connect", bad_connect)
+    with pytest.raises(Exception, match="Catalog Error"):
+        replay_mod._connect_with_retry(db, budget_s=60, logger=LOG)
+    assert len(calls) == 1
