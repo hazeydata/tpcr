@@ -267,22 +267,50 @@ def retrain_challenger(challenger, run_date):
     return None
 
 
-def record_training(challenger, result):
+def production_trained_entities(run_date, base=None):
+    """Entity codes production S7 trained in the run for run_date, or None if not found.
+
+    S7 writes models/<entity>/metadata_baseline.json (with trained_at) per trained
+    entity. The run's set is every entity whose trained_at falls on run_date (UTC).
+    """
+    mroot = (base or PIPELINE_BASE) / "models"
+    if not mroot.is_dir():
+        return None
+    trained = set()
+    for meta in mroot.glob("*/metadata_baseline.json"):
+        try:
+            ts = parse_timestamp(json.loads(meta.read_text()).get("trained_at"))
+        except (OSError, ValueError, AttributeError):
+            continue
+        if ts is not None and ts.astimezone(timezone.utc).date() == run_date:
+            trained.add(meta.parent.name)
+    return trained or None
+
+
+def record_training(challenger, result, run_date, base=None):
     """Write trained_at / entity_count to the registry entry.
 
-    Returns an error string when entity_count differs from the production
-    eligible count (the diff is printed), else None.
+    Returns an error string when the challenger's trained entity set differs from
+    the production S7 trained set of the same run (the diff is printed), or when
+    that set cannot be found; else None.
     """
     challenger["trained_at"] = result["trained_at"]
     challenger["entity_count"] = result["entity_count"]
-    eligible = result.get("eligible_count")
-    if eligible is None or result["entity_count"] == eligible:
+    name = challenger["name"]
+    prod = production_trained_entities(run_date, base)
+    if prod is None:
+        print(f"  No production S7 trained set found for {run_date}")
+        return f"{name}: production S7 trained set not found for {run_date}"
+    trained = set(result.get("trained_entities") or [])
+    if trained == prod:
         return None
+    missing, extra = sorted(prod - trained), sorted(trained - prod)
     skipped = result.get("skipped") or {}
     detail = ", ".join(f"{e}={r}" for e, r in sorted(skipped.items())) or "none recorded"
-    print(f"  entity_count {result['entity_count']} != production eligible {eligible}; skipped: {detail}")
-    return (f"{challenger['name']}: entity_count {result['entity_count']} != "
-            f"production eligible count {eligible} (skipped: {detail})")
+    print(f"  entity set != production S7 trained set ({len(trained)} vs {len(prod)}); "
+          f"missing: {missing}; extra: {extra}; skipped: {detail}")
+    return (f"{name}: entity set != production S7 trained set for {run_date} "
+            f"(missing {missing}, extra {extra}; skipped: {detail})")
 
 
 # --- Step 1: Generate shadow forecasts ---
@@ -653,7 +681,7 @@ def run_day(run_date, retrain=False, register_fallback=False, out_base=None, pos
                 errors.append(f"{name}: retrain failed")
                 report_lines.append(f"{name}: RETRAIN FAILED")
                 continue
-            mismatch = record_training(challenger, train_result)
+            mismatch = record_training(challenger, train_result, run_date)
             if mismatch:
                 errors.append(mismatch)
             write_registry(registry, registry_out)
