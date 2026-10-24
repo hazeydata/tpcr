@@ -393,7 +393,7 @@ db = duckdb.connect(DUCKDB_PATH, read_only=True)
 
 1. **[x] Create init script** — `scripts/init_live_duckdb.py` (schema + backfill)
 2. **[ ] Run init** — creates DuckDB with all existing data (run on wilma-server after pipeline)
-3. **[x] Update scraper** — dual-write (CSV + DuckDB) for safety
+3. **[x] Update scraper** — dual-write (CSV + DuckDB) for safety. Current behaviour (TPCR-S11-LOCK-001): rows are inserted via anti-join on `(entity_code, observed_at, wait_time_type)` (not `INSERT OR IGNORE`); lock failures retry ~180s; unwritten batches are kept in `state/live_waits_pending/` and flushed later; `src/replay_live_waits.py` backfills from staging daily at ~04:30 ET.
 4. **[ ] Verify** — check DuckDB has fresh data after a few scraper cycles
 5. **[x] Update pipeline** — WTI, forecasts, entities write to DuckDB after parquet
 6. **[ ] Move bot code** — into main repo `tpcr-discord-bot/` directory
@@ -411,7 +411,7 @@ db = duckdb.connect(DUCKDB_PATH, read_only=True)
 ## Concurrency Notes
 
 - DuckDB supports **multiple concurrent readers** (read_only connections)
-- **One writer at a time** — scraper writes every 5 min, pipeline writes once/day at 6am, no conflict
+- **One writer at a time** — scraper writes every 5 min, pipeline (s11) holds the write lock ~110s once/day at ~6:15 AM ET; scraper writes retry ~180s and fall back to `state/live_waits_pending/`
 - Bot and dashboard API use `read_only=True` connections — never block writers
 - If we ever need concurrent writes: use WAL mode (`PRAGMA enable_wal`)
 
