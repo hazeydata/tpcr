@@ -83,7 +83,7 @@ def detect_park(question: str, park_names: Mapping[str, Tuple[str, str]]) -> Opt
 
 def build_rotation(generic: List[str], park_lines: Optional[List[str]] = None,
                    rng: Optional[random.Random] = None) -> List[str]:
-    """One cycle of lines. Park lines alternate with generic ones (park first)."""
+    """One cycle of lines: park lines first, interleaved with generic, then generic only."""
     rng = rng or random.Random()
     g = list(generic) or list(FALLBACK_GENERIC)
     rng.shuffle(g)

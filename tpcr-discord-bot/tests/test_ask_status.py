@@ -130,7 +130,7 @@ def test_generic_only_without_park():
     assert sorted(lines) == ["g1", "g2", "g3"]
 
 
-def test_park_lines_alternate_with_generic():
+def test_park_lines_first_interleaved_then_generic():
     data = {"generic": ["g1", "g2", "g3"], "parks": {"EP": ["p1", "p2"]}}
     lines = st.lines_for_question("epcot tomorrow?", PARKS, data, random.Random(1))
     assert sorted(lines) == ["g1", "g2", "g3", "p1", "p2"]
