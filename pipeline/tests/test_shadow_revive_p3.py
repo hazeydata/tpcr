@@ -94,9 +94,8 @@ class JobCase(unittest.TestCase):
         """Stand-in for rolling_shadow.run_day: real registry update, files staged in out_base."""
         rs = self.rs
 
-        def run_day(run_date, retrain=False, register_fallback=False, out_base=None, post=True):
+        def run_day(run_date, retrain=False, register_fallback=False, out_base=None):
             self.calls += 1
-            self.assertFalse(post, "the job must never post to Discord")
             self.assertNotEqual(Path(out_base), rs.COMPETITION_BASE, "outputs must be staged")
             if mid_run:
                 mid_run()

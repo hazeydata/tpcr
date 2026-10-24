@@ -5,6 +5,7 @@
 **Authors:** Barney (architect) + Fred (decision-maker)
 **Status:** APPROVED by Fred — 2026-03-26
 **Amends:** `PIPELINE_V4_DESIGN.md` Phase E (Competition Framework)
+**Superseded in part (TPCR-SHADOW-REVIVE-001 Phase 4):** nothing posts to Discord any more, and challengers are no longer auto-retired or auto-flagged after 7 days. A challenger is flagged only by the streak + bootstrap + gain rule, and promotion is always manual. Current behavior: `SHADOW_COMPETITION.md`.
 
 ---
 

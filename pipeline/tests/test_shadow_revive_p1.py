@@ -186,9 +186,7 @@ class MainRunListTest(unittest.TestCase):
             with mock.patch.object(mod, "retrain_challenger", fake_retrain), \
                     mock.patch.object(mod, "generate_forecasts", fake_forecast), \
                     mock.patch.object(mod, "archive_predictions", fake_archive), \
-                    mock.patch.object(mod, "evaluate_previous_day", fake_evaluate), \
-                    mock.patch.object(mod, "post_discord", lambda msg: None), \
-                    mock.patch.object(mod, "load_env", lambda: None):
+                    mock.patch.object(mod, "evaluate_previous_day", fake_evaluate):
                 mod.main(["--pipeline-base", str(base), "--tpcr-dir", str(Path(d) / "repo"),
                           "--run-date", date(2026, 10, 24).isoformat()])
 
@@ -211,9 +209,7 @@ class MainRunListTest(unittest.TestCase):
             registry_path = base / "competition" / "challenger_registry.json"
             mod.write_registry(make_registry("xgb-dow"), registry_path)
             boom = mock.Mock(side_effect=AssertionError("must not run"))
-            with mock.patch.object(mod, "generate_forecasts", boom), \
-                    mock.patch.object(mod, "post_discord", boom), \
-                    mock.patch.object(mod, "load_env", lambda: None):
+            with mock.patch.object(mod, "generate_forecasts", boom):
                 mod.main(["--pipeline-base", str(base), "--tpcr-dir", str(Path(d) / "repo")])
             boom.assert_not_called()
             saved = json.loads(registry_path.read_text())
