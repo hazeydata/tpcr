@@ -1,6 +1,6 @@
 # Shadow Competition (Rolling Shadow Run)
 
-Challenger models run daily against production on the same entities and slots. A winner is only ever *flagged*; promotion is always manual. Governing spec: TPCR-SHADOW-REVIVE-001. Phases 1 and 2 (local run, `shadow_days` fix, xgb-dow retired, full-entity retrains, identical-set scoring, fallback-entity MAE, fallback-v2) are described as built; Phases 3 and 4 are marked planned.
+Challenger models run daily against production on the same entities and slots. A winner is only ever *flagged*; promotion is always manual. Governing spec: TPCR-SHADOW-REVIVE-001. Phases 1-3 (local run, `shadow_days` fix, xgb-dow retired, full-entity retrains, identical-set scoring, fallback-entity MAE, fallback-v2, the scheduled job) are described as built; Phase 4 is marked planned. The launchd job is written but **not installed**.
 
 ## What runs
 
@@ -121,7 +121,7 @@ Scoring: `score_scope = "fallback"` — the summary marks it, and the registry's
 }
 ```
 
-A challenger with no matched pairs gets `{"score_scope", "trained_at", "entity_count", "matched_pairs": 0, "status": "no_data"}`. `run_status` is `ok` with no errors, else `failed` (any retrain/forecast/archive/evaluation error, or an `entity_count` mismatch). `win`, `streak`, `ci95_low`, `ci95_high`, `gain_min` arrive with the Phase 4 flag rule. The Phase 3 exit-code and `skipped_lock` behavior is not built: the exit code is unchanged.
+A challenger with no matched pairs gets `{"score_scope", "trained_at", "entity_count", "matched_pairs": 0, "status": "no_data"}`. `run_status` is `ok` with no errors, else `failed` (any retrain/forecast/archive/evaluation error, or an `entity_count` mismatch). `win`, `streak`, `ci95_low`, `ci95_high`, `gain_min` arrive with the Phase 4 flag rule. `rolling_shadow.py` run by hand keeps its old exit code; the scheduled job's run_status values and exit codes are in the Phase 3 section below.
 
 ## `shadow_days` rule
 
@@ -142,9 +142,54 @@ cd ~/theme-park-crowd-report
 .venv/bin/python scripts/rolling_shadow.py --pipeline-base /tmp/pipe --tpcr-dir "$PWD"   # sandbox
 ```
 
-Tests: `pytest pipeline/tests/test_shadow_revive_p1.py pipeline/tests/test_shadow_revive_p2.py`.
+Tests: `pytest pipeline/tests/test_shadow_revive_p1.py pipeline/tests/test_shadow_revive_p2.py pipeline/tests/test_shadow_revive_p3.py`.
+
+## Phase 3: scheduled job (AC9-AC11)
+
+`scripts/shadow_job.py` wraps `rolling_shadow.run_day` (stdlib plus `rolling_shadow`). `launchd/com.hazeydata.tpcr-shadow.plist` starts it at 06:20 local with `Nice` 10 and `LowPriorityIO`; the script also calls `os.nice(10)`. Logs go to `~/hazeydata/pipeline/competition/logs/`.
+
+**Not installed.** Installing the plist is a deploy step that needs Fred's go. The install commands are in `launchd/README.md` as documentation only.
+
+```bash
+.venv/bin/python scripts/shadow_job.py [--date YYYY-MM-DD] [--pipeline-base DIR] [--tpcr-dir DIR] \
+    [--max-marker-wait-min 30] [--lock-wait-min 20] [--dry-run]
+```
+
+`--dry-run` prints the marker status and scraper-lock state once, waits for nothing and writes nothing.
+
+### Order of checks
+
+1. **Job lock.** A non-blocking `flock` on `competition/locks/shadow_job.lock`. If another shadow job holds it, this one exits 0 at once and writes nothing. The lock is shadow-only: S1-S11 and the scraper never use it.
+2. **Pipeline marker.** The job polls (60 s) for `<pipeline base>/logs/pipeline_metrics_<run date>.json`, the file `pipeline/pipeline.py` writes at the end of a full run and `tpcr-discord-bot/daily_report.py` waits for. It runs only on `status == "done"`. `failed` or `sync_partial` gives `skipped_pipeline` immediately. No terminal status within `--max-marker-wait-min` (default 30) gives `skipped_no_marker`.
+3. **Scraper lock.** The live_waits scraper's lock is `<pipeline base>/state/processing_queue_times.lock`, a plain pid file (no flock) taken by `acquire_lock` in `src/get_tp_wait_time_data_from_s3.py`. The job only `stat`s it. It follows the scraper's own staleness rule: a lock older than 24 h is stale and ignored. While the lock is held the job polls up to `--lock-wait-min` (default 20); still held gives `skipped_lock`.
+4. **Run into a staging dir.** `run_day(out_base=<competition>/staging/<eval date>, post=False)` writes the scores file, summary and registry there. The scraper lock is checked again before committing. If it was taken during the run, the staging dir is deleted and the run is recorded as `skipped_lock`. Otherwise the files are moved into place with `os.replace` (scores, registry, then summary last).
+
+Models, forecasts and `shadow/` archives are written in place by the subprocesses. They are keyed by date or challenger and overwritten on rerun, so a skipped run can leave them behind. A retrain whose registry update was discarded simply happens again on the next run.
+
+### run_status values (summary `run_status`)
+
+| Value | Meaning | Files written | Exit |
+|---|---|---|---|
+| `ok` | ran, no errors | scores, summary, registry | 0 |
+| `failed` | exception, or any retrain/forecast/archive/eval error | exception: summary only (`errors[]` = `{"type", "message"}`). Soft error from a challenger: that day's outputs are committed with `errors[]` as strings | 1 |
+| `skipped_pipeline` | marker `failed` / `sync_partial` | summary only | 0 |
+| `skipped_no_marker` | no terminal marker in time | summary only | 0 |
+| `skipped_lock` | scraper lock held after the wait, or taken mid-run | summary only (`errors` = `[]`); no scores file, registry unchanged | 0 |
+
+Skip and failure summaries have `matched_pairs` 0, empty `challengers`, a `run_date`, and (for skips) a `detail` string. Summaries are keyed by the evaluated date (`run date - 1`), same as the scores file.
+
+### Idempotence
+
+A rerun for the same date overwrites that date's scores file and summary (no duplicate rows). The registry's `daily_metrics` is keyed by `date`, so a rerun replaces that day's entry. `shadow_days` counts distinct dates with at least one matched pair and is not incremented again on a rerun. A failed or skipped rerun overwrites that date's summary but leaves the scores file from an earlier good run. Other dates' files are never touched on failure.
+
+### No shared lock, no slowdown (AC11)
+
+The job never takes the scraper lock or any lock S1-S11 uses. It does not import `acquire_lock`/`release_lock` or any pipeline step. `pipeline/tests/test_shadow_revive_p3.py` checks this statically (AST) for `shadow_job.py` and `rolling_shadow.py`. It runs at 06:20, after the marker says S11 finished, at `nice` 10 with low-priority I/O.
+
+Not measured here: that the 06:00 pipeline total is unchanged within ±30 s. That can only be measured on the Mini, so it is left for the Mini replay (compare `total_duration_sec` in `pipeline_metrics_<date>.json` with and without the job installed).
+
+Because it only runs after the marker is `done`, the job should not overlap S1-S11 on a normal day. Overlap can still happen with the next scraper run, which is what the lock check is for.
 
 ## Planned (TPCR-SHADOW-REVIVE-001)
 
-- Phase 3: launchd job after S11 completes, scraper-lock handling (`run_status=skipped_lock`), nonzero exit on `run_status=failed`, no partial outputs on skip, idempotent reruns beyond the overwrite behavior above. Planned.
 - Phase 4: flag rule (7-day streak, seeded paired bootstrap CI excluding 0, gain of at least 0.3 min MAE; adds `win`, `streak`, `ci95_low`, `ci95_high`, `gain_min` to the summary) and removal of the Discord path. Planned.

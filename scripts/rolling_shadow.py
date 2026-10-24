@@ -364,12 +364,15 @@ def archive_predictions(challenger, run_date):
 
 # --- Step 3: Evaluate using shadow_evaluate.py ---
 
-def staging_path(name, eval_date):
-    """Per-challenger score rows for one eval date, merged into scores/ at the end of the run."""
-    return COMPETITION_BASE / "scores" / f".staging-{eval_date}" / f"{name}.parquet"
+def staging_path(name, eval_date, base=None):
+    """Per-challenger score rows for one eval date, merged into scores/ at the end of the run.
+
+    base: root holding scores/ (default: the competition dir; shadow_job passes its stage dir).
+    """
+    return Path(base or COMPETITION_BASE) / "scores" / f".staging-{eval_date}" / f"{name}.parquet"
 
 
-def evaluate_previous_day(challenger, run_date):
+def evaluate_previous_day(challenger, run_date, out_base=None):
     """Evaluate yesterday's predictions against actuals.
 
     The reference_date for evaluation = run_date - 1 (yesterday).
@@ -385,7 +388,7 @@ def evaluate_previous_day(challenger, run_date):
     name = challenger["name"]
     reference_date = (run_date - timedelta(days=1)).isoformat()  # yesterday = the date to evaluate
 
-    scores_out = staging_path(name, reference_date)
+    scores_out = staging_path(name, reference_date, out_base)
     scores_out.parent.mkdir(parents=True, exist_ok=True)
     scores_out.unlink(missing_ok=True)
 
@@ -426,10 +429,12 @@ def matched_pairs(metrics):
     return int(metrics.get("n_matched") or 0)
 
 
-def update_registry(registry, challenger_name, metrics):
+def update_registry(registry, challenger_name, metrics, eval_date=None):
     """Update challenger metrics and check promotion/retirement criteria.
 
     shadow_days only counts evaluations with at least one matched pair.
+    With eval_date, daily_metrics is keyed by date: a rerun for the same date
+    replaces that day's entry and does not increment shadow_days again.
     """
     settings = registry["settings"]
 
@@ -440,11 +445,17 @@ def update_registry(registry, challenger_name, metrics):
         if matched_pairs(metrics) < 1:
             return "shadow"
 
-        c["shadow_days"] = c.get("shadow_days", 0) + 1
-
-        # Store daily metrics
+        # Store daily metrics (one entry per date when eval_date is given)
         daily = c.get("daily_metrics", [])
-        daily.append(metrics)
+        if eval_date is None:
+            c["shadow_days"] = c.get("shadow_days", 0) + 1
+            daily.append(metrics)
+        else:
+            seen = any(m.get("date") == eval_date for m in daily)
+            daily = [m for m in daily if m.get("date") != eval_date]
+            daily.append(dict(metrics, date=eval_date))
+            if not seen:
+                c["shadow_days"] = c.get("shadow_days", 0) + 1
         c["daily_metrics"] = daily
 
         # Compute running averages
@@ -527,8 +538,10 @@ def challenger_summary(challenger, metrics):
     )
 
 
-def write_day_outputs(eval_date, results, errors):
+def write_day_outputs(eval_date, results, errors, out_base=None):
     """Write scores/<date>.parquet and summaries/<date>.json (atomic, overwrite).
+
+    out_base: root for scores/ and summaries/ (default: the competition dir).
 
     results: [(challenger, metrics)] for the challengers that ran. The scores
     file holds every challenger's rows for the date and replaces any earlier
@@ -537,13 +550,14 @@ def write_day_outputs(eval_date, results, errors):
     blocks = {c["name"]: challenger_summary(c, m) for c, m in results}
     scored = [b for b in blocks.values() if b["matched_pairs"] >= 1]
 
-    staged = [staging_path(c["name"], eval_date) for c, _ in results]
+    out_base = Path(out_base or COMPETITION_BASE)
+    staged = [staging_path(c["name"], eval_date, out_base) for c, _ in results]
     staged = [p for p in staged if p.exists()]
     if staged:
         import pandas as pd
 
         scores = pd.concat([pd.read_parquet(p) for p in staged], ignore_index=True)
-        atomic_write_parquet(scores, COMPETITION_BASE / "scores" / f"{eval_date}.parquet")
+        atomic_write_parquet(scores, out_base / "scores" / f"{eval_date}.parquet")
 
     summary = {
         "date": eval_date,
@@ -555,8 +569,8 @@ def write_day_outputs(eval_date, results, errors):
         "run_status": "failed" if errors else "ok",
         "errors": list(errors),
     }
-    atomic_write_json(COMPETITION_BASE / "summaries" / f"{eval_date}.json", summary)
-    shutil.rmtree(COMPETITION_BASE / "scores" / f".staging-{eval_date}", ignore_errors=True)
+    atomic_write_json(out_base / "summaries" / f"{eval_date}.json", summary)
+    shutil.rmtree(out_base / "scores" / f".staging-{eval_date}", ignore_errors=True)
     return summary
 
 
@@ -576,11 +590,21 @@ def parse_args(argv=None):
     return p.parse_args(argv)
 
 
-def main(argv=None):
-    args = parse_args(argv)
-    configure(args.pipeline_base, args.tpcr_dir, args.python)
-    load_env()
-    run_date = args.run_date or date.today()
+class RegistryError(RuntimeError):
+    """The challenger registry is missing or unreadable."""
+
+
+def run_day(run_date, retrain=False, register_fallback=False, out_base=None, post=True):
+    """Run one day. Returns the day's summary dict (None when no challenger is active).
+
+    out_base: where the registry, scores/ and summaries/ are written. Default is
+    the competition dir (the CLI behavior). shadow_job passes a staging dir and
+    commits it itself. Models, forecasts and shadow/ archives are always written
+    in place; they are keyed by date or challenger and are overwritten on rerun.
+    post: post the report to Discord (shadow_job never does; removal is Phase 4).
+    """
+    out_base = Path(out_base) if out_base else COMPETITION_BASE
+    registry_out = out_base / REGISTRY_PATH.name
 
     archive_ref = (run_date + timedelta(days=1)).isoformat()
     eval_ref = (run_date - timedelta(days=1)).isoformat()
@@ -596,10 +620,9 @@ def main(argv=None):
     # Load registry
     registry = load_registry()
     if not registry:
-        print("ERROR: Could not load challenger registry")
-        sys.exit(1)
+        raise RegistryError("Could not load challenger registry")
 
-    if args.register_fallback_v2 and register_fallback_v2(registry):
+    if register_fallback and register_fallback_v2(registry):
         print(f"Registered {FALLBACK_V2}")
 
     active = [c for c in registry["challengers"]
@@ -607,9 +630,9 @@ def main(argv=None):
     print(f"Active challengers: {len(active)}")
 
     if not active:
-        write_registry(registry)  # persist normalization (e.g. retired xgb-dow)
+        write_registry(registry, registry_out)  # persist normalization (e.g. retired xgb-dow)
         print("No active challengers — nothing to do")
-        return
+        return None
 
     report_lines = [f":bar_chart: **Rolling Shadow Report — {run_date.isoformat()}**\n"]
     report_lines.append(f"Active challengers: {len(active)}\n```")
@@ -622,7 +645,7 @@ def main(argv=None):
         print(f"\n--- {name} (Day {challenger.get('shadow_days', 0) + 1}) ---")
 
         # Step 0: Retrain on every production-eligible entity when due
-        reason = needs_retrain(challenger, args.retrain)
+        reason = needs_retrain(challenger, retrain)
         if reason:
             print(f"  Retrain due: {reason}")
             train_result = retrain_challenger(challenger, run_date)
@@ -633,7 +656,7 @@ def main(argv=None):
             mismatch = record_training(challenger, train_result)
             if mismatch:
                 errors.append(mismatch)
-            write_registry(registry)
+            write_registry(registry, registry_out)
 
         # Step 1: Generate forecasts
         forecast_ok = generate_forecasts(challenger)
@@ -650,14 +673,14 @@ def main(argv=None):
             continue
 
         # Step 3: Evaluate previous day (reference_date = run_date - 1)
-        metrics = evaluate_previous_day(challenger, run_date)
+        metrics = evaluate_previous_day(challenger, run_date, out_base)
         if metrics is None:
             errors.append(f"{name}: evaluation failed")
         results.append((challenger, metrics))
 
         # Step 4: Update registry (fallback-scope challengers are tracked on fallback MAE)
         scoped = registry_metrics(metrics, score_scope(challenger))
-        status = update_registry(registry, name, scoped)
+        status = update_registry(registry, name, scoped, eval_ref)
 
         # Build report line
         day = challenger.get("shadow_days", 0)
@@ -682,22 +705,36 @@ def main(argv=None):
     report_lines.append("```")
 
     # Save updated registry
-    write_registry(registry)
+    write_registry(registry, registry_out)
     print("\nRegistry updated.")
 
     # Daily scores + summary for the evaluated date
-    summary = write_day_outputs(eval_ref, results, errors)
+    summary = write_day_outputs(eval_ref, results, errors, out_base)
     print(f"Wrote scores/summary for {eval_ref}: run_status={summary['run_status']}, "
           f"matched_pairs={summary['matched_pairs']}, coverage={summary['coverage_pct']}%")
     for err in errors:
         print(f"  ERROR: {err}")
 
     # Post to Discord (Phase 4 removes this)
+    if post:
+        try:
+            post_discord("\n".join(report_lines))
+            print("Report posted to Discord.")
+        except Exception as e:
+            print(f"WARNING: Discord post failed: {e}")
+    return summary
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    configure(args.pipeline_base, args.tpcr_dir, args.python)
+    load_env()
     try:
-        post_discord("\n".join(report_lines))
-        print("Report posted to Discord.")
-    except Exception as e:
-        print(f"WARNING: Discord post failed: {e}")
+        run_day(args.run_date or date.today(), retrain=args.retrain,
+                register_fallback=args.register_fallback_v2)
+    except RegistryError as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -169,7 +169,7 @@ class MainRunListTest(unittest.TestCase):
             calls["archive"].append(ch["name"])
             return True
 
-        def fake_evaluate(ch, run_date):
+        def fake_evaluate(ch, run_date, out_base=None):
             calls["evaluate"].append(ch["name"])
             return good_metrics(5)
 
