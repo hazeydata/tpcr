@@ -50,18 +50,21 @@ Last resort: restore the backup file over `$DB` while no writer has it open. Scr
 
 First `MISSING DAYS: none` (else exit 4 with the list, before any DB access). Then one line per day:
 
-`<day>: clean_posted=<n> excluded_PRIORITY=<n> excluded_ACTUAL=<n> excluded_other=<n> null_key=<n> dropped_nonpositive_or_unparseable=<n> duplicate_keys=<n> park_date_mismatch=<n> expected=<n> already_in_live=<n> would_insert=<n>`
+`<day>: clean_posted=<n> excluded_PRIORITY=<n> excluded_ACTUAL=<n> excluded_other=<n> null_key=<n> bad_observed_at=<n> wait_nonpositive=<n> duplicate_keys=<n> park_date_mismatch=<n> expected=<n> already_in_live=<n> would_insert=<n>`
 
-(`inserted=` instead of `would_insert=` after `--apply`.) Before the DB is opened, a reconcile line per day is printed (`<day> reconcile: clean_posted=<n> == expected=<n> + drops=<n> (null_key=.. + dropped_nonpositive_or_unparseable=.. + duplicate_keys=.. + park_date_mismatch=..) OK`). `clean_posted == expected + sum(drops)` must hold exactly for every day. If it does not, the script prints `MISMATCH` and `RECONCILE FAILED`, exits 7, and writes nothing.
+(`inserted=` instead of `would_insert=` after `--apply`.) Before the DB is opened, a reconcile line per day is printed (`<day> reconcile: clean_posted=<n> == expected=<n> + drops=<n> (null_key=.. + bad_observed_at=.. + wait_nonpositive=.. + duplicate_keys=.. + park_date_mismatch=..) OK`; `!=` and `MISMATCH` instead of `==` and `OK` when it fails). `clean_posted == expected + sum(drops)` must hold exactly for every day. If it does not, the script prints `MISMATCH` and `RECONCILE FAILED`, exits 7, and writes nothing. The five drop classes are independent: each is counted with its own predicate, in the order below, on the rows still remaining, and none is a remainder. A POSTED row that fits no class (e.g. a non-numeric `wait_time_minutes` such as `abc`, which the prep drops but no class counts) therefore makes the reconcile fail: exit 7, nothing written. That is intended; fix or investigate the clean file.
 
 - `clean_posted`: rows with `wait_time_type == 'POSTED'`. `excluded_*`: all other rows by type (`excluded_other` includes a blank type). They are never inserted.
-- `null_key`: POSTED rows with an empty key column (also logged by the prep).
-- `dropped_nonpositive_or_unparseable`: wait <= 0; unparseable waits stay counted here (scraper prep).
+- `null_key`: POSTED rows with a null or blank `entity_code`, `observed_at` or `wait_time_type` (also logged by the prep).
+- `bad_observed_at`: key present but `observed_at` unparseable.
+- `wait_nonpositive`: `wait_time_minutes` parses as a number and is <= 0. A non-numeric wait is in no class (see reconcile above).
 - `duplicate_keys`: repeat of an `(entity_code, observed_at, wait_time_type)` key.
 - `park_date_mismatch`: derived park date (6 AM rule) is not the file's date. These are not inserted, so nothing outside Oct 1-9 is written.
-- `expected`: clean POSTED minus the four drop classes above (and nothing else). VERIFY equality is checked against it.
+- `expected`: clean POSTED minus the five drop classes above (and nothing else). VERIFY equality is checked against it.
 - `expected` rows are the distinct keys eligible for that day. `already_in_live`: of those, already in `live_waits`. Expect 0.
 - After `--apply`, per day `VERIFY PASS|FAIL <day>: live_posted=.. expected=..` (exact equality), then `LOAD KEY inserted_at=<value>` again and `CLEAN CHECKSUMS UNCHANGED (<n> files)`.
+
+The dry run (the default) opens the DB read-only. Symlinks: the run refuses (exit 2, nothing written) if `fact_tables`, `clean`, or any dir/file below `clean` is a symlink, or anything resolves outside `clean` (the spec is silent on symlinks; refusing is the safer choice).
 
 A `VERIFY FAIL` exits 5 and prints the exact rollback commands (dry run, then `--apply`). Data stays loaded until you roll back.
 
@@ -72,7 +75,7 @@ Clean files are sha256-hashed at start, before the first write and at the end. A
 | Code | Meaning |
 |------|---------|
 | 0 | Success (dry run, load, or rollback) |
-| 2 | Bad input: path outside `fact_tables/clean`, symlinked dir/file, bad file name or park code, missing DB, bad `--load-key`, load key already present, `live_waits` has no `inserted_at`, `--rollback` without `--load-key` |
+| 2 | Bad input: path outside `fact_tables/clean`, symlinked `fact_tables`/`clean`/dir/file below clean, bad file name or park code, missing DB, bad `--load-key`, load key already present, `live_waits` has no `inserted_at`, `--rollback` without `--load-key` |
 | 4 | A day 2026-10-01..09 has no clean CSV; no DB access |
 | 5 | `VERIFY FAIL` for at least one day (data stays loaded), or the rollback count check failed |
 | 6 | A clean file's checksum changed (`CHECKSUM CHANGED: <file>`) |

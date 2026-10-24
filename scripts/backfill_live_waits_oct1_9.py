@@ -7,11 +7,14 @@ Source: output_base/fact_tables/clean/2026-10/{park}_{YYYY-MM-DD}.csv for the fi
 anything else are counted per day (excluded_PRIORITY / excluded_ACTUAL / excluded_other) and never inserted.
 Each day needs at least one clean CSV; otherwise "MISSING DAYS: d1,d2" and exit 4 before any DB access.
 
-Per day, Expected = clean POSTED minus exactly four drop classes (the scraper's own prep): null key; wait <= 0
-(unparseable waits stay counted in this class); duplicate exact key; rows whose 6 AM-rule park_date is not that
-file's day. Only Expected rows are inserted, so nothing outside Oct 1-9 is written. The dry run prints each drop
-class per day and a reconcile line; clean_posted == expected + sum(drops) must hold EXACTLY for every day, else the
-run exits 7 before any DB access or write.
+Per day, Expected = clean POSTED minus five independent drop classes, each counted with its own predicate on the
+rows still remaining after the earlier classes (in this order, mutually exclusive): null_key (entity_code /
+observed_at / wait_time_type null or blank); bad_observed_at (key present, observed_at unparseable);
+wait_nonpositive (wait parses as a number and is <= 0); duplicate_keys (exact key); park_date_mismatch (6 AM-rule
+park_date is not that file's day). Nothing is a remainder: a row whose wait is non-numeric (e.g. 'abc') fits no class
+(prep drops it, it is not counted), so reconcile fails. Only Expected rows are inserted, so nothing outside Oct 1-9
+is written. The dry run prints each drop class per day and a reconcile line; clean_posted == expected + sum(drops)
+must hold EXACTLY for every day, else the run exits 7 before any DB access or write.
 
 Insert is the scraper's exact-key anti-join (insert_missing_live_waits), so a rerun inserts 0.
 
@@ -105,7 +108,7 @@ class RefusedPath(Exception):
 def _check_under_clean(path: Path, clean_root: Path) -> Path:
     """Return resolved path; raise RefusedPath if it (or any dir above it, up to clean_root) escapes clean."""
     resolved = path.resolve()
-    # clean_root itself may be (under) a symlink, e.g. to an external disk; only symlinks below it are refused
+    # run_load already refused a symlinked fact_tables or clean; here every component below clean_root is checked
     if not resolved.is_relative_to(clean_root.resolve()):
         raise RefusedPath(f"{path} resolves to {resolved}, outside {clean_root.resolve()}")
     # No symlinked directory between clean_root and the file (e.g. clean/2026-10 -> elsewhere)
@@ -223,7 +226,7 @@ def print_rollback(args, ob: Path, key: str) -> None:
 def read_day(files: list[Path], day: str) -> tuple[dict, pd.DataFrame]:
     """(counts, eligible rows) for one day: POSTED only, scraper prep, distinct keys, park_date == day."""
     st = dict(clean_posted=0, excluded_PRIORITY=0, excluded_ACTUAL=0, excluded_other=0,
-              null_key=0, dropped_nonpositive_or_unparseable=0, duplicate_keys=0, park_date_mismatch=0)
+              null_key=0, bad_observed_at=0, wait_nonpositive=0, duplicate_keys=0, park_date_mismatch=0)
     frames = []
     for f in files:
         raw = pd.read_csv(f, usecols=lambda c: c in CSV_COLUMNS, dtype=str)
@@ -240,9 +243,15 @@ def read_day(files: list[Path], day: str) -> tuple[dict, pd.DataFrame]:
         if posted.empty:
             continue
         prepped = prepare_live_waits_rows(posted, park_tz_for_park_code(parse_name(f)[0]))
-        nk = int(prepped.attrs.get("dropped_null_key", 0))
-        st["null_key"] += nk
-        st["dropped_nonpositive_or_unparseable"] += len(posted) - nk - len(prepped)
+        # Each class has its own predicate on the rows left by the earlier classes; none is a remainder.
+        null_key = posted[list(LIVE_WAITS_KEY)].apply(
+            lambda c: c.isna() | (c.astype(str).str.strip() == "")).any(axis=1)
+        st["null_key"] += int(null_key.sum())
+        keyed = posted[~null_key]
+        bad_t = pd.to_datetime(keyed["observed_at"], utc=True, errors="coerce").isna()
+        st["bad_observed_at"] += int(bad_t.sum())
+        wait = pd.to_numeric(keyed.loc[~bad_t, "wait_time_minutes"], errors="coerce")
+        st["wait_nonpositive"] += int((wait <= 0).sum())
         frames.append(prepped)
     df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=list(LIVE_WAITS_COLUMNS))
     if not df.empty:
@@ -274,7 +283,7 @@ def count_present(con, df: pd.DataFrame) -> int:
 
 # --------------------------------------------------------------------------- reconcile
 
-DROP_CLASSES = ("null_key", "dropped_nonpositive_or_unparseable", "duplicate_keys", "park_date_mismatch")
+DROP_CLASSES = ("null_key", "bad_observed_at", "wait_nonpositive", "duplicate_keys", "park_date_mismatch")
 
 
 def reconcile(plans: dict) -> bool:
@@ -402,6 +411,10 @@ def build_parser() -> argparse.ArgumentParser:
 def run_load(args, ob: Path, db: Path, now, state: dict) -> int:
     clean_root = ob / "fact_tables" / "clean"
     try:
+        # The spec is silent on symlinks; refusing is the safer choice.
+        for d in (ob / "fact_tables", clean_root):
+            if d.is_symlink():
+                raise RefusedPath(f"{d} is a symlink; refusing")
         by_day = day_files(clean_root)
         missing = [d for d in DAYS if not by_day[d]]
         print(f"MISSING DAYS: {','.join(missing) if missing else 'none'}")

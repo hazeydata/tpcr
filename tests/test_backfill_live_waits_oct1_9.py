@@ -172,9 +172,9 @@ def test_ac3_reconciliation_null_key_and_nothing_outside_days(env, capsys):
     out = capsys.readouterr().out
     day1 = re.search(r"^  2026-10-01: .*$", out, re.M).group(0)
     assert ("clean_posted=10 excluded_PRIORITY=1 excluded_ACTUAL=1 excluded_other=1 null_key=1 "
-            "dropped_nonpositive_or_unparseable=1 duplicate_keys=1 park_date_mismatch=1 expected=6 ") in day1
-    assert ("2026-10-01 reconcile: clean_posted=10 == expected=6 + drops=4 (null_key=1 + "
-            "dropped_nonpositive_or_unparseable=1 + duplicate_keys=1 + park_date_mismatch=1) OK") in out
+            "bad_observed_at=0 wait_nonpositive=1 duplicate_keys=1 park_date_mismatch=1 expected=6 ") in day1
+    assert ("2026-10-01 reconcile: clean_posted=10 == expected=6 + drops=4 (null_key=1 + bad_observed_at=0 + "
+            "wait_nonpositive=1 + duplicate_keys=1 + park_date_mismatch=1) OK") in out
     assert "2026-10-02 reconcile: clean_posted=8 == expected=4 + drops=4" in out
     assert out.count(" OK\n") == 9 and "MISMATCH" not in out
     assert f"TOTAL: expected={EXPECTED_TOTAL} " in out
@@ -189,9 +189,32 @@ def test_ac3_each_drop_class_counted_and_reconciles(env, capsys):
     for day in DAYS:
         line = re.search(rf"^  {day}: .*$", out, re.M).group(0)
         for c in bf.DROP_CLASSES:
-            assert f"{c}=1 " in line  # one row of each class per day (day_rows)
+            # one row of each class per day (day_rows), except bad_observed_at (own test)
+            assert f"{c}={0 if c == 'bad_observed_at' else 1} " in line
         assert f"{day} reconcile:" in out
     assert out.index("2026-10-01 reconcile:") < out.index("2026-10-01: clean_posted")
+
+
+def test_bad_observed_at_counted(env, capsys):
+    path = env["clean"] / "mk_2026-10-04.csv"
+    write_csv(path, day_rows("2026-10-04") + [("A", "not-a-time", "POSTED", 10)])
+    assert run(env) == 0
+    out = capsys.readouterr().out
+    line = re.search(r"^  2026-10-04: .*$", out, re.M).group(0)
+    assert "clean_posted=9 " in line and "bad_observed_at=1 " in line and "wait_nonpositive=1 " in line
+    assert "2026-10-04 reconcile: clean_posted=9 == expected=4 + drops=5" in out
+    assert "MISMATCH" not in out and "RECONCILE FAILED" not in out
+
+
+def test_reconcile_row_in_no_class_exits_7(env, capsys):
+    path = env["clean"] / "mk_2026-10-04.csv"
+    write_csv(path, day_rows("2026-10-04") + [("A", ts("2026-10-04", "19:00"), "POSTED", "abc")])
+    before = sha(env["db"])
+    assert run(env, "--apply") == bf.EXIT_RECONCILE
+    out = capsys.readouterr().out
+    assert "2026-10-04 reconcile:" in out and "MISMATCH" in out and "RECONCILE FAILED" in out
+    assert "LOAD KEY" not in out
+    assert counts(env["db"]) == {} and sha(env["db"]) == before
 
 
 @pytest.mark.parametrize("extra", [(), ("--apply",)])
@@ -490,13 +513,52 @@ def test_symlinked_month_dir_refused(env, tmp_path, capsys):
     assert sha(env["db"]) == before
 
 
-def test_symlinked_clean_root_allowed(env, tmp_path):
+def test_symlinked_clean_root_refused(env, tmp_path, capsys):
     clean_root = env["base"] / "fact_tables" / "clean"
     external = tmp_path / "external_disk" / "clean"
     external.parent.mkdir()
     shutil.move(str(clean_root), str(external))
     clean_root.symlink_to(external, target_is_directory=True)
+    before = sha(env["db"])
+    assert run(env, "--apply") == 2
+    assert "REFUSED" in capsys.readouterr().out
+    assert sha(env["db"]) == before
+
+
+def test_symlinked_fact_tables_refused(env, tmp_path, capsys):
+    fact = env["base"] / "fact_tables"
+    other = tmp_path / "other_tree" / "fact_tables"
+    other.parent.mkdir()
+    shutil.move(str(fact), str(other))
+    fact.symlink_to(other, target_is_directory=True)
+    before = sha(env["db"])
+    assert run(env, "--apply") == 2
+    assert "REFUSED" in capsys.readouterr().out
+    assert sha(env["db"]) == before and counts(env["db"]) == {}
+
+
+def test_symlink_inside_clean_refused(env, capsys):
+    real = env["clean"].parent / "_real_2026-10"  # inside clean, so the resolve() check passes
+    env["clean"].rename(real)
+    env["clean"].symlink_to(real, target_is_directory=True)
+    assert env["clean"].resolve().is_relative_to((env["base"] / "fact_tables" / "clean").resolve())
+    before = sha(env["db"])
+    assert run(env, "--apply") == 2
+    assert "REFUSED" in capsys.readouterr().out
+    assert sha(env["db"]) == before and counts(env["db"]) == {}
+
+
+def test_dry_run_opens_db_read_only(env, monkeypatch):
+    real_connect = duckdb.connect
+    calls = []
+
+    def recording(*a, **k):
+        calls.append(k)
+        return real_connect(*a, **k)
+
+    monkeypatch.setattr(bf.duckdb, "connect", recording)
     assert run(env) == 0
+    assert calls and all(k.get("read_only") is True for k in calls)
 
 
 def test_symlinked_file_refused(env, tmp_path):
@@ -530,16 +592,18 @@ def test_ac13_rollout_doc_matches_code():
                  bf.EXIT_RECONCILE, bf.EXIT_WINDOW, bf.EXIT_LOCKED):
         assert f"| {code} |" in doc, code
     assert bf.ETL_WINDOW_ET == (dtime(5, 30), dtime(9, 0)) and bf.REPLAY_WINDOW_ET == (dtime(4, 25), dtime(4, 45))
-    assert bf.DROP_CLASSES == ("null_key", "dropped_nonpositive_or_unparseable", "duplicate_keys", "park_date_mismatch")
+    assert bf.DROP_CLASSES == ("null_key", "bad_observed_at", "wait_nonpositive", "duplicate_keys",
+                               "park_date_mismatch")
     readme = (_SCRIPT.parent / "README.md").read_text()
     for text in (doc, readme[readme.index("### `backfill_live_waits_oct1_9.py`"):]):
         assert "05:30-09:00" in text and "04:25-04:45" in text and "reconcile" in text
+        assert "dropped_nonpositive_or_unparseable" not in text
         assert "05:30-07:00" not in text and "04:30-04:40" not in text
     assert "clean_posted == expected + sum(drops)" in doc and "exit 9" in doc and "no marker" in doc
     for s in ("MISSING DAYS:", "CHECKSUM CHANGED:", "CLEAN CHECKSUMS UNCHANGED", "LOAD KEY inserted_at=",
               "ROLLBACK DRY RUN: would delete", "ROLLBACK VERIFY PASS", "VERIFY PASS", "VERIFY FAIL",
               "REFUSED: inside", "LOCKED:", "excluded_PRIORITY=", "excluded_ACTUAL=", "excluded_other=",
-              "null_key=", "dropped_nonpositive_or_unparseable=", "duplicate_keys=", "park_date_mismatch=",
+              "null_key=", "bad_observed_at=", "wait_nonpositive=", "duplicate_keys=", "park_date_mismatch=",
               "expected=", "already_in_live=", "would_insert=", "05:30", "09:00", "04:25", "04:45", "reconcile"):
         assert s in doc, s
     for gone in ("--parity-date", "--glob", "--start", "--end", "--allow-missing", "--row-tol", "--dry-run",
