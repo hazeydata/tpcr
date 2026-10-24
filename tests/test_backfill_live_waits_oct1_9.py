@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import errno
+
 import hashlib
 import importlib.util
 import os
@@ -806,6 +808,21 @@ def test_simulated_lstat_stat_error_during_scan_refused(env, capsys, monkeypatch
 def test_day_files_oserror_refused_before_connect(env, capsys, monkeypatch, connect_spy, mode):
     def boom(*a, **k):
         raise PermissionError(13, "Permission denied", str(env["clean"]))
+
+    monkeypatch.setattr(bf, "day_files", boom)
+    rc = run(env, *mode)
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "any OSError during the pre-open scan exits 2" in out and str(env["clean"]) in out
+    assert connect_spy == []
+    assert counts(env["db"]) == {}
+
+
+@pytest.mark.parametrize("mode", [["--apply"], []])
+def test_day_files_eio_refused_before_connect(env, capsys, monkeypatch, connect_spy, mode):
+    # a non-permission OSError (EIO) must also exit 2: pins the whole-scan `except OSError` (not PermissionError)
+    def boom(*a, **k):
+        raise OSError(errno.EIO, "Input/output error", str(env["clean"]))
 
     monkeypatch.setattr(bf, "day_files", boom)
     rc = run(env, *mode)
