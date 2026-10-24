@@ -1,4 +1,4 @@
-"""/ask provider selection: Anthropic first with Qwen fallback, TPCR_DATA_ROOT required."""
+"""/ask provider selection: OpenRouter first with Qwen fallback, TPCR_DATA_ROOT required."""
 
 import asyncio
 import os
@@ -17,7 +17,7 @@ QWEN_REPLY = {"choices": [{"message": {"role": "assistant", "content": "qwen ans
 def _ask(api_key="sk-test", claude=None, chat=None):
     claude = claude or AsyncMock(return_value="claude answer")
     chat = chat or AsyncMock(return_value=QWEN_REPLY)
-    with patch.object(aa, "_claude_loop", claude), patch.object(aa, "_chat", chat), \
+    with patch.object(aa, "_openrouter_loop", claude), patch.object(aa, "_chat", chat), \
             patch.object(aa, "track_usage", return_value=(1, -1)), \
             patch.object(aa, "log_question") as log, patch.object(aa, "_trigger_self_heal"):
         answer = asyncio.run(aa.ask_agent("q", "u", api_key=api_key))
@@ -40,25 +40,26 @@ def test_data_path_uses_env_with_tilde_expansion(monkeypatch):
     assert aa.data_path("wti", "wti.parquet") == os.path.join(expected, "wti", "wti.parquet")
 
 
-def test_anthropic_with_key_uses_claude_and_not_qwen(monkeypatch):
-    monkeypatch.setenv("TPCR_ASK_PROVIDER", "anthropic")
+@pytest.mark.parametrize("provider", ["openrouter", "anthropic"])
+def test_openrouter_with_key_uses_claude_and_not_qwen(monkeypatch, provider):
+    monkeypatch.setenv("TPCR_ASK_PROVIDER", provider)
     answer, claude, chat, log = _ask()
     assert answer == "claude answer"
     claude.assert_awaited_once()
     chat.assert_not_called()
-    assert log.call_args.args[-1] == "claude-sonnet-4-6"
+    assert log.call_args.args[-1] == "anthropic/claude-sonnet-4.6"
 
 
 def test_claude_timeout_falls_back_to_qwen(monkeypatch):
-    monkeypatch.setenv("TPCR_ASK_PROVIDER", "anthropic")
+    monkeypatch.setenv("TPCR_ASK_PROVIDER", "openrouter")
     answer, claude, chat, _ = _ask(claude=AsyncMock(side_effect=asyncio.TimeoutError()))
     assert answer == "qwen answer"
     claude.assert_awaited_once()
     chat.assert_awaited()
 
 
-def test_anthropic_without_api_key_goes_to_qwen(monkeypatch):
-    monkeypatch.setenv("TPCR_ASK_PROVIDER", "anthropic")
+def test_openrouter_without_api_key_goes_to_qwen(monkeypatch):
+    monkeypatch.setenv("TPCR_ASK_PROVIDER", "openrouter")
     answer, claude, chat, _ = _ask(api_key=None)
     assert answer == "qwen answer"
     claude.assert_not_called()
@@ -71,7 +72,7 @@ def test_qwen_provider_skips_claude():
     claude.assert_not_called()
 
 
-def test_default_provider_is_anthropic(monkeypatch):
+def test_default_provider_is_openrouter(monkeypatch):
     monkeypatch.delenv("TPCR_ASK_PROVIDER", raising=False)
     answer, claude, chat, _ = _ask()
     assert answer == "claude answer"

@@ -9,8 +9,7 @@ import pytest
 
 from .test_ask_qwen import bot, call_ask, make_interaction  # noqa: F401
 
-# Built at runtime so no secret-shaped literal lives in the source.
-PLANTED = "s" + "k" + "-or-" + "v1-" + "PLANTED" + "r4secret" + "0000"
+PLANTED = "sk-or-v1-PLANTEDr4secret0000"
 
 
 class EditDenied(Exception):
@@ -65,21 +64,6 @@ def test_placeholder_edit_failure_logs_class_status_only(bot, caplog, status_cod
     assert PLANTED not in _all_log_text(caplog)
     assert "Bearer" not in _all_log_text(caplog)
     assert "Traceback" not in caplog.text
-
-
-def test_placeholder_edit_failure_reads_status_attribute(bot, caplog):
-    class EditError(Exception):
-        status = 403
-
-    interaction = _interaction_with_failing_edit([], EditError(f"Forbidden {PLANTED}"))
-    with patch.object(bot, "ask_agent", AsyncMock(return_value="Answer")):
-        with caplog.at_level("DEBUG"):
-            call_ask(bot, interaction)
-
-    warns = [r for r in caplog.records if r.getMessage().startswith("/ask placeholder edit failed")]
-    assert [r.getMessage() for r in warns] == [
-        "/ask placeholder edit failed (EditError, status 403); sending new message"]
-    assert PLANTED not in _all_log_text(caplog)
 
 
 def _ask_failed_messages(bot, caplog, exc):

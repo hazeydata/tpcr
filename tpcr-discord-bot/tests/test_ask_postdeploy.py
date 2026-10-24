@@ -30,92 +30,69 @@ def chat_reply(content="", tool_calls=None):
 
 # ---------- (1) Claude payload ----------
 
-def _validate_claude_request(kw):
-    """Structural checks the Messages API enforces (subset that 400s)."""
-    assert re.fullmatch(r"claude-[a-z]+-\d+(-\d+)?(-\d{8})?", kw["model"])
-    assert isinstance(kw["max_tokens"], int) and 0 < kw["max_tokens"] <= 64000
-    assert isinstance(kw["system"], str) and kw["system"].strip()
-    for t in kw["tools"]:
-        assert set(t) == {"name", "description", "input_schema"}
-        assert re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", t["name"])
-        assert t["input_schema"]["type"] == "object"
-    msgs = kw["messages"]
-    assert msgs[0]["role"] == "user"
+def _validate_openrouter_request(payload):
+    assert payload["model"] == "anthropic/claude-sonnet-4.6"
+    assert isinstance(payload["max_tokens"], int) and 0 < payload["max_tokens"] <= 64000
+    for t in payload["tools"]:
+        assert t["type"] == "function"
+        assert re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", t["function"]["name"])
+        assert t["function"]["parameters"]["type"] == "object"
+    msgs = payload["messages"]
+    assert msgs[0]["role"] == "system" and msgs[0]["content"].strip()
+    assert msgs[1]["role"] == "user"
     pending = set()
-    for i, m in enumerate(msgs):
-        assert m["role"] == ("user" if i % 2 == 0 else "assistant")
-        content = m["content"]
-        if isinstance(content, str):
-            assert content.strip()
-            continue
-        assert content, "empty content list"
-        for b in content:
-            assert isinstance(b, dict), "blocks must be plain dicts"
-            if b["type"] == "text":
-                assert b["text"].strip(), "empty text block"
-            elif b["type"] == "tool_use":
-                pending.add(b["id"])
-            elif b["type"] == "tool_result":
-                assert b["tool_use_id"] in pending, "tool_result without tool_use"
-                assert isinstance(b["content"], str) and b["content"]
-                pending.discard(b["tool_use_id"])
-        if m["role"] == "user":
-            assert not pending, "tool_use not answered by the next user turn"
+    for m in msgs[2:]:
+        if m["role"] == "assistant":
+            assert not pending
+            pending = {c["id"] for c in m["tool_calls"]}
+        else:
+            assert m["role"] == "tool" and m["tool_call_id"] in pending
+            assert isinstance(m["content"], str) and m["content"]
+            pending.discard(m["tool_call_id"])
 
 
-def test_claude_payload_valid_across_tool_rounds(monkeypatch):
+def test_openrouter_payload_valid_across_tool_rounds(monkeypatch):
     calls = []
+
+    def call(cid, sql):
+        return {"id": cid, "type": "function", "function": {"name": "run_query", "arguments": json.dumps({"sql": sql})}}
+
     replies = [
-        NS(content=[NS(type="text", text=""),  # empty text block alongside a tool_use
-                    NS(type="tool_use", id="tu1", name="run_query", input={"sql": "SELECT 1"})]),
-        NS(content=[NS(type="tool_use", id="tu2", name="run_query", input={"sql": "SELECT 2"}),
-                    NS(type="tool_use", id="tu3", name="run_query", input={"sql": "DROP TABLE x"})]),
-        NS(content=[NS(type="text", text="Seven Dwarfs averaged 51 min.")]),
+        chat_reply(tool_calls=[call("tu1", "SELECT 1")]),
+        chat_reply(tool_calls=[call("tu2", "SELECT 2"), call("tu3", "DROP TABLE x")]),
+        chat_reply("Seven Dwarfs averaged 51 min."),
     ]
 
-    async def create(**kw):
-        calls.append({**kw, "messages": [dict(m) for m in kw["messages"]]})
-        _validate_claude_request(calls[-1])
+    async def post(api_key, payload):
+        calls.append(json.loads(json.dumps(payload)))
+        _validate_openrouter_request(calls[-1])
         return replies[len(calls) - 1]
 
-    fake = NS(AsyncAnthropic=lambda **k: NS(messages=NS(create=create)))
-    monkeypatch.setitem(sys.modules, "anthropic", fake)
+    monkeypatch.setattr(aa, "_post_openrouter", post)
     monkeypatch.setattr(aa, "run_duckdb_query", lambda sql: "x\n-\n1")
-    answer, rounds = asyncio.run(aa._claude_loop("k", "system prompt", "q"))
+    answer, rounds = asyncio.run(aa._openrouter_loop("k", "system prompt", "q"))
     assert answer == "Seven Dwarfs averaged 51 min." and rounds == 3
     assert len(calls) == 3
-    assert calls[0]["model"] == "claude-sonnet-4-6"
 
 
-def test_requirements_pin_anthropic_sdk():
+def test_requirements_do_not_pin_anthropic_sdk():
     req = open(os.path.join(ROOT, "requirements.txt")).read()
-    assert re.search(r"^anthropic>=", req, re.M)
+    assert not re.search(r"^anthropic", req, re.M)
 
 
-def _status_error(code, body):
-    anthropic = pytest.importorskip("anthropic")
-    req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
-    return anthropic.BadRequestError(f"Error code: {code} {SECRET}", response=httpx.Response(code, request=req),
-                                     body=body)
-
-
-@pytest.mark.parametrize("message", [
-    "Your credit balance is too low to access the Anthropic API.",
-    "messages: text content blocks must be non-empty",
-])
-def test_ac27_400_logs_class_and_status_only(message, monkeypatch, caplog):
-    """AC27/AC24: class name + HTTP status only; no message text, no error type, no key."""
-    monkeypatch.setenv("TPCR_ASK_PROVIDER", "anthropic")
-    err = _status_error(400, {"type": "error", "error": {"type": "invalid_request_error",
-                                                         "message": f"{message} key={SECRET}"}})
-    with patch("ask_agent._claude_loop", AsyncMock(side_effect=err)), \
+@pytest.mark.parametrize("code", [400, 429])
+def test_ac27_http_error_logs_class_and_status_only(code, monkeypatch, caplog):
+    """AC27/AC24: class name + HTTP status only; no message text, no key."""
+    monkeypatch.setenv("TPCR_ASK_PROVIDER", "openrouter")
+    err = aa.OpenRouterHTTPError(code)
+    with patch("ask_agent._openrouter_loop", AsyncMock(side_effect=err)), \
          patch("ask_agent._chat", AsyncMock(return_value=chat_reply("qwen answer"))), \
          caplog.at_level(logging.DEBUG):
         assert asyncio.run(aa.ask_agent("q", "u", api_key=SECRET)) == "qwen answer"
-    lines = [r.getMessage() for r in caplog.records if "Claude /ask failed" in r.getMessage()]
-    assert lines == ["Claude /ask failed (BadRequestError, status 400); falling back to Qwen"]
+    lines = [r.getMessage() for r in caplog.records if "OpenRouter /ask failed" in r.getMessage()]
+    assert lines == [f"OpenRouter /ask failed (OpenRouterHTTPError, status {code}); falling back to Qwen"]
     assert "TESTSECRET123" not in caplog.text
-    for fragment in (message, "credit", "content blocks", "invalid_request_error", "Error code"):
+    for fragment in ("credit", "content blocks", "invalid_request_error", "Error code"):
         assert fragment not in caplog.text
 
 
@@ -523,19 +500,16 @@ def test_parser_guard_bypass_never_reaches_duckdb_qwen(sql, monkeypatch):
 
 
 @pytest.mark.parametrize("sql", BYPASS_SQL)
-def test_parser_guard_bypass_never_reaches_duckdb_claude(sql, monkeypatch):
-    replies = [
-        NS(content=[NS(type="tool_use", id="tu1", name="run_query", input={"sql": sql})]),
-        NS(content=[NS(type="text", text="done")]),
-    ]
+def test_parser_guard_bypass_never_reaches_duckdb_openrouter(sql, monkeypatch):
+    call = {"id": "tu1", "type": "function", "function": {"name": "run_query", "arguments": json.dumps({"sql": sql})}}
+    replies = [chat_reply(tool_calls=[call]), chat_reply("done")]
 
-    async def create(**kw):
+    async def post(api_key, payload):
         return replies.pop(0)
 
-    fake = NS(AsyncAnthropic=lambda **k: NS(messages=NS(create=create)))
-    monkeypatch.setitem(sys.modules, "anthropic", fake)
+    monkeypatch.setattr(aa, "_post_openrouter", post)
     monkeypatch.setattr(aa.duckdb, "connect", lambda *a, **k: pytest.fail("connected to DuckDB"))
-    answer, _ = asyncio.run(aa._claude_loop("k", "system prompt", "q"))
+    answer, _ = asyncio.run(aa._openrouter_loop("k", "system prompt", "q"))
     assert answer == "done"
 
 
@@ -668,24 +642,20 @@ def test_ac28_parse_error_text_reaches_model_qwen(sql, monkeypatch):
 
 
 @pytest.mark.parametrize("sql", PARSE_ERROR_SQL)
-def test_ac28_parse_error_text_reaches_model_claude(sql, monkeypatch):
-    replies = [
-        NS(content=[NS(type="tool_use", id="tu1", name="run_query", input={"sql": sql})]),
-        NS(content=[NS(type="text", text="done")]),
-    ]
+def test_ac28_parse_error_text_reaches_model_openrouter(sql, monkeypatch):
+    call = {"id": "tu1", "type": "function", "function": {"name": "run_query", "arguments": json.dumps({"sql": sql})}}
+    replies = [chat_reply(tool_calls=[call]), chat_reply("done")]
     sent = []
 
-    async def create(**kw):
-        sent.append(kw["messages"])
+    async def post(api_key, payload):
+        sent.append(json.loads(json.dumps(payload)))
         return replies.pop(0)
 
-    fake = NS(AsyncAnthropic=lambda **k: NS(messages=NS(create=create)))
-    monkeypatch.setitem(sys.modules, "anthropic", fake)
+    monkeypatch.setattr(aa, "_post_openrouter", post)
     monkeypatch.setattr(aa.duckdb, "connect", lambda *a, **k: pytest.fail("connected to DuckDB"))
-    answer, _ = asyncio.run(aa._claude_loop("k", "system prompt", "q"))
+    answer, _ = asyncio.run(aa._openrouter_loop("k", "system prompt", "q"))
     assert answer == "done"
-    results = [b["content"] for m in sent[-1] if m["role"] == "user" and isinstance(m["content"], list)
-               for b in m["content"] if b.get("type") == "tool_result"]
+    results = [m["content"] for m in sent[-1]["messages"] if m["role"] == "tool"]
     assert results == [_parser_error_text(sql)]
     assert "Only one SQL statement" not in results[0]
 
