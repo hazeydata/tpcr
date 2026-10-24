@@ -66,3 +66,8 @@ def require_range(value: float, min_val: float, max_val: float, name: str):
         raise ValidationError(
             f"{name}={value} outside expected range [{min_val}, {max_val}]"
         )
+
+
+class StageFailed(ValidationError):
+    """Raised after a stage finishes its work when real errors occurred (stage exits nonzero)."""
+    pass
