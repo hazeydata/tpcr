@@ -129,6 +129,8 @@ python scripts/init_live_duckdb.py [--output-base PATH]
 
 Creates `output_base/tpcr_live.duckdb` with schema and backfills from existing data. Scraper, WTI, forecast, and dimension scripts dual-write to it when it exists.
 
+`live_waits` is written only by the queue-times scraper (plus the daily staging replay once TPCR-S11-LOCK-001 lands); the morning ETL does not backfill it, so a gap in the scraper leaves a gap in `live_waits` even though `fact_tables/clean` has the rows. One-off gap fill: `scripts/backfill_live_waits_oct1_9.py` (2026-10-01..09 POSTED only, dry run by default, `--apply` to load, per-day reconcile `clean_posted == expected + sum(drops)` (exit 7 on mismatch), VERIFY exact; refused 05:30-09:00 and 04:25-04:45 ET, exit 9 on DB lock; prep approved, not run; see `docs/rollout/TPCR-BACKFILL-OCT1-9.md`).
+
 ### Manual daily run
 
 ```bash

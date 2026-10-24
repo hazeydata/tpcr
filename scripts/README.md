@@ -321,6 +321,28 @@ python scripts/inspect_entity_index.py --limit 50
 
 **Options**: `--output-base`, `--needing-modeling` (show only entities needing re-modeling), `--limit` (default: 20).
 
+### `backfill_live_waits_oct1_9.py` (one-off, TPCR-BACKFILL-OCT1-9)
+
+Loads the Oct 1-9 2026 **POSTED** waits from `fact_tables/clean/2026-10/{park}_{date}.csv` into `tpcr_live.duckdb` `live_waits`, exactly once. Days are fixed (2026-10-01..09). PRIORITY/ACTUAL rows are out of scope (counted per day as `excluded_*`, never inserted). Rows are prepped with the scraper's `prepare_live_waits_rows` and inserted with `insert_missing_live_waits` (exact-key anti-join), so a rerun inserts 0. Reads only under `fact_tables/clean`: refuses with exit 2 and writes nothing if `fact_tables` or `clean` is a symlink, if any symlink (file or dir, at any depth, on or off the read path) exists anywhere under `clean`, or, per Spec R3a, because any OSError during the pre-open scan exits 2 (the scan covers the symlink walk, every per-entry stat/is_symlink/access check (an unreadable or unsearchable dir and an unreadable file also refuse), listing, hashing and reading the clean files; the refusal names the path and nothing is written), or if anything resolves outside `clean` (the spec is silent on symlinks; refusing is the safer choice). The walk runs before any DB open. Never writes a CSV. Prep approved, **not run**; running needs Fred's go.
+
+```bash
+python scripts/backfill_live_waits_oct1_9.py --output-base "$OB"            # dry run (default, read-only)
+python scripts/backfill_live_waits_oct1_9.py --output-base "$OB" --apply    # load (needs the DuckDB write lock)
+python scripts/backfill_live_waits_oct1_9.py --output-base "$OB" --rollback --load-key '<logged value>'          # rollback dry run
+python scripts/backfill_live_waits_oct1_9.py --output-base "$OB" --rollback --load-key '<logged value>' --apply  # rollback
+```
+
+- `MISSING DAYS: <d1>,<d2>` (or `none`); any missing day: exit `4` before any DB access.
+- Per day it prints `clean_posted`, `excluded_PRIORITY/ACTUAL/other`, `null_key`, `bad_observed_at` (key present, `observed_at` unparseable), `wait_nonpositive` (wait is a number <= 0), `duplicate_keys`, `park_date_mismatch` (not inserted), `expected`, `already_in_live`, `would_insert` (`inserted` with `--apply`), plus a reconcile line per day (`<day> reconcile: clean_posted=<n> == expected=<n> + drops=<n> (null_key=.. + bad_observed_at=.. + wait_nonpositive=.. + duplicate_keys=.. + park_date_mismatch=..) OK`). The five drop classes are independent, each counted with its own predicate on the rows remaining after the earlier ones; none is a remainder. `clean_posted == expected + sum(drops)` must hold exactly, else `MISMATCH` / `RECONCILE FAILED` and exit `7` before any DB access or write. A row in no class (e.g. non-numeric wait `abc`) therefore fails the reconcile (exit `7`, no write); that is intended. The dry run opens the DB read-only.
+- `--apply` tags every inserted row with one `inserted_at` (UTC, microseconds; `--load-key 'YYYY-MM-DD HH:MM:SS.ffffff'` overrides), logged as `LOAD KEY inserted_at=<value>` at start and end. A key already present, or no `inserted_at` column, is refused (exit 2).
+- `VERIFY PASS|FAIL <day>: live_posted=.. expected=..` is an exact match; any FAIL exits `5` and prints the rollback commands.
+- Rollback deletes only rows with `inserted_at` equal to the key; without `--apply` it is a dry run (`ROLLBACK DRY RUN: would delete <n> rows ...`).
+- sha256 of the clean files at start, before the first write and at the end; a change prints `CHECKSUM CHANGED: <file>` and exits `6`.
+- Refused inside the ETL (05:30-09:00 ET) and replay (04:25-04:45 ET) windows, half-open `[start,end)`, at start and before each day's insert (exit `8`). S11 is inside the ETL window, so no marker. DB locked: exit `9` at once, no retry. While `--apply` holds the write connection the scraper parks batches in `state/live_waits_pending/`; run mid-afternoon ET.
+
+Options: `--output-base`, `--db`, `--apply`, `--load-key`, `--rollback`.
+Exit codes: `0` ok, `2` bad input / path refused / no `inserted_at` / key clash / rollback without key, `4` missing days, `5` VERIFY or rollback check failed, `6` clean checksum changed, `7` reconcile mismatch, `8` protected window, `9` DB locked. Rollout: [docs/rollout/TPCR-BACKFILL-OCT1-9.md](../docs/rollout/TPCR-BACKFILL-OCT1-9.md).
+
 ## Additional Scripts (summary)
 
 - **Modeling pipeline**: `build_posted_aggregates.py`, `train_batch_entities.py`, `train_entity_model.py`, `generate_forecast.py`, `generate_backfill.py`, `calculate_wti.py`, `test_modeling_pipeline.py` — see [README.md](../README.md) and [docs/MODELING_AND_WTI_METHODOLOGY.md](../docs/MODELING_AND_WTI_METHODOLOGY.md).
