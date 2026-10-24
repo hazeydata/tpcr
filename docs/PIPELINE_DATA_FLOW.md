@@ -279,28 +279,22 @@ Creates a single table: for every (entity_code, park_date) combination, is that 
 <a name="step-3-posted-aggregates"></a>
 ## Step 3: Posted Aggregates
 
-**Script:** `scripts/build_posted_aggregates_fast.py`  
-**Time:** ~7 seconds  
-**What it does:** Computes historical average POSTED wait times, grouped by entity × date_group_id × hour of day. These averages are used by the forecast step as the "expected posted time" for future predictions.
+**v3 status (TPCR-S4-AGG-001):** this v2 step no longer runs. `posted_aggregates.parquet`, written by `scripts/build_posted_aggregates_fast.py`, has no reader and is a dead file; nothing in the forecast uses it. The live equivalent is pipeline v3 step S4 below.
 
-### Grouping:
+### Model Aggregates (v3 step S4)
 
-For every combination of (entity_code, date_group_id, hour), this computes:
-- Median posted wait time
-- Mean posted wait time (with geo-decay weighting: recent data counts more, 2-year half-life)
-- Count of observations
+`pipeline/steps/s04_aggregates.py` rebuilds `aggregates/model_aggregates.parquet` on every production run, using `pipeline/core/model_aggregates.py` (also behind `scripts/build_model_aggregates.py`):
 
-### Example:
-> "Space Mountain (MK01) on a FEB_WEEK3_TUE at hour 14 (2 PM) typically has a posted wait of 55 minutes."
-
-- **Input:** `fact_tables/parquet/*.parquet` + `dimdategroupid.csv`
-- **Output:** `aggregates/posted_aggregates.parquet` (~1.7M rows, 19 MB)
-
-### Also: Model Aggregates
-
-A separate script (`scripts/build_model_aggregates.py`) computes similar aggregates at 15-minute resolution (time_slot 0–95) with additional stats (percentiles, std dev). These are used as fallback predictions for entities without trained models.
-
-- **Output:** `aggregates/model_aggregates.parquet` (~6.4M rows, 85 MB)
+- **Input:** `fact_tables/parquet/*.parquet` POSTED rows with wait > 0, park dates through yesterday, all history; `dimdategroupid.csv`; `dimentity.csv` (fastpass booths excluded).
+- **Dedupe:** one row per natural key (entity_code, observed_at, wait_time_type, park_date) before aggregating.
+- **Grouping:** entity_code × date_group_id × 15-minute clock slot (`time_slot` 0–95 = hour*4 + minute//15) and hour_of_day.
+- **Stats:** median, mean, p25, p75, std, min, max, a 2-year half-life weighted mean, sample_count, date_count, min/max park_date.
+- **Minimum count:** cells with fewer than 5 observations are not written (absent, never 0).
+- **Write:** to a temp file, validated (schema, 96 slots, 24 hours, max park_date ≥ yesterday), then atomically renamed. Sidecar `model_aggregates.meta.json` records build time, row count and input max date.
+- **Failure:** the previous file is left untouched, S4 raises, the run stops and exits nonzero.
+- **Shadow mode:** S4 does not rebuild. It validates the production file (row count and freshness: sidecar/max park_date ≥ yesterday) and fails if stale.
+- **Readers:** S8 forecast (`wait_median` as posted_time; every fallback to 5 minutes is logged with entity and reason, and counted; warns, does not fail, only when the file is stale, i.e. max park_date < yesterday, read from the sidecar or, if the sidecar is missing or unreadable, from the parquet itself; a fresh file with no sidecar gives no warning) and `dashboard/api.py`.
+- **Output:** ~6.4M rows, ~85 MB.
 
 ---
 
@@ -782,7 +776,7 @@ Each pipeline run records which steps actually executed, enabling cascade logic 
 | Dimensions | `run_dimension_fetches.sh` | ~30s |
 | Operating Calendar | `build_operating_calendar.py` | ~9s |
 | Impute Park Hours | `impute_park_hours.py` | ~1s |
-| Posted Aggregates | `build_posted_aggregates_fast.py` | ~7s |
+| Posted Aggregates (v3 S4) | `pipeline/steps/s04_aggregates.py` | box bench: ~75s per 56M input rows |
 | Report | `report_wait_time_db.py` | ~1s |
 | Forecast Accuracy | `evaluate_forecast_accuracy.py` | ~varies |
 | Synthetic Actuals | `generate_synthetic_actuals.py` | ~varies |
@@ -860,7 +854,7 @@ Each pipeline run records which steps actually executed, enabling cascade logic 
 | `scripts/run_dimension_fetches.sh` | Dimension table fetches |
 | `src/build_operating_calendar.py` | Operating calendar |
 | `scripts/impute_park_hours.py` | Park hours imputation |
-| `scripts/build_posted_aggregates_fast.py` | Posted aggregates |
+| `scripts/build_posted_aggregates_fast.py` | Posted aggregates (dead output, no reader) |
 | `scripts/report_wait_time_db.py` | DB report |
 | `src/evaluate_forecast_accuracy.py` | Accuracy evaluation |
 | `scripts/generate_synthetic_actuals.py` | Synthetic actuals |
@@ -887,7 +881,7 @@ Each pipeline run records which steps actually executed, enabling cascade logic 
 
 | Script | Purpose |
 |--------|---------|
-| `scripts/build_model_aggregates.py` | Model aggregates (fallback predictions) |
+| `scripts/build_model_aggregates.py` | Model aggregates, manual run of the S4 build |
 | `scripts/build_synthetic_pairs.py` | Synthetic pairs for training augmentation |
 | `scripts/daily_accuracy_report.py` | Telegram-friendly accuracy report |
 | `scripts/entity_wti_diagnostics.py` | Per-entity WTI diagnostics |
@@ -941,7 +935,7 @@ Fred reviewed all open questions. Resolved decisions:
 
 1. 📋 **TODO: Remove WTI POSTED fallback** — Delete the COALESCE fallback path in `calculate_wti_simple.py`. If POSTED data exists without synthetic actuals, generate synthetic actuals first.
 
-2. 📋 **TODO: Review model aggregates necessity** — Determine if `build_model_aggregates.py` is still needed or if it can be retired.
+2. ✅ **Model aggregates** — rebuilt daily by S4 (TPCR-S4-AGG-001); read by S8 and the dashboard.
 
 3. 📋 **TODO: Ride closure handling in data collection** — The live scraper (`get_wait_times_from_queue_times.py`) silently skips rides where `is_open: false`. This means closed rides disappear from output. Two types of closures need different handling:
    - **Scheduled closures** (refurbishments) — known in advance, predictable

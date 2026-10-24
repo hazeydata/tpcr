@@ -75,7 +75,7 @@ All under **output_base** unless noted.
 | `output_base/pipeline_validation/` | validation_report.json, validation_report.txt (post-run checks) |
 | `output_base/fact_tables/clean/` | Cleaned wait time fact CSVs (by date) |
 | `output_base/staging/queue_times/` | Queue-times fetcher output (before ETL merge) |
-| `output_base/aggregates/` | posted_aggregates.parquet (for forecast) |
+| `output_base/aggregates/` | model_aggregates.parquet + model_aggregates.meta.json: rebuilt daily by S4 (`pipeline/steps/s04_aggregates.py`), read by S8 forecast (posted_time) and the dashboard API. posted_aggregates.parquet is a dead v2 file with no reader. |
 | `output_base/models/` | Per-entity XGBoost (or mean) models |
 | `output_base/curves/forecast/` | Forecast curves (actual/posted predicted) |
 | `output_base/state/` | entity_index.sqlite, pipeline_state.json, run_manifest.json, pipeline_status.json, daily_pipeline.lock, encoding_mappings.json, **etl_last_run.json** (timestamp of last successful ETL; ETL only processes files modified since), processed_files.json, failed_files.json, dedupe.sqlite, etc. |

@@ -68,7 +68,7 @@ pipeline_v3/
 │   ├── s01_sync.py          # S3 sync
 │   ├── s02_etl.py           # ETL + CSV→Parquet
 │   ├── s03_dimensions.py    # Dimension fetches + park hours + closures
-│   ├── s04_aggregates.py    # Posted aggregates
+│   ├── s04_aggregates.py    # Rebuild model_aggregates.parquet daily
 │   ├── s05_conversion.py    # POSTED→ACTUAL conversion model (weekly)
 │   ├── s06_synthetic.py     # Synthetic actuals generation
 │   ├── s07_training.py      # Per-entity XGBoost training (Python, not Julia)
