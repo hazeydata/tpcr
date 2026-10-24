@@ -32,6 +32,7 @@ from pipeline.config import load_config
 from pipeline.core.logging import PipelineLogger
 from pipeline.core.metrics import PipelineMetrics
 from pipeline.core.paths import log_events_path
+from pipeline.core.validation import StageFailed
 from pipeline.steps import STEP_ORDER
 
 # Legacy bridge: keep pipeline_status.json updated for monitoring scripts
@@ -240,8 +241,11 @@ def main() -> int:
                         _ps_step_failed(cfg.output_base, legacy)
                     except Exception:
                         pass
-            # In shadow mode, continue on failure. In production, stop.
-            if not cfg.shadow:
+            # Spec R5 (Fred, Oct 24 1:34 AM ET): in production, any failure stops
+            # the run. Under --shadow, failures are logged and the run continues,
+            # except an S8 entity error (s08_forecast raising StageFailed), which
+            # stops the run even in shadow mode.
+            if not cfg.shadow or (step_name == "s08_forecast" and isinstance(e, StageFailed)):
                 break
 
     # Finalize

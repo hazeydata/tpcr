@@ -126,6 +126,31 @@ def test_s7_eligibility_and_skip_log(tmp_path):
     assert ["s07", "MK02", "extinct"] in rows
 
 
+def test_s7_misfiled_entity_logs_no_training_data(tmp_path):
+    """Entity counted eligible from another park's file but absent from its own park file -> no_training_data (M18)."""
+    cfg = _cfg(tmp_path)
+    _write_dim(cfg, {"MK01": "", "EP05": ""})
+    _write_oc(cfg, [
+        ("MK01", TODAY + timedelta(days=1), True),
+        ("EP05", TODAY + timedelta(days=1), True),
+    ])
+    actuals = cfg.output_base / "matched_pairs" / "actuals_training_v2"
+    actuals.mkdir(parents=True)
+    pd.concat([
+        _actuals("MK01", date(2020, 1, 1), 300),
+        _actuals("EP05", date(2020, 1, 1), 300),  # misfiled in MK's park file
+    ]).to_parquet(actuals / "MK.parquet", index=False)
+    _actuals("EP01", date(2020, 1, 1), 5).to_parquet(actuals / "EP.parquet", index=False)
+
+    log = PipelineLogger("t7misfiled")
+    res = s07_training.run(cfg, log)
+
+    msgs = [e["message"] for e in log.events]
+    assert "SKIP stage=s07 entity=EP05 reason=no_training_data" in msgs
+    assert not any("entity=EP05 reason=below_min_obs" in m for m in msgs)
+    assert res["failed"] == 0
+
+
 def test_s7_injected_error_warns_and_continues(tmp_path, monkeypatch):
     cfg = _s7_fixture(tmp_path)
     real = s07_training._train_baseline_model
@@ -468,9 +493,10 @@ class _Setattr:
         setattr(obj, name, value)
 
 
-def _install_halt_patches(mp, tmp_path: Path, pp) -> list[str]:
+def _install_halt_patches(mp, tmp_path: Path, pp, shadow: bool = False) -> list[str]:
     """One injected S8 entity error; S7 and S9-S11 are markers that record whether they run."""
     cfg = _s8_fixture(tmp_path)
+    cfg.shadow = shadow
     _s8_setup(cfg, mp, ["MK01", "MK05"], extra_boom="MK05")
     ran: list[str] = []
     ok = lambda c, log: {"rows": 0}  # noqa: E731
@@ -555,3 +581,60 @@ def test_s8_single_entity_error_halts_pipeline(tmp_path, monkeypatch):
     assert "STEP_RAN s08_forecast" in proc.stdout
     for later in ("s09_wti", "s10_accuracy", "s11_deploy"):
         assert f"STEP_RAN {later}" not in proc.stdout
+
+
+def test_s8_entity_error_shadow_mode_halts_pipeline(tmp_path, monkeypatch):
+    """R5 (Fred, Oct 24 1:34 AM ET): an S8 entity error stops the run even under --shadow."""
+    import pipeline.pipeline as pp
+
+    # in-process: S9-S11 never run, nonzero exit
+    ran = _install_halt_patches(monkeypatch, tmp_path / "shadow", pp, shadow=True)
+    assert pp.main() != 0
+    assert ran == ["s07_training", "s08_forecast"]
+
+    # real process, driver passes shadow=True
+    import subprocess
+
+    repo = Path(__file__).resolve().parents[2]
+    driver = tmp_path / "shadow_halt_driver.py"
+    driver.write_text(
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {str(repo)!r})\n"
+        "import pipeline.pipeline as pp\n"
+        "from pipeline.tests import test_s7_s8_eligibility as t\n"
+        "t._install_halt_patches(t._Setattr(), Path(sys.argv[1]), pp, shadow=True)\n"
+        "sys.exit(pp.main())\n"
+    )
+    work = tmp_path / "shadow_proc"
+    work.mkdir()
+    proc = subprocess.run(
+        [sys.executable, str(driver), str(work)],
+        cwd=repo, capture_output=True, text=True, timeout=300,
+    )
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out
+    assert "STEP_RAN s08_forecast" in proc.stdout
+    assert "Step s08_forecast FAILED" in out  # S8 itself raised StageFailed
+    for later in ("s09_wti", "s10_accuracy", "s11_deploy"):
+        assert f"STEP_RAN {later}" not in proc.stdout
+
+
+@pytest.mark.parametrize("failing", ["s09_wti", "s08_forecast"])
+def test_shadow_mode_other_step_failure_continues(tmp_path, monkeypatch, failing):
+    """R5: under --shadow, any failure other than S8 StageFailed is logged and the run continues (exit nonzero)."""
+    import pipeline.pipeline as pp
+
+    def boom(c, log):
+        raise RuntimeError("boom")  # plain RuntimeError, not StageFailed
+
+    cfg = _cfg(tmp_path)
+    cfg.shadow = True
+    ran: list[str] = []
+    ok = lambda c, log: {"rows": 0}  # noqa: E731
+    names = ["s07_training", "s08_forecast", "s09_wti", "s10_accuracy"]
+    steps = {n: (boom if n == failing else ok) for n in names}
+    _install_pipeline_fakes(monkeypatch, pp, cfg, steps, ran)
+
+    assert pp.main() != 0
+    assert ran == names

@@ -594,7 +594,7 @@ For EU entities not in the training data (unseen entity_code), XGBoost uses grou
 - Excludes Lightning Lane booths (`fastpass_booth = FALSE`)
 - Excludes extinct/fully-closed entities (zero operating dates in calendar) — logged as `SKIP … reason=extinct`; entities with no dates in the window are logged as `not_operating`
 - Entities not in the operating calendar at all are assumed operating (graceful fallback)
-- **S8 failure handling:** intended behaviour (Fred, Oct 24 12:28 AM ET): any S8 entity error (`error:<class>`) raises `StageFailed` after outputs are written; `pipeline.py` stops, so S9-S11 do not run for that run. Contrast with S7, which warns and continues on entity errors.
+- **S8 failure handling:** intended behaviour (Fred, Oct 24 12:28 AM ET): any S8 entity error (`error:<class>`) raises `StageFailed` after outputs are written. `pipeline.py` stops, so S9-S11 do not run, and the process exits nonzero. This applies in `--shadow` mode too (Spec R5, Fred, Oct 24 1:34 AM ET): an S8 entity error is the one failure that stops a shadow run; any other failed step in shadow mode is logged and the run continues (the run still exits nonzero). Contrast with S7, which warns and continues on entity errors.
 - **EU entities with `scope_and_scale` are added even without POSTED data** (use scope-scale group models)
 
 ### Model Type Detection:
