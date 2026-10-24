@@ -43,6 +43,10 @@ from forecast_image import generate_forecast_image
 
 logger = logging.getLogger("tpcr-bot")
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)-8s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+# Spec R5/AC33: the SDK/HTTP loggers emit request ids and headers at DEBUG; pin them
+# to WARNING so a root logger at DEBUG cannot leak them.
+for _noisy in ("anthropic", "httpx", "httpcore", "httpx2", "httpcore2"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 from calendar_image import generate_calendar_image
 # Load ~/.env BEFORE importing ask_agent so its QWEN_* settings see it
 # (ask_agent also reads them at call time; this is defense in depth).
