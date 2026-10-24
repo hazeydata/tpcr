@@ -45,7 +45,7 @@ Single reference for the current Theme Park pipeline setup (Linux, user **fred**
 ### 3.2 Queue-times loop (systemd, on boot + always)
 
 - **What:** Fetches wait times from queue-times.com every 5 minutes; writes to `output_base/staging/queue_times/`. Morning ETL later merges staging into `fact_tables/clean`.
-- **Live DB dual-write:** each batch is also written to `tpcr_live.duckdb` `live_waits` (anti-join on `entity_code, observed_at, wait_time_type`). If s11 holds the write lock (~6:15 AM ET, ~110s) the write retries with backoff for ~180s; on failure the batch stays in `output_base/state/live_waits_pending/` and is flushed by the next write (60s cool-down after an exhausted batch). Once per ET day, first loop cycle at/after 04:30 ET, `src/replay_live_waits.py --days 2` backfills any missing rows from staging (TPCR-S11-LOCK-001).
+- **Live DB dual-write:** each batch is also written to `tpcr_live.duckdb` `live_waits` (anti-join on `entity_code, observed_at, wait_time_type`; rows with a null/empty key are dropped but counted and logged as a WARNING). If s11 holds the write lock (~6:15 AM ET, ~110s) the write retries with backoff for ~180s; on failure the batch stays in `output_base/state/live_waits_pending/` and is flushed by the next write (60s cool-down after an exhausted batch). Once per ET day, first loop cycle at/after 04:30 ET, `src/replay_live_waits.py --days 2` backfills any missing rows from staging (TPCR-S11-LOCK-001).
 - **Service:** `queue-times-loop.service` (user fred, project dir = repo path).
 - **Starts:** Automatically on boot if you ran `sudo bash scripts/install_queue_times_service.sh`.
 - **Log (systemd):** `sudo journalctl -u queue-times-loop -f`

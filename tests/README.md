@@ -6,7 +6,7 @@
 
 Covers the scraper's `live_waits` write retry (~180s budget), the pending-batch dir
 (`state/live_waits_pending/`), the daily staging replay (`src/replay_live_waits.py`),
-row prep (6 AM park-date rule) and `replay_due`. The s11 write lock is simulated with a
+row prep (6 AM park-date rule; rows dropped for null/empty keys are counted and logged as a WARNING) and `replay_due`. The s11 write lock is simulated with a
 child process holding the DuckDB file open. Uses `tmp_path` only; takes ~15s.
 
 ```bash

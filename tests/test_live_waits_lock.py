@@ -221,10 +221,11 @@ def test_replay_fills_gaps_and_is_idempotent(tmp_path, pk):
     assert r["per_date"]["2026-10-20"]["inserted"] == 6
     assert r["per_date"]["2026-10-21"]["inserted"] == 4
     assert count(db) == 16
+    n_after_first = count(db)
 
     r2 = replay_staging_to_live(db, tmp_path / "staging" / "queue_times", dates, LOG, budget_s=5)
     assert r2["inserted"] == 0
-    assert count(db) == 16
+    assert count(db) == n_after_first == 16, "replay twice must give the same row count"
 
 
 def test_prep_drops_bad_rows_and_uses_6am_rule():
@@ -242,6 +243,31 @@ def test_prep_drops_bad_rows_and_uses_6am_rule():
     assert list(out.columns) == list(LIVE_WAITS_COLUMNS)
     assert out["wait_time_minutes"].tolist() == [10, 20]
     assert out["park_date"].tolist() == ["2026-10-19", "2026-10-20"]
+
+
+def test_null_key_rows_counted_and_logged(caplog):
+    good = {"observed_at": "2026-10-20T09:00:00-04:00", "wait_time_type": "POSTED", "wait_time_minutes": 5}
+    rows = [
+        {**good, "entity_code": "MK01"},
+        {**good, "entity_code": "MK02", "observed_at": "2026-10-20T10:00:00-04:00"},
+        {**good, "entity_code": None},
+        {**good, "entity_code": "  "},
+        {**good, "entity_code": "MK03", "observed_at": None},
+        {**good, "entity_code": "MK04", "wait_time_type": ""},
+    ]
+    tz = park_tz_for_park_code("mk")
+    with caplog.at_level(logging.WARNING):
+        out = prepare_live_waits_rows(pd.DataFrame(rows), tz)
+    assert len(out) == 2
+    assert out.attrs["dropped_null_key"] == 4
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("dropped 4 row(s) with null/empty key" in r.getMessage() for r in warnings)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        clean = prepare_live_waits_rows(pd.DataFrame(rows[:2]), tz)
+    assert clean.attrs["dropped_null_key"] == 0
+    assert not any("null/empty key" in r.getMessage() for r in caplog.records)
 
 
 def test_park_tz_for_park_code():

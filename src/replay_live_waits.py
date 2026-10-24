@@ -77,7 +77,7 @@ def replay_staging_to_live(
             park = f.stem.rsplit("_", 1)[0]
             try:
                 raw = pd.read_csv(f, usecols=STAGING_COLUMNS)
-                prepared = prepare_live_waits_rows(raw, park_tz_for_park_code(park))
+                prepared = prepare_live_waits_rows(raw, park_tz_for_park_code(park), logger)
             except Exception as e:
                 logger.warning(f"Skipping {f.name}: {e}")
                 continue

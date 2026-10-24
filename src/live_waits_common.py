@@ -4,10 +4,14 @@ Shared helpers for writing wait-time rows to tpcr_live.duckdb live_waits.
 Used by the queue-times scraper (get_wait_times_from_queue_times.py) and the daily
 staging replay (replay_live_waits.py). Idempotency is done with an anti-join on the key,
 not INSERT OR IGNORE, because the live table may have been rebuilt without a PRIMARY KEY.
+
+Rows dropped by prepare_live_waits_rows because a key column is null/empty are counted and
+logged as a WARNING (never silently dropped); the count is also on result.attrs["dropped_null_key"].
 """
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -23,6 +27,8 @@ for _p in (str(_SRC_DIR), str(_REPO_ROOT)):
 from get_tp_wait_time_data_from_s3 import derive_park_date
 from pipeline.core.park_codes import PARK_TIMEZONE
 
+logger = logging.getLogger(__name__)
+
 LIVE_WAITS_KEY = ("entity_code", "observed_at", "wait_time_type")
 LIVE_WAITS_COLUMNS = LIVE_WAITS_KEY + ("wait_time_minutes", "park_date")
 
@@ -35,18 +41,34 @@ def park_tz_for_park_code(code: str) -> ZoneInfo:
     return ZoneInfo(tz_name)
 
 
-def prepare_live_waits_rows(df: pd.DataFrame, park_tz: ZoneInfo) -> pd.DataFrame:
-    """Add park_date (6 AM rule), keep wait > 0 and non-empty keys; return LIVE_WAITS_COLUMNS."""
+def prepare_live_waits_rows(
+    df: pd.DataFrame, park_tz: ZoneInfo, logger: logging.Logger | None = None
+) -> pd.DataFrame:
+    """Add park_date (6 AM rule), keep wait > 0 and non-empty keys; return LIVE_WAITS_COLUMNS.
+
+    Rows dropped for a null/empty key column are counted, logged as a WARNING, and the count
+    is set on the result's attrs["dropped_null_key"].
+    """
+    log = logger or globals()["logger"]
     df = df.copy()
+    bad_by_col = {}
     for col in LIVE_WAITS_KEY:
-        df[col] = df[col].where(df[col].notna() & (df[col].astype(str).str.strip() != ""))
+        bad = df[col].isna() | (df[col].astype(str).str.strip() == "")
+        bad_by_col[col] = int(bad.sum())
+        df[col] = df[col].where(~bad)
+    n_dropped = int(df[list(LIVE_WAITS_KEY)].isna().any(axis=1).sum())
+    if n_dropped:
+        detail = ", ".join(f"{c}={n}" for c, n in bad_by_col.items())
+        log.warning(f"live_waits prep: dropped {n_dropped} row(s) with null/empty key ({detail})")
     df = df.dropna(subset=list(LIVE_WAITS_KEY))
     df["park_date"] = derive_park_date(df["observed_at"], park_tz)
     df = df.dropna(subset=["park_date"])
     df = df[df["park_date"] != "NaT"]  # unparseable observed_at
     df["wait_time_minutes"] = pd.to_numeric(df["wait_time_minutes"], errors="coerce")
     df = df[df["wait_time_minutes"] > 0]
-    return df[list(LIVE_WAITS_COLUMNS)]
+    out = df[list(LIVE_WAITS_COLUMNS)]
+    out.attrs["dropped_null_key"] = n_dropped
+    return out
 
 
 def insert_missing_live_waits(con, df: pd.DataFrame) -> int:

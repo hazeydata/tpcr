@@ -260,7 +260,7 @@ def _write_to_live_duckdb(
 
     # Prepare data
     try:
-        df = prepare_live_waits_rows(df, park_tz)
+        df = prepare_live_waits_rows(df, park_tz, logger)
     except Exception as e:
         logger.warning(f"DuckDB data prep failed: {e}")
         return False
