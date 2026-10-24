@@ -51,6 +51,9 @@ from calendar_image import generate_calendar_image
 # Load ~/.env BEFORE importing ask_agent so its QWEN_* settings see it
 # (ask_agent also reads them at call time; this is defense in depth).
 load_dotenv(os.path.expanduser("~/.env"))
+# Spec R5/AC33: the anthropic SDK reads ANTHROPIC_LOG at import and would override the
+# WARNING pin above; pop after load_dotenv since ~/.env could set it.
+os.environ.pop("ANTHROPIC_LOG", None)
 from ask_agent import ask_agent, data_path, _duckdb_path, validate_config
 validate_config()
 

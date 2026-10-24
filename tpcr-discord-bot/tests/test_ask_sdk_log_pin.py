@@ -61,3 +61,39 @@ def test_ac33_sdk_debug_lines_do_not_leak_request_id_or_key(bot, monkeypatch, ca
     assert http_lines == [], http_lines
     for name in ("anthropic", "httpx", "httpcore", "httpx2", "httpcore2"):
         assert logging.getLogger(name).level == logging.WARNING, name
+
+
+def test_ac33_anthropic_log_env_cannot_reenable_sdk_debug(bot, monkeypatch, caplog):
+    """ANTHROPIC_LOG=debug is read by the SDK at import; a fresh import must not re-enable DEBUG."""
+    monkeypatch.setenv("TPCR_ASK_PROVIDER", "anthropic")
+    monkeypatch.setattr(bot, "ANTHROPIC_API_KEY", SECRET)
+    monkeypatch.setenv("ANTHROPIC_LOG", "debug")
+    for name in [m for m in sys.modules if m == "anthropic" or m.startswith("anthropic.")]:
+        monkeypatch.delitem(sys.modules, name)
+    orig_init = httpx.AsyncClient.__init__
+
+    def init(self, *a, **k):
+        k["transport"] = httpx.MockTransport(_handler)
+        orig_init(self, *a, **k)
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", init)
+    with patch("ask_agent._chat", AsyncMock(side_effect=aa.QwenHTTPError(500, "down"))), \
+         patch("ask_agent.track_usage", return_value=(1, -1)), \
+         patch("ask_agent.log_question"), \
+         caplog.at_level(logging.DEBUG):
+        call_ask(bot, make_interaction([]))
+    assert "anthropic" in sys.modules, "the anthropic SDK was not freshly imported"
+    assert "ANTHROPIC_LOG" not in os.environ
+    assert logging.getLogger("anthropic").getEffectiveLevel() >= logging.WARNING
+    leaked = [(r.name, r.getMessage()) for r in caplog.records
+              if r.levelno == logging.DEBUG
+              and r.name.split(".")[0] in ("anthropic", "httpx", "httpcore", "httpx2", "httpcore2")]
+    assert leaked == [], leaked
+
+
+def test_bot_pops_anthropic_log_after_load_dotenv_before_ask_agent_import():
+    src = open(os.path.join(os.path.dirname(__file__), "..", "bot.py")).read()
+    dotenv = src.index('load_dotenv(os.path.expanduser("~/.env"))')
+    pop = src.index('os.environ.pop("ANTHROPIC_LOG", None)')
+    imp = src.index("from ask_agent import")
+    assert dotenv < pop < imp

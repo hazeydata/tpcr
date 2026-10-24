@@ -794,7 +794,11 @@ def claude_assistant_blocks(content) -> list[dict]:
 
 
 async def _claude_loop(api_key: str, system_prompt: str, question: str) -> str | None:
+    # Spec R5/AC33: the SDK's import-time _setup_logging reads ANTHROPIC_LOG and can
+    # re-enable DEBUG; drop it before import and re-pin the logger after.
+    os.environ.pop("ANTHROPIC_LOG", None)
     import anthropic
+    logging.getLogger("anthropic").setLevel(logging.WARNING)
 
     client = anthropic.AsyncAnthropic(api_key=api_key, timeout=60.0, max_retries=1)
     messages = [{"role": "user", "content": question}]
