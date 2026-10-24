@@ -125,7 +125,7 @@ Scoring: `score_scope = "fallback"` — the summary marks it, and the registry t
 }
 ```
 
-A challenger with no matched pairs gets `{"score_scope", "trained_at", "entity_count", "matched_pairs": 0, "status": "no_data"}` plus the flag fields at their defaults (`win` false, `streak` 0, the rest `null` / false). `significant_gain` lists the flagged ids and `significant_gain_text` is `"None yet"` when it is empty (a valid outcome, not a failure); skip and failure summaries carry the same two fields (`[]`, `"None yet"`). `run_status` is `ok` with no errors, else `failed` (any retrain/forecast/archive/evaluation error, or an `entity_count` mismatch). `rolling_shadow.py` run by hand keeps its old exit code; the scheduled job's run_status values and exit codes are in the Phase 3 section below.
+A challenger with no matched pairs gets `{"score_scope", "trained_at", "entity_count", "matched_pairs": 0, "status": "no_data"}` plus the flag fields at their defaults (`win` false, `streak` 0, the rest `null` / false). `significant_gain` lists the flagged ids and `significant_gain_text` is `"None yet"` when it is empty (a valid outcome, not a failure); skip and failure summaries carry the same two fields (`[]`, `"None yet"`). `run_status` is `ok` with no errors, else `failed` (any retrain/forecast/archive/evaluation error, or an AC5 entity-set mismatch against the production S7 trained set minus extinct, R1a). `rolling_shadow.py` run by hand keeps its old exit code; the scheduled job's run_status values and exit codes are in the Phase 3 section below.
 
 ## `shadow_days` rule
 
