@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-One-off backfill of tpcr_live.duckdb live_waits for park dates 2026-10-01..09 (TPCR-BACKFILL-OCT1-9).
+One-off backfill of tpcr_live.duckdb live_waits from fact_tables/clean (TPCR-BACKFILL-OCT1-9).
+Default target: park dates 2026-10-01..09. Use --start/--end for another inclusive park-date range
+(e.g. 2026-10-14..22, the S11 lock loss).
 
-Source: output_base/fact_tables/clean/2026-10/{park}_{YYYY-MM-DD}.csv (read only; no CSV is ever written).
+Source: output_base/fact_tables/clean/{YYYY-MM}/{park}_{YYYY-MM-DD}.csv (read only; no CSV is ever written).
 
 Before loading anything, a source-parity check compares the clean CSVs for --parity-date with the
 live_waits rows already in the DB for that date (row count, entity set, wait_time_type mix, and
@@ -13,6 +15,10 @@ Idempotent: rows whose (entity_code, observed_at, wait_time_type) already exist 
 Usage:
     python scripts/backfill_live_waits_oct1_9.py --dry-run
     python scripts/backfill_live_waits_oct1_9.py
+    python scripts/backfill_live_waits_oct1_9.py --start 2026-10-14 --end 2026-10-22 --parity-date 2026-10-23 --dry-run
+
+--start/--end (both required together, start <= end, may span months) are mutually exclusive with --glob,
+and the range must not include --parity-date (parity is checked on a day that is not being loaded).
 
 Exit codes: 0 ok, 2 bad input/path refused, 3 source parity failed (nothing loaded).
 """
@@ -23,6 +29,7 @@ import argparse
 import glob
 import re
 import sys
+from datetime import date, timedelta
 from pathlib import Path
 
 import duckdb
@@ -93,6 +100,32 @@ def resolve_targets(output_base: Path, pattern: str, clean_root: Path) -> list[P
         _check_under_clean(glob_dir, clean_root)
     matches = sorted(Path(m) for m in glob.glob(str(output_base / pattern)))
     return [_check_under_clean(m, clean_root) for m in matches]
+
+
+def _parse_date(value: str, flag: str) -> date:
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise RefusedPath(f"bad {flag} {value!r} (want YYYY-MM-DD)")
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        raise RefusedPath(f"bad {flag} {value!r} (not a calendar date)")
+
+
+def resolve_range_targets(output_base: Path, start: str, end: str, parity_date: str, clean_root: Path) -> list[Path]:
+    """Files for every park date in [start, end]; each match validated by resolve_targets/_check_under_clean."""
+    d0, d1 = _parse_date(start, "--start"), _parse_date(end, "--end")
+    if d0 > d1:
+        raise RefusedPath(f"--start {start} is after --end {end}")
+    if d0 <= _parse_date(parity_date, "--parity-date") <= d1:
+        raise RefusedPath(f"range {start}..{end} includes --parity-date {parity_date}; "
+                          "parity must be checked on a day that is not being loaded")
+    files: list[Path] = []
+    d = d0
+    while d <= d1:
+        iso = d.isoformat()
+        files += resolve_targets(output_base, f"fact_tables/clean/{iso[:7]}/*_{iso}.csv", clean_root)
+        d += timedelta(days=1)
+    return files
 
 
 def parse_name(path: Path) -> tuple[str, str]:
@@ -300,10 +333,12 @@ def load_days(files: list[Path], con, dry_run: bool) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description="Backfill live_waits for 2026-10-01..09 from fact_tables/clean CSVs")
+    p = argparse.ArgumentParser(description="Backfill live_waits (default 2026-10-01..09) from fact_tables/clean CSVs")
     p.add_argument("--output-base", type=Path, default=None)
     p.add_argument("--db", type=Path, default=None, help="default: <output-base>/tpcr_live.duckdb")
-    p.add_argument("--glob", default=DEFAULT_GLOB, help="relative to output base")
+    p.add_argument("--glob", default=None, help=f"relative to output base (default: {DEFAULT_GLOB})")
+    p.add_argument("--start", default=None, help="YYYY-MM-DD, inclusive park date; requires --end; excludes --glob")
+    p.add_argument("--end", default=None, help="YYYY-MM-DD, inclusive park date; requires --start; excludes --glob")
     p.add_argument("--parity-date", default=DEFAULT_PARITY_DATE)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--row-tol", type=float, default=0.02)
@@ -322,9 +357,18 @@ def main(argv=None) -> int:
     try:
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.parity_date):
             raise RefusedPath(f"bad --parity-date {args.parity_date!r}")
-        files = resolve_targets(output_base, args.glob, clean_root)
+        if (args.start is None) != (args.end is None):
+            raise RefusedPath("--start and --end must be given together")
+        if args.start is not None:
+            if args.glob is not None:
+                raise RefusedPath("--start/--end are mutually exclusive with --glob")
+            desc = f"{args.start}..{args.end}"
+            files = resolve_range_targets(output_base, args.start, args.end, args.parity_date, clean_root)
+        else:
+            desc = args.glob or DEFAULT_GLOB
+            files = resolve_targets(output_base, desc, clean_root)
         if not files:
-            raise RefusedPath(f"no files match {args.glob} under {output_base}")
+            raise RefusedPath(f"no files match {desc} under {output_base}")
         for f in files:
             parse_name(f)
             park_tz_for_park_code(parse_name(f)[0])

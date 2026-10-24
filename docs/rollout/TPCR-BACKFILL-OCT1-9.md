@@ -29,6 +29,27 @@
 6. **Rerun the dry run** (step 3 command): `PARITY PASS` and `would insert=0` for every day. A real rerun also inserts 0.
 7. **Rollback.** If anything is wrong: when no writer has the DB open, restore the backup over `$DB` (`cp "$OB/tpcr_live.duckdb.bak-<date>" "$DB"`), then verify the row count equals `<N_before>`. Rows written by the scraper after the backup are lost with a file restore. To avoid that, delete only the backfilled days instead, if Fred agrees (`DELETE FROM live_waits WHERE park_date BETWEEN '2026-10-01' AND '2026-10-09'` is only safe if the scraper had written none of them, which was the starting state).
 
+## Oct 14-22 (S11 lock loss) — Fred ruled the loss not accepted, recover from clean; loading still needs Fred's go
+
+Same script, same parity gate and skip-existing anti-join. Select the days with `--start/--end` (inclusive park dates; mutually exclusive with `--glob`; both required; start <= end). Parity is checked on a day that is *not* loaded, so use `--parity-date 2026-10-23`; a range containing the parity date is refused (exit 2). Do not start the live run without Fred's go. Prerequisites, deploy and backup (steps 1-2 above) apply unchanged; take the backup first.
+
+Dry run (read-only; parity runs first):
+`python scripts/backfill_live_waits_oct1_9.py --output-base "$OB" --start 2026-10-14 --end 2026-10-22 --parity-date 2026-10-23 --dry-run`
+
+Live run (after Fred's go):
+`python scripts/backfill_live_waits_oct1_9.py --output-base "$OB" --start 2026-10-14 --end 2026-10-22 --parity-date 2026-10-23`
+
+Expectations:
+- `PARITY PASS` for 2026-10-23, else exit 3 and nothing is loaded.
+- `already_present` is **nonzero**: the scraper covered part of these days. Those keys are skipped.
+- Per-day `would insert` is the rows lost to the lock; record `<N_day>` and `<N_before>` from the dry run. Live `inserted` must equal it (a `WARNING ... inserted != expected` line means stop).
+
+Verify (read-only):
+`duckdb -readonly "$DB" "SELECT park_date, count(*) FROM live_waits WHERE park_date BETWEEN '2026-10-14' AND '2026-10-22' GROUP BY 1 ORDER BY 1"`
+Per day: previous count + `would insert`. Rerun the dry run: `would insert=0` for every day.
+
+Rollback: restore the backup file over `$DB` when no writer has it open, then check the row count equals `<N_before>` (scraper rows written after the backup are lost). **`DELETE ... WHERE park_date BETWEEN '2026-10-14' AND '2026-10-22'` is NOT safe here**: scraper rows already exist for these days and would be deleted too. Only a file restore, or a DELETE of exactly the keys the run inserted (e.g. `inserted_at >= <run start>` and `park_date` in range, checked against the `inserted` totals first), removes only the backfilled rows.
+
 ## Exit codes
 
 | Code | Meaning |

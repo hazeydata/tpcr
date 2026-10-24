@@ -332,7 +332,9 @@ python scripts/backfill_live_waits_oct1_9.py --dry-run   # parity + per-day file
 python scripts/backfill_live_waits_oct1_9.py             # live run (needs the DuckDB write lock)
 ```
 
-Options: `--output-base`, `--db`, `--glob`, `--parity-date`, `--dry-run`, `--row-tol`, `--entity-tol`, `--tp-posted-tol`.
+Other ranges: `--start YYYY-MM-DD --end YYYY-MM-DD` (inclusive park dates, both required, may span months, mutually exclusive with `--glob`, must not include `--parity-date`; violations exit 2). Files are globbed per date as `fact_tables/clean/<YYYY-MM>/*_<date>.csv` and each is still path-validated. Example (Oct 14-22 S11 lock loss): `--start 2026-10-14 --end 2026-10-22 --parity-date 2026-10-23`.
+
+Options: `--output-base`, `--db`, `--glob`, `--start`, `--end`, `--parity-date`, `--dry-run`, `--row-tol`, `--entity-tol`, `--tp-posted-tol`.
 Exit codes: `0` ok, `2` bad input / path refused, `3` source parity failed (nothing loaded). Rollout: [docs/rollout/TPCR-BACKFILL-OCT1-9.md](../docs/rollout/TPCR-BACKFILL-OCT1-9.md).
 
 ## Additional Scripts (summary)

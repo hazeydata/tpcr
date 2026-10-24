@@ -255,3 +255,97 @@ def test_raw_glob_refused(env, capsys):
 
 def test_dotdot_glob_refused(env):
     assert run(env, "--glob", "fact_tables/clean/../raw/*.csv") == 2
+
+
+# ---------------------------------------------------------------- --start/--end range (Oct 14-22)
+
+RANGE = ("--start", "2026-10-14", "--end", "2026-10-22", "--parity-date", "2026-10-23")
+
+
+def _range_env(env):
+    """Clean files for 10-13..10-23 (4 valid rows each); 10-23 is a parity day that matches live exactly."""
+    for d in range(13, 24):
+        day = f"2026-10-{d:02d}"
+        write_csv(env["clean"] / f"mk_{day}.csv", day_rows(day)[:4])
+    p23 = [(e, o.replace("2026-10-12", "2026-10-23"), t, w) for e, o, t, w in parity_rows()]
+    write_csv(env["clean"] / "mk_2026-10-23.csv", p23)
+    insert_live(env["db"], p23, "2026-10-23")
+    return env
+
+
+def test_range_selects_exactly_14_to_22(env):
+    _range_env(env)
+    root = env["base"] / "fact_tables" / "clean"
+    files = bf.resolve_range_targets(env["base"], "2026-10-14", "2026-10-22", "2026-10-23", root)
+    assert sorted(f.name for f in files) == [f"mk_2026-10-{d}.csv" for d in range(14, 23)]
+
+
+def test_range_dry_run_then_load_only_range_days(env, capsys):
+    _range_env(env)
+    before = sha(env["db"])
+    assert run(env, *RANGE, "--dry-run") == 0
+    out = capsys.readouterr().out
+    assert "PARITY PASS" in out and "target files: 9" in out
+    assert "2026-10-13: files" not in out and "2026-10-23: files" not in out
+    assert sha(env["db"]) == before
+    assert run(env, *RANGE) == 0
+    c = counts(env["db"])
+    assert c["2026-10-14"] == 4 and c["2026-10-22"] == 4
+    assert "2026-10-13" not in c
+    assert c["2026-10-23"] == len(parity_rows())
+
+
+def test_month_spanning_range(env):
+    root = env["base"] / "fact_tables" / "clean"
+    write_csv(root / "2026-09" / "mk_2026-09-30.csv", day_rows("2026-09-30")[:4])
+    files = bf.resolve_range_targets(env["base"], "2026-09-29", "2026-10-01", "2026-10-12", root)
+    assert sorted(f.name for f in files) == ["ep_2026-10-01.csv", "mk_2026-09-30.csv", "mk_2026-10-01.csv"]
+
+
+@pytest.mark.parametrize("extra", [
+    ("--start", "2026-10-22", "--end", "2026-10-14"),
+    ("--start", "2026-10-14"),
+    ("--end", "2026-10-14"),
+    ("--start", "2026/10/14", "--end", "2026-10-22"),
+    ("--start", "2026-02-01", "--end", "2026-02-30"),
+    ("--glob", "fact_tables/clean/2026-10/*_2026-10-03.csv", "--start", "2026-10-14", "--end", "2026-10-22"),
+    ("--start", "2026-10-10", "--end", "2026-10-14", "--parity-date", "2026-10-12"),
+])
+def test_range_bad_args_exit_2(env, extra, capsys):
+    before = sha(env["db"])
+    assert run(env, *extra) == 2
+    assert "REFUSED" in capsys.readouterr().out
+    assert sha(env["db"]) == before
+
+
+def test_range_symlinked_file_refused(env, tmp_path):
+    _range_env(env)
+    outside = tmp_path / "outside.csv"
+    shutil.move(str(env["clean"] / "mk_2026-10-17.csv"), str(outside))
+    (env["clean"] / "mk_2026-10-17.csv").symlink_to(outside)
+    before = sha(env["db"])
+    assert run(env, *RANGE, "--dry-run") == 2
+    assert sha(env["db"]) == before
+
+
+def test_range_run_idempotent(env, capsys):
+    _range_env(env)
+    assert run(env, *RANGE) == 0
+    c = counts(env["db"])
+    capsys.readouterr()
+    assert run(env, *RANGE) == 0
+    out = capsys.readouterr().out
+    assert "inserted=0" in out and "inserted=4" not in out
+    assert counts(env["db"]) == c
+
+
+def test_range_partially_present_day_inserts_only_missing(env, capsys):
+    _range_env(env)
+    insert_live(env["db"], [("A", ts("2026-10-15", "14:00"), "POSTED", 10),
+                            ("B", ts("2026-10-15", "15:00"), "POSTED", 13)], "2026-10-15")
+    assert run(env, *RANGE, "--dry-run") == 0
+    assert ("2026-10-15: files=1 raw=4 prepped=4 distinct_keys=4 already_present=2 would insert=2"
+            in capsys.readouterr().out)
+    assert run(env, *RANGE) == 0
+    assert "already_present=2 inserted=2" in capsys.readouterr().out
+    assert counts(env["db"])["2026-10-15"] == 4
