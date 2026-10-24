@@ -229,6 +229,26 @@ def test_replay_fills_gaps_and_is_idempotent(tmp_path, pk):
     assert count(db) == n_after_first == 16, "replay twice must give the same row count"
 
 
+def test_replay_skips_unreadable_staging_file(tmp_path, caplog):
+    db = make_db(tmp_path / "tpcr_live.duckdb")
+    staging = tmp_path / "staging" / "queue_times" / "2026-10"
+    staging.mkdir(parents=True)
+
+    mk_df(5, entity="MK01", day="2026-10-20").to_csv(staging / "mk_2026-10-20.csv", index=False)
+    # Same date, but missing the required STAGING_COLUMNS -> pd.read_csv(usecols=...) raises
+    pd.DataFrame({"foo": [1, 2], "bar": [3, 4]}).to_csv(staging / "uh_2026-10-20.csv", index=False)
+
+    with caplog.at_level(logging.WARNING, logger=LOG.name):
+        r = replay_staging_to_live(db, tmp_path / "staging" / "queue_times", ["2026-10-20"], LOG, budget_s=5)
+
+    assert r["files"] == 1
+    assert r["per_date"]["2026-10-20"]["files"] == 1
+    assert r["inserted"] == 5
+    assert count(db) == 5
+    warnings = [x for x in caplog.records if x.levelno == logging.WARNING]
+    assert any("Skipping" in x.getMessage() and "uh_2026-10-20.csv" in x.getMessage() for x in warnings)
+
+
 def test_prep_drops_bad_rows_and_uses_6am_rule():
     df = pd.DataFrame([
         {"entity_code": "MK01", "observed_at": "2026-10-20T05:30:00-04:00", "wait_time_type": "POSTED", "wait_time_minutes": 10},
