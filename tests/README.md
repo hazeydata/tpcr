@@ -73,4 +73,4 @@ Results: 7 passed, 0 failed
 
 ## Live waits backfill tests
 
-**File**: `tests/test_backfill_live_waits_oct1_9.py` — `scripts/backfill_live_waits_oct1_9.py` (TPCR-BACKFILL-OCT1-9): source-parity gate (row count, entity set, type mix, TouringPlans POSTED), dry run, idempotent load, path-safety refusals. Uses `tmp_path` only; run with `pytest tests/test_backfill_live_waits_oct1_9.py`.
+**File**: `tests/test_backfill_live_waits_oct1_9.py` — `scripts/backfill_live_waits_oct1_9.py` (TPCR-BACKFILL-OCT1-9): source-parity gate (row count, entity set, type mix, TouringPlans POSTED), dry run, idempotent load, path-safety refusals, and the TPCR-RECOVER-OCT14-22 criteria (`test_ac1_*` … `test_ac9_*`: missing days / `--allow-missing` exit 4, parity-fail counts exit 3, parity-date range refused before read, VERIFY pass/fail exit 5, second dry run 0, clean checksums exit 6, single load key / HOLD exit 7, key-based rollback, per-day log fields). Uses `tmp_path` only; run with `pytest tests/test_backfill_live_waits_oct1_9.py`.

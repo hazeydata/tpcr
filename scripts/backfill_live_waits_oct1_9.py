@@ -15,21 +15,46 @@ Idempotent: rows whose (entity_code, observed_at, wait_time_type) already exist 
 Usage:
     python scripts/backfill_live_waits_oct1_9.py --dry-run
     python scripts/backfill_live_waits_oct1_9.py
-    python scripts/backfill_live_waits_oct1_9.py --start 2026-10-14 --end 2026-10-22 --parity-date 2026-10-23 --dry-run
+    python scripts/backfill_live_waits_oct1_9.py --start 2026-10-14 --end 2026-10-22 --parity-date 2026-10-12 --dry-run
+    python scripts/backfill_live_waits_oct1_9.py --rollback --load-key '<logged value>' --dry-run
 
 --start/--end (both required together, start <= end, may span months) are mutually exclusive with --glob,
 and the range must not include --parity-date (parity is checked on a day that is not being loaded).
 
-Exit codes: 0 ok, 2 bad input/path refused, 3 source parity failed (nothing loaded).
+Range runs list days with no clean CSV ("MISSING DAYS: d1,d2" or "MISSING DAYS: none") and skip them; with
+missing days the run exits 4 before any DB access unless --allow-missing is given.
+
+Checksums: every target clean file and the parity-date files are sha256-hashed at the start, re-hashed after
+parity (before any write) and at the end; any change prints "CHECKSUM CHANGED: <file>" and exits 6.
+
+Load key: every live load tags all inserted rows with ONE inserted_at value (naive UTC TIMESTAMP with
+microseconds, or --load-key 'YYYY-MM-DD HH:MM:SS.ffffff'), logged as "LOAD KEY inserted_at=<value>" at start
+and end. If live_waits has no inserted_at column the run is HOLD (exit 7, nothing written; a dry run still
+prints the per-day counts first). After a live load each day is checked ("VERIFY PASS/FAIL <day>"): the
+live_waits count for that park_date vs the distinct keys of all loaded clean rows with that derived
+park_date, within --row-tol.
+
+Parity failure (exit 3) still prints the per-day counts, read-only ("DRY RUN (parity failed; counts only)").
+Parity failure takes precedence over HOLD.
+
+Rollback: --rollback --load-key <value> [--dry-run] [--start/--end] deletes exactly the rows with
+inserted_at = <value> (rows with NULL inserted_at never match), optionally restricted to a park-date range.
+No parity check, no file reads. Exit 2 if live_waits has no inserted_at.
+
+Exit codes: 0 ok, 2 bad input/path refused (also: load key already present, rollback without --load-key),
+3 source parity failed (nothing loaded), 4 missing days without --allow-missing, 5 post-load VERIFY failed
+(data stays loaded; roll back by key) or rollback count check failed, 6 clean file checksum changed,
+7 HOLD: live_waits has no inserted_at (no live load).
 """
 
 from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import re
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import duckdb
@@ -56,6 +81,10 @@ CSV_COLUMNS = list(LIVE_WAITS_KEY) + ["wait_time_minutes"]
 _NAME_RE = re.compile(r"^([A-Za-z0-9]+)_(\d{4}-\d{2}-\d{2})\.csv$")
 
 EXIT_OK, EXIT_PATH, EXIT_PARITY = 0, 2, 3
+EXIT_MISSING, EXIT_VERIFY, EXIT_CHECKSUM, EXIT_HOLD = 4, 5, 6, 7
+
+KEY_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
+_KEY_RE = re.compile(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6}")
 
 
 class RefusedPath(Exception):
@@ -135,6 +164,73 @@ def parse_name(path: Path) -> tuple[str, str]:
     return m.group(1).lower(), m.group(2)
 
 
+def missing_days(start: str, end: str, files: list[Path]) -> list[str]:
+    """Park dates in [start, end] with no clean CSV among files."""
+    have = {parse_name(f)[1] for f in files}
+    d, d1, out = _parse_date(start, "--start"), _parse_date(end, "--end"), []
+    while d <= d1:
+        if d.isoformat() not in have:
+            out.append(d.isoformat())
+        d += timedelta(days=1)
+    return out
+
+
+def parity_files(clean_root: Path, parity_date: str) -> list[Path]:
+    month_dir = clean_root / parity_date[:7]
+    files = sorted(month_dir.glob(f"*_{parity_date}.csv")) if month_dir.is_dir() else []
+    return [_check_under_clean(f, clean_root) for f in files]
+
+
+# --------------------------------------------------------------------------- checksums
+
+
+def hash_files(files) -> dict[Path, str]:
+    out = {}
+    for f in files:
+        h = hashlib.sha256()
+        with open(f, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        out[f] = h.hexdigest()
+    return out
+
+
+def changed_files(before: dict[Path, str]) -> list[Path]:
+    """Files whose sha256 (or existence) differs from the earlier hash."""
+    out = []
+    for f, digest in before.items():
+        try:
+            now = hash_files([f])[f]
+        except OSError:
+            now = None
+        if now != digest:
+            out.append(f)
+    return out
+
+
+# --------------------------------------------------------------------------- load key
+
+
+def parse_load_key(value: str) -> str:
+    if not _KEY_RE.fullmatch(value):
+        raise RefusedPath(f"bad --load-key {value!r} (want 'YYYY-MM-DD HH:MM:SS.ffffff')")
+    try:
+        datetime.strptime(value, KEY_FORMAT)
+    except ValueError:
+        raise RefusedPath(f"bad --load-key {value!r} (not a valid timestamp)")
+    return value
+
+
+def new_load_key() -> str:
+    return datetime.now(timezone.utc).replace(tzinfo=None).strftime(KEY_FORMAT)
+
+
+def has_inserted_at(con) -> bool:
+    return con.execute(
+        "SELECT count(*) FROM information_schema.columns "
+        "WHERE table_name = 'live_waits' AND column_name = 'inserted_at'").fetchall()[0][0] > 0
+
+
 # --------------------------------------------------------------------------- reading
 
 
@@ -160,8 +256,7 @@ def _concat(frames: list[pd.DataFrame]) -> pd.DataFrame:
 
 def run_parity(db: Path, clean_root: Path, parity_date: str, args) -> bool:
     month_dir = clean_root / parity_date[:7]
-    files = sorted(month_dir.glob(f"*_{parity_date}.csv")) if month_dir.is_dir() else []
-    files = [_check_under_clean(f, clean_root) for f in files]
+    files = parity_files(clean_root, parity_date)
     print("=" * 64)
     print(f"SOURCE PARITY CHECK: clean CSVs vs live_waits for {parity_date}")
     print(f"  clean files: {len(files)} in {month_dir}")
@@ -287,20 +382,39 @@ def count_new(con, df: pd.DataFrame) -> tuple[int, int]:
         con.unregister("_bf_new")
 
 
-def load_days(files: list[Path], con, dry_run: bool) -> None:
+def distinct_keys_by_park_date(con, df: pd.DataFrame) -> dict[str, int]:
+    """Distinct (entity_code, observed_at, wait_time_type) per derived park_date."""
+    if df.empty:
+        return {}
+    con.register("_bf_all", df[list(LIVE_WAITS_KEY) + ["park_date"]])
+    try:
+        return {str(d): n for d, n in con.execute("""
+            SELECT CAST(park_date AS VARCHAR), count(*) FROM (
+                SELECT DISTINCT entity_code, observed_at::TIMESTAMPTZ AS observed_at, wait_time_type, park_date
+                FROM _bf_all) GROUP BY 1
+        """).fetchall()}
+    finally:
+        con.unregister("_bf_all")
+
+
+def load_days(files: list[Path], con, header: str, inserted_at: str | None = None, row_tol: float = 0.02) -> bool:
+    """Per-day counts; with inserted_at set, also insert (tagged) and VERIFY. True unless a VERIFY failed."""
+    dry_run = inserted_at is None
     by_day: dict[str, list[Path]] = {}
     for f in files:
         by_day.setdefault(parse_name(f)[1], []).append(f)
 
     before = con.execute("SELECT count(*) FROM live_waits").fetchall()[0][0]
-    tot = dict(files=0, raw=0, prepped=0, present=0, would=0, inserted=0, mismatch=0)
+    tot = dict(files=0, raw=0, prepped=0, present=0, would=0, inserted=0, mismatch=0, dropped=0)
     verb = "would insert" if dry_run else "inserted"
-    print(f"{'DRY RUN' if dry_run else 'LOAD'}: live_waits rows before: {before:,}")
+    print(f"{header}: live_waits rows before: {before:,}")
+    loaded: list[pd.DataFrame] = []
     for day in sorted(by_day):
-        raw_n, frames, mismatch = 0, [], 0
+        raw_n, frames, mismatch, dropped = 0, [], 0, 0
         for f in by_day[day]:
             n, prepped = read_prepped(f)
             raw_n += n
+            dropped += int(prepped.attrs.get("dropped_null_key", 0))
             mismatch += int((prepped["park_date"] != day).sum())
             frames.append(prepped)
         df = _concat(frames)
@@ -310,23 +424,139 @@ def load_days(files: list[Path], con, dry_run: bool) -> None:
         if not dry_run:
             con.execute("BEGIN TRANSACTION")
             try:
-                inserted = insert_missing_live_waits(con, df)
+                inserted = insert_missing_live_waits(con, df, inserted_at=inserted_at)
                 con.execute("COMMIT")
             except Exception:
                 con.execute("ROLLBACK")
                 raise
             if inserted != would:
                 print(f"  WARNING {day}: inserted {inserted} != expected {would}")
+            loaded.append(df[list(LIVE_WAITS_KEY) + ["park_date"]])
         print(f"  {day}: files={len(by_day[day])} raw={raw_n:,} prepped={len(df):,} distinct_keys={distinct:,} "
               f"already_present={present:,} {verb}={would if dry_run else inserted:,} "
-              f"derived_park_date_mismatch={mismatch:,}")
+              f"derived_park_date_mismatch={mismatch:,} candidates={raw_n:,} dropped_null_key={dropped:,} "
+              f"skipped_existing={present:,}")
         tot["files"] += len(by_day[day]); tot["raw"] += raw_n; tot["prepped"] += len(df)
         tot["present"] += present; tot["would"] += would; tot["inserted"] += inserted; tot["mismatch"] += mismatch
+        tot["dropped"] += dropped
     after = con.execute("SELECT count(*) FROM live_waits").fetchall()[0][0]
     print(f"TOTAL: files={tot['files']} raw={tot['raw']:,} prepped={tot['prepped']:,} "
           f"already_present={tot['present']:,} {verb}={(tot['would'] if dry_run else tot['inserted']):,} "
-          f"derived_park_date_mismatch={tot['mismatch']:,}")
+          f"derived_park_date_mismatch={tot['mismatch']:,} candidates={tot['raw']:,} "
+          f"dropped_null_key={tot['dropped']:,} skipped_existing={tot['present']:,}")
     print(f"live_waits rows after: {after:,}" + (" (dry run; unchanged)" if dry_run else ""))
+    if dry_run:
+        return True
+
+    clean_by_day = distinct_keys_by_park_date(con, _concat(loaded))
+    failed = 0
+    for day in sorted(by_day):
+        clean_n = clean_by_day.get(day, 0)
+        live_n = con.execute("SELECT count(*) FROM live_waits WHERE park_date = CAST(? AS DATE)",
+                             [day]).fetchall()[0][0]
+        diff = abs(live_n - clean_n) / max(clean_n, 1)
+        ok = diff <= row_tol
+        failed += not ok
+        print(f"  VERIFY {'PASS' if ok else 'FAIL'} {day}: live_waits={live_n:,} clean_distinct_keys={clean_n:,} "
+              f"diff={diff:.4%} (tol {row_tol:.2%})")
+    return failed == 0
+
+
+# --------------------------------------------------------------------------- rollback
+
+
+def run_rollback(args, db: Path) -> int:
+    try:
+        if args.load_key is None:
+            raise RefusedPath("--rollback requires --load-key")
+        key = parse_load_key(args.load_key)
+        if (args.start is None) != (args.end is None):
+            raise RefusedPath("--start and --end must be given together")
+        where, params = "inserted_at = CAST(? AS TIMESTAMP)", [key]
+        if args.start is not None:
+            d0, d1 = _parse_date(args.start, "--start"), _parse_date(args.end, "--end")
+            if d0 > d1:
+                raise RefusedPath(f"--start {args.start} is after --end {args.end}")
+            where += " AND park_date BETWEEN CAST(? AS DATE) AND CAST(? AS DATE)"
+            params += [args.start, args.end]
+        if not db.is_file():
+            raise RefusedPath(f"database not found: {db}")
+    except (RefusedPath, ValueError) as e:
+        print(f"REFUSED: {e}")
+        return EXIT_PATH
+
+    con = duckdb.connect(str(db), read_only=args.dry_run)
+    try:
+        if not has_inserted_at(con):
+            print("REFUSED: live_waits has no inserted_at column; nothing to roll back by key")
+            return EXIT_PATH
+        per_day = con.execute(
+            f"SELECT CAST(park_date AS VARCHAR), count(*) FROM live_waits WHERE {where} GROUP BY 1 ORDER BY 1",
+            params).fetchall()
+        n = sum(c for _, c in per_day)
+        if args.dry_run:
+            print(f"ROLLBACK DRY RUN: would delete {n} rows with inserted_at={key}")
+            for d, c in per_day:
+                print(f"  {d}: would delete={c:,}")
+            return EXIT_OK
+        print(f"ROLLBACK: deleting {n} rows with inserted_at={key}")
+        con.execute("BEGIN TRANSACTION")
+        try:
+            deleted = con.execute(f"DELETE FROM live_waits WHERE {where}", params).fetchall()[0][0]
+            con.execute("COMMIT")
+        except Exception:
+            con.execute("ROLLBACK")
+            raise
+        remaining = con.execute(f"SELECT count(*) FROM live_waits WHERE {where}", params).fetchall()[0][0]
+        print(f"ROLLBACK: deleted {deleted} rows with inserted_at={key}")
+        if remaining != 0 or deleted != n:
+            print(f"ROLLBACK VERIFY FAIL: expected to delete {n}, deleted {deleted}, {remaining} still match")
+            return EXIT_VERIFY
+        print(f"ROLLBACK VERIFY PASS: 0 rows remain with inserted_at={key}")
+        return EXIT_OK
+    finally:
+        con.close()
+
+
+# --------------------------------------------------------------------------- run phase
+
+
+def run_load_phase(args, db: Path, files: list[Path], parity_ok: bool, key_arg: str | None) -> int:
+    ro = duckdb.connect(str(db), read_only=True)
+    try:
+        has_key = has_inserted_at(ro)
+        if args.dry_run or not parity_ok or not has_key:
+            header = ("DRY RUN (parity failed; counts only)" if not parity_ok
+                      else "DRY RUN" if args.dry_run else "DRY RUN (inserted_at missing; counts only)")
+            load_days(files, ro, header)
+            if not parity_ok:
+                print("Source parity failed; refusing to load. Nothing was written.")
+                return EXIT_PARITY
+            if not has_key:
+                print("HOLD: live_waits has no inserted_at column (OQ1); no live load")
+                return EXIT_HOLD
+            return EXIT_OK
+    finally:
+        ro.close()
+
+    key = key_arg or new_load_key()
+    con = duckdb.connect(str(db))
+    try:
+        clash = con.execute("SELECT count(*) FROM live_waits WHERE inserted_at = CAST(? AS TIMESTAMP)",
+                            [key]).fetchall()[0][0]
+        if clash:
+            print(f"REFUSED: {clash} live_waits rows already have inserted_at={key}; use a fresh load key")
+            return EXIT_PATH
+        print(f"LOAD KEY inserted_at={key}")
+        ok = load_days(files, con, "LOAD", inserted_at=key, row_tol=args.row_tol)
+        print(f"LOAD KEY inserted_at={key}")
+    finally:
+        con.close()
+    if not ok:
+        print("VERIFY FAILED: data stays loaded. To undo this load: "
+              f"--rollback --load-key '{key}' --dry-run, then without --dry-run")
+        return EXIT_VERIFY
+    return EXIT_OK
 
 
 # --------------------------------------------------------------------------- main
@@ -341,6 +571,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--end", default=None, help="YYYY-MM-DD, inclusive park date; requires --start; excludes --glob")
     p.add_argument("--parity-date", default=DEFAULT_PARITY_DATE)
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--allow-missing", action="store_true",
+                   help="continue with the days that have a clean CSV (range runs; otherwise missing days exit 4)")
+    p.add_argument("--load-key", default=None,
+                   help="inserted_at value 'YYYY-MM-DD HH:MM:SS.ffffff' (default: now, UTC); required by --rollback")
+    p.add_argument("--rollback", action="store_true",
+                   help="delete the rows with inserted_at = --load-key (optionally within --start/--end)")
     p.add_argument("--row-tol", type=float, default=0.02)
     p.add_argument("--entity-tol", type=float, default=0.02)
     p.add_argument("--tp-posted-tol", type=float, default=0.01)
@@ -354,6 +590,10 @@ def main(argv=None) -> int:
     db = (args.db or output_base / "tpcr_live.duckdb")
     clean_root = output_base / "fact_tables" / "clean"
 
+    if args.rollback:
+        return run_rollback(args, db)
+
+    missing: list[str] = []
     try:
         if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.parity_date):
             raise RefusedPath(f"bad --parity-date {args.parity_date!r}")
@@ -364,6 +604,8 @@ def main(argv=None) -> int:
                 raise RefusedPath("--start/--end are mutually exclusive with --glob")
             desc = f"{args.start}..{args.end}"
             files = resolve_range_targets(output_base, args.start, args.end, args.parity_date, clean_root)
+            missing = missing_days(args.start, args.end, files)
+            print(f"MISSING DAYS: {','.join(missing) if missing else 'none'}")
         else:
             desc = args.glob or DEFAULT_GLOB
             files = resolve_targets(output_base, desc, clean_root)
@@ -372,27 +614,39 @@ def main(argv=None) -> int:
         for f in files:
             parse_name(f)
             park_tz_for_park_code(parse_name(f)[0])
+        if missing and not args.allow_missing:
+            print("Missing days and --allow-missing not set; refusing. No DB access.")
+            return EXIT_MISSING
         if not db.is_file():
             raise RefusedPath(f"database not found: {db}")
+        key_arg = parse_load_key(args.load_key) if args.load_key is not None else None
+        hashes = hash_files(sorted(set(files) | set(parity_files(clean_root, args.parity_date))))
     except (RefusedPath, ValueError) as e:
         print(f"REFUSED: {e}")
         return EXIT_PATH
 
     print(f"output base: {output_base}\ndb: {db}\ntarget files: {len(files)}")
+
+    def checksum_changed() -> bool:
+        changed = changed_files(hashes)
+        for f in changed:
+            print(f"CHECKSUM CHANGED: {f}")
+        return bool(changed)
+
     try:
-        if not run_parity(db, clean_root, args.parity_date, args):
-            print("Source parity failed; refusing to load. Nothing was written.")
-            return EXIT_PARITY
+        parity_ok = run_parity(db, clean_root, args.parity_date, args)
     except RefusedPath as e:
         print(f"REFUSED: {e}")
         return EXIT_PATH
+    if checksum_changed():
+        print("Clean files changed during the run; aborting before any write.")
+        return EXIT_CHECKSUM
 
-    con = duckdb.connect(str(db), read_only=args.dry_run)
-    try:
-        load_days(files, con, args.dry_run)
-    finally:
-        con.close()
-    return EXIT_OK
+    rc = run_load_phase(args, db, files, parity_ok, key_arg)
+    if checksum_changed():
+        return EXIT_CHECKSUM
+    print(f"CLEAN CHECKSUMS UNCHANGED ({len(hashes)} files)")
+    return rc
 
 
 if __name__ == "__main__":

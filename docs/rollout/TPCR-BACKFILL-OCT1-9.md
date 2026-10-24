@@ -29,31 +29,48 @@
 6. **Rerun the dry run** (step 3 command): `PARITY PASS` and `would insert=0` for every day. A real rerun also inserts 0.
 7. **Rollback.** If anything is wrong: when no writer has the DB open, restore the backup over `$DB` (`cp "$OB/tpcr_live.duckdb.bak-<date>" "$DB"`), then verify the row count equals `<N_before>`. Rows written by the scraper after the backup are lost with a file restore. To avoid that, delete only the backfilled days instead, if Fred agrees (`DELETE FROM live_waits WHERE park_date BETWEEN '2026-10-01' AND '2026-10-09'` is only safe if the scraper had written none of them, which was the starting state).
 
-## Oct 14-22 (S11 lock loss) — Fred ruled the loss not accepted, recover from clean; loading still needs Fred's go
+## Oct 14-22 (S11 lock loss) — Fred ruled the loss not accepted, recover from clean; HOLD until OQ2 is explained and Fred's go
 
-Same script, same parity gate and skip-existing anti-join. Select the days with `--start/--end` (inclusive park dates; mutually exclusive with `--glob`; both required; start <= end). Parity is checked on a day that is *not* loaded, so use `--parity-date 2026-10-23`; a range containing the parity date is refused (exit 2). Do not start the live run without Fred's go. Prerequisites, deploy and backup (steps 1-2 above) apply unchanged; take the backup first.
+Same script, same parity gate and skip-existing anti-join. Select the days with `--start/--end` (inclusive park dates; mutually exclusive with `--glob`; both required; start <= end). Parity is checked on a day that is *not* loaded: use `--parity-date 2026-10-12` (R1: Oct 23 is not in clean yet); a range containing the parity date is refused (exit 2) before any file is read.
+
+**Status: HOLD.** Do not run the live load until (a) OQ2 is explained (chief's gaps are 6.0k-8.1k/day for Oct 14-22, but control days Oct 12 and Oct 13 show gaps too, so the gap may be structural rather than lost batches) and (b) Fred gives his go. **chief runs the live load and the rollback on the Mini.** The dry run is read-only and may be run any time. Prerequisites, deploy and backup (steps 1-2 above) apply unchanged; take the backup first.
 
 Dry run (read-only; parity runs first):
-`python scripts/backfill_live_waits_oct1_9.py --output-base "$OB" --start 2026-10-14 --end 2026-10-22 --parity-date 2026-10-23 --dry-run`
+`python scripts/backfill_live_waits_oct1_9.py --output-base "$OB" --start 2026-10-14 --end 2026-10-22 --parity-date 2026-10-12 --dry-run`
 
-Live run (after Fred's go):
-`python scripts/backfill_live_waits_oct1_9.py --output-base "$OB" --start 2026-10-14 --end 2026-10-22 --parity-date 2026-10-23`
+Live run (after OQ2 and Fred's go; chief, on the Mini):
+`python scripts/backfill_live_waits_oct1_9.py --output-base "$OB" --start 2026-10-14 --end 2026-10-22 --parity-date 2026-10-12`
+
+Behavior, in order:
+- **Missing days.** The run prints `MISSING DAYS: <d1>,<d2>` (comma-separated, no spaces) or `MISSING DAYS: none`: park dates in the range with no clean CSV. Those days are skipped and not recovered. If the list is non-empty and `--allow-missing` is not given, the run exits 4 before any DB access. With `--allow-missing` it continues with the present days (record the missing days as still broken). If every day is missing, exit 2.
+- **Checksums.** Every target clean file and the `--parity-date` files are sha256-hashed at the start, re-hashed after parity (before any write) and again at the end (dry or live). Any change prints `CHECKSUM CHANGED: <file>` and exits 6 (before loading, if caught after parity). Success prints `CLEAN CHECKSUMS UNCHANGED (<n> files)`.
+- **Parity.** `PARITY PASS`, else the per-day counts are still printed read-only under `DRY RUN (parity failed; counts only)`, nothing is written and the exit code is 3. Parity failure takes precedence over HOLD.
+- **inserted_at gate.** If `live_waits` has no `inserted_at` column the run prints `HOLD: live_waits has no inserted_at column (OQ1); no live load` and exits 7 without writing (after the per-day counts). The column exists on the Mini (OQ1 closed); no schema change is made by this script.
+- **Load key.** One value for the whole load: the current UTC time as a naive `TIMESTAMP` with microseconds (override: `--load-key 'YYYY-MM-DD HH:MM:SS.ffffff'`). It is logged as `LOAD KEY inserted_at=<value>` at load start and end; **copy it from the log**. Every inserted row gets it; scraper rows keep their own `inserted_at`. The run refuses (exit 2) if any `live_waits` row already has that key.
+- **Per-day log line.** `<day>: files=.. raw=.. prepped=.. distinct_keys=.. already_present=X inserted=Y derived_park_date_mismatch=.. candidates=<rows read> dropped_null_key=<n> skipped_existing=<n>` (`would insert=` instead of `inserted=` in a dry run). `candidates` = rows read before prep; `skipped_existing` = keys already in `live_waits`.
+- **Verify.** After the whole load, per day: `VERIFY PASS <day>` / `VERIFY FAIL <day>` with `live_waits` count for that park_date vs the distinct keys of all loaded clean rows whose derived park_date is that day, tolerance `--row-tol` (default 2%, abs diff / max(clean, 1)). Any FAIL exits 5; the data stays loaded and the log points at the rollback.
 
 Expectations:
-- `PARITY PASS` for 2026-10-23, else exit 3 and nothing is loaded.
 - `already_present` is **nonzero**: the scraper covered part of these days. Those keys are skipped.
-- Per-day `would insert` is the rows lost to the lock; record `<N_day>` and `<N_before>` from the dry run. Live `inserted` must equal it (a `WARNING ... inserted != expected` line means stop).
+- Per-day `would insert` is the rows lost to the lock (or a structural gap, see OQ2); record `<N_day>`, the total `<N_total>` and `<N_before>` from the dry run. Live `inserted` must equal it (a `WARNING ... inserted != expected` line means stop).
+- Rerun the dry run afterwards: `would insert=0` for every day.
 
 Verify (read-only):
 `duckdb -readonly "$DB" "SELECT park_date, count(*) FROM live_waits WHERE park_date BETWEEN '2026-10-14' AND '2026-10-22' GROUP BY 1 ORDER BY 1"`
-Per day: previous count + `would insert`. Rerun the dry run: `would insert=0` for every day.
 
-Rollback: restore the backup file over `$DB` when no writer has it open, then check the row count equals `<N_before>` (scraper rows written after the backup are lost). **`DELETE ... WHERE park_date BETWEEN '2026-10-14' AND '2026-10-22'` is NOT safe here**: scraper rows already exist for these days and would be deleted too. Only a file restore, or a DELETE of exactly the keys the run inserted (e.g. `inserted_at >= <run start>` and `park_date` in range, checked against the `inserted` totals first), removes only the backfilled rows.
+Rollback (by load key; chief, on the Mini, after Fred's go): `DELETE ... WHERE park_date BETWEEN ...` is NOT safe, scraper rows exist for these days. Use the key from the `LOAD KEY inserted_at=` log line:
+1. `python scripts/backfill_live_waits_oct1_9.py --output-base "$OB" --rollback --load-key '<logged value>' --dry-run` prints `ROLLBACK DRY RUN: would delete <n> rows with inserted_at=<key>` and per-park_date counts (read-only). `<n>` must equal the load's inserted total.
+2. Same command without `--dry-run` deletes exactly those rows in one transaction, prints `ROLLBACK: deleted <n> rows with inserted_at=<key>`, re-counts and prints `ROLLBACK VERIFY PASS: 0 rows remain with inserted_at=<key>` (exit 5 on a mismatch).
+Rows with a NULL `inserted_at` or another key never match, so scraper rows of the same park dates stay. `--start/--end` may be added to restrict the rollback to a park-date range. Rollback does no parity check and reads no files; it exits 2 without `--load-key`, with a malformed key, or if `live_waits` has no `inserted_at`. A file restore of the backup remains the last resort (scraper rows written since the backup are lost).
 
 ## Exit codes
 
 | Code | Meaning |
 |------|---------|
 | 0 | Success (dry run or load) |
-| 2 | Bad input: path outside `fact_tables/clean`, symlinked dir/file, no matching files, missing DB, bad filename/park code, argument error |
-| 3 | Source parity failed; nothing loaded (also in `--dry-run`) |
+| 2 | Bad input: path outside `fact_tables/clean`, symlinked dir/file, no matching files (incl. every day missing), range containing `--parity-date`, missing DB, bad filename/park code, bad `--load-key`, load key already present in `live_waits`, `--rollback` without `--load-key` or without an `inserted_at` column, argument error |
+| 3 | Source parity failed; nothing loaded (also in `--dry-run`; per-day counts are still printed) |
+| 4 | Range has missing days (no clean CSV) and `--allow-missing` was not given; no DB access |
+| 5 | Post-load `VERIFY FAIL` for at least one day (data stays loaded; roll back by key), or the rollback count check failed |
+| 6 | A clean file's checksum changed during the run (`CHECKSUM CHANGED: <file>`); aborts before loading if caught after parity |
+| 7 | HOLD: `live_waits` has no `inserted_at` column; no live load (dry run prints the counts first) |

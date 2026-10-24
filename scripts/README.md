@@ -332,10 +332,20 @@ python scripts/backfill_live_waits_oct1_9.py --dry-run   # parity + per-day file
 python scripts/backfill_live_waits_oct1_9.py             # live run (needs the DuckDB write lock)
 ```
 
-Other ranges: `--start YYYY-MM-DD --end YYYY-MM-DD` (inclusive park dates, both required, may span months, mutually exclusive with `--glob`, must not include `--parity-date`; violations exit 2). Files are globbed per date as `fact_tables/clean/<YYYY-MM>/*_<date>.csv` and each is still path-validated. Example (Oct 14-22 S11 lock loss): `--start 2026-10-14 --end 2026-10-22 --parity-date 2026-10-23`.
+Other ranges: `--start YYYY-MM-DD --end YYYY-MM-DD` (inclusive park dates, both required, may span months, mutually exclusive with `--glob`, must not include `--parity-date`; violations exit 2, before any file is read). Files are globbed per date as `fact_tables/clean/<YYYY-MM>/*_<date>.csv` and each is still path-validated. Example (Oct 14-22 S11 lock loss; parity on Oct 12 because Oct 23 is not in clean yet): `--start 2026-10-14 --end 2026-10-22 --parity-date 2026-10-12 --dry-run`. Live load of that range is HOLD until OQ2 (control-day gap) is explained and Fred gives his go; chief runs it on the Mini.
 
-Options: `--output-base`, `--db`, `--glob`, `--start`, `--end`, `--parity-date`, `--dry-run`, `--row-tol`, `--entity-tol`, `--tp-posted-tol`.
-Exit codes: `0` ok, `2` bad input / path refused, `3` source parity failed (nothing loaded). Rollout: [docs/rollout/TPCR-BACKFILL-OCT1-9.md](../docs/rollout/TPCR-BACKFILL-OCT1-9.md).
+Range safeguards:
+- `MISSING DAYS: <d1>,<d2>` (or `none`) lists days with no clean CSV; they are skipped. If any, exit `4` before any DB access unless `--allow-missing`. All days missing: exit `2`.
+- sha256 of every target clean file and the parity-date files at start, after parity (before any write) and at the end; a change prints `CHECKSUM CHANGED: <file>` and exits `6`. Success prints `CLEAN CHECKSUMS UNCHANGED (<n> files)`.
+- Parity failure still prints the per-day counts read-only (`DRY RUN (parity failed; counts only)`), then exits `3`; nothing is written. Parity failure wins over HOLD.
+- Live load needs an `inserted_at` column on `live_waits`; without it: `HOLD: live_waits has no inserted_at column (OQ1); no live load`, exit `7`. All rows of a load get one `inserted_at` (UTC, microseconds; `--load-key 'YYYY-MM-DD HH:MM:SS.ffffff'` overrides), logged as `LOAD KEY inserted_at=<value>` at start and end; a key already present is refused (exit 2).
+- Per-day log adds `candidates=` (rows read), `dropped_null_key=`, `skipped_existing=` after the existing fields.
+- After a live load, `VERIFY PASS|FAIL <day>` compares the day's `live_waits` count with the distinct clean keys for that park date within `--row-tol`; any FAIL exits `5` (data stays loaded).
+
+Rollback by key: `--rollback --load-key '<logged value>' [--dry-run] [--start D --end D]` deletes only rows with `inserted_at` equal to the key (NULL never matches) in one transaction, then verifies 0 remain. `--dry-run` prints `ROLLBACK DRY RUN: would delete <n> rows with inserted_at=<key>` plus per-park-date counts, read-only; the count must equal the load's inserted total. No parity check, no file reads; exit 2 without `--load-key` or without an `inserted_at` column.
+
+Options: `--output-base`, `--db`, `--glob`, `--start`, `--end`, `--parity-date`, `--dry-run`, `--allow-missing`, `--load-key`, `--rollback`, `--row-tol`, `--entity-tol`, `--tp-posted-tol`.
+Exit codes: `0` ok, `2` bad input / path refused, `3` source parity failed (nothing loaded), `4` missing days without `--allow-missing`, `5` post-load VERIFY failed (or rollback count check failed), `6` clean checksum changed, `7` HOLD (no `inserted_at`). Rollout: [docs/rollout/TPCR-BACKFILL-OCT1-9.md](../docs/rollout/TPCR-BACKFILL-OCT1-9.md).
 
 ## Additional Scripts (summary)
 

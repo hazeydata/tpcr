@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -71,18 +72,27 @@ def prepare_live_waits_rows(
     return out
 
 
-def insert_missing_live_waits(con, df: pd.DataFrame) -> int:
+def insert_missing_live_waits(con, df: pd.DataFrame, inserted_at=None) -> int:
     """Insert rows of df whose (entity_code, observed_at, wait_time_type) is not in live_waits.
 
     Idempotent, and works whether or not live_waits has a PRIMARY KEY. Returns rows inserted.
+
+    inserted_at (optional, datetime or 'YYYY-MM-DD HH:MM:SS[.ffffff]' string): when given, every inserted
+    row is tagged with it (live_waits must have an inserted_at TIMESTAMP column). When None the
+    statement is exactly the untagged insert used by the scraper and the replay.
     """
     if df.empty:
         return 0
+    tag_col, tag_val, params = "", "", []
+    if inserted_at is not None:
+        if isinstance(inserted_at, datetime):
+            inserted_at = inserted_at.strftime("%Y-%m-%d %H:%M:%S.%f")
+        tag_col, tag_val, params = ", inserted_at", ", CAST(? AS TIMESTAMP)", [inserted_at]
     con.register("_live_waits_new", df[list(LIVE_WAITS_COLUMNS)])
     try:
-        rows = con.execute("""
-            INSERT INTO live_waits (entity_code, observed_at, wait_time_type, wait_time_minutes, park_date)
-            SELECT entity_code, observed_at, wait_time_type, wait_time_minutes, park_date
+        rows = con.execute(f"""
+            INSERT INTO live_waits (entity_code, observed_at, wait_time_type, wait_time_minutes, park_date{tag_col})
+            SELECT entity_code, observed_at, wait_time_type, wait_time_minutes, park_date{tag_val}
             FROM (
                 SELECT DISTINCT ON (entity_code, observed_at, wait_time_type)
                        entity_code,
@@ -98,7 +108,7 @@ def insert_missing_live_waits(con, df: pd.DataFrame) -> int:
                   AND w.observed_at = n.observed_at
                   AND w.wait_time_type = n.wait_time_type
             )
-        """).fetchall()
+        """, params).fetchall()
         return int(rows[0][0]) if rows else 0
     finally:
         con.unregister("_live_waits_new")
