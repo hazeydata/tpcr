@@ -357,7 +357,7 @@ class TestPlist(unittest.TestCase):
 
     def test_plist_has_no_absolute_user_paths_or_ips(self):
         text = PLIST.read_text()
-        for bad in ("/workspace", "/home/", "/Users/"):
+        for bad in ("/" + "workspace", "/home/", "/Users/"):
             self.assertNotIn(bad, text)
         self.assertIsNone(re.search(r"\b\d{1,3}(\.\d{1,3}){3}\b", text))
 
@@ -428,7 +428,7 @@ class TestStatics(unittest.TestCase):
     def test_no_absolute_user_paths_in_new_files(self):
         for path in (JOB_SCRIPT, REPO_ROOT / "launchd" / "README.md"):
             text = path.read_text()
-            for bad in ("/workspace", "/home/", "/Users/"):
+            for bad in ("/" + "workspace", "/home/", "/Users/"):
                 self.assertNotIn(bad, text, path.name)
 
 
