@@ -112,6 +112,10 @@ class FlagRuleUnitTest(unittest.TestCase):
         self.assertEqual(flag_rule.streak_length(EVAL_DATE, True, summaries(no_data), "c1"), 2)
         self.assertEqual(flag_rule.streak_length(EVAL_DATE, True, summaries({}), "other"), 1)
 
+    def test_float_mae_gain_of_exactly_point_three_flags(self):
+        self.assertTrue(flag_rule.should_flag(True, 7, 0.1, flag_rule.gain_min(5.3, 5.0)))
+        self.assertFalse(flag_rule.should_flag(True, 7, 0.1, flag_rule.gain_min(5.29, 5.0)))
+
     def test_significant_gain_text(self):
         self.assertEqual(flag_rule.significant_gain_text([]), "None yet")
         self.assertEqual(flag_rule.significant_gain_text(["a"]), "Significant gain: a")

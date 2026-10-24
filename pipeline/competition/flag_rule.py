@@ -19,6 +19,9 @@ import numpy as np
 MIN_STREAK = 7
 BOOTSTRAP_RESAMPLES = 10_000
 MIN_GAIN_MIN = 0.3
+# Float MAEs make an exact 0.3 gain land just under it (5.3 - 5.0 = 0.29999999999999982),
+# so the gain comparison allows this tolerance.
+GAIN_EPSILON = 1e-9
 BOOTSTRAP_SEED = 20261024
 CI_LEVEL = 95
 STREAK_LOOKBACK_DAYS = 60  # streak lookback cap (the rule only needs MIN_STREAK)
@@ -101,7 +104,7 @@ def should_flag(win, streak, ci95_low, gain):
         win
         and streak >= MIN_STREAK
         and ci95_low is not None and ci95_low > 0
-        and gain is not None and gain >= MIN_GAIN_MIN
+        and gain is not None and gain >= MIN_GAIN_MIN - GAIN_EPSILON
     )
 
 

@@ -5,7 +5,7 @@
 **Authors:** Barney (architect) + Fred (decision-maker)
 **Status:** APPROVED by Fred — 2026-03-26
 **Amends:** `PIPELINE_V4_DESIGN.md` Phase E (Competition Framework)
-**Superseded in part (TPCR-SHADOW-REVIVE-001 Phase 4):** nothing posts to Discord any more, and challengers are no longer auto-retired or auto-flagged after 7 days. A challenger is flagged only by the streak + bootstrap + gain rule, and promotion is always manual. Current behavior: `SHADOW_COMPETITION.md`.
+**Superseded in part (TPCR-SHADOW-REVIVE-001 Phase 4):** nothing posts to Discord any more, and challengers are no longer auto-retired or auto-flagged after 7 days. A challenger is flagged only by the streak + bootstrap + gain rule, and promotion is always manual. Execution is local on the production pipeline host (`scripts/shadow_job.py` / `scripts/rolling_shadow.py`, launchd `com.hazeydata.tpcr-shadow`): no SSH, no wilma-server, no Dino orchestration. Current behavior: `SHADOW_COMPETITION.md`.
 
 ---
 
@@ -49,7 +49,7 @@ At steady state: **7-10 challengers running simultaneously**, each testing a sin
 
 1. **Challengers don't interact.** Each one independently generates predictions from its own model weights against the same actuals. Running them in parallel doesn't contaminate results.
 
-2. **Compute cost is trivial.** Each challenger forecast takes ~2 minutes of Python/XGBoost on wilma-server. Ten challengers = 20 minutes added to a pipeline with 23 hours of daily idle time. No API credits. No LLM calls. Pure CPU.
+2. **Compute cost is trivial.** Each challenger forecast takes ~2 minutes of Python/XGBoost on the production pipeline host. Ten challengers = 20 minutes added to a pipeline with 23 hours of daily idle time. No API credits. No LLM calls. Pure CPU.
 
 3. **Single-hypothesis challengers are easier to interpret.** When `xgb-dow` (day-of-week feature) wins, you know exactly what caused the improvement. When `xgb-kitchen-sink` (5 new features + different hyperparams) wins, you learn nothing about which change helped.
 
@@ -100,8 +100,8 @@ pipeline/competition/challenger_registry.json
 
 ### Daily Shadow Run (New Step — runs after Step 10)
 
-**Trigger:** Dino cron on Mac Mini, fires after pipeline completes (~7:00 AM ET)
-**Execution:** SSH to wilma-server, run shadow forecast loop
+**Trigger:** launchd job `com.hazeydata.tpcr-shadow` at 06:20 local, `nice` 10 (written, not installed)
+**Execution:** local on the production pipeline host via `scripts/shadow_job.py` / `scripts/rolling_shadow.py` (no SSH, no remote host)
 **For each active challenger:**
 1. Load challenger model weights
 2. Generate predictions for all entities (same feature set, same operating calendar)
@@ -175,11 +175,11 @@ Water parks are a fundamentally different product with intermittent schedules an
 
 | Component | Cost | Notes |
 |-----------|------|-------|
-| Shadow forecasts | ~2 min CPU per challenger | Pure Python/XGBoost on wilma-server |
+| Shadow forecasts | ~2 min CPU per challenger | Pure Python/XGBoost on the production pipeline host |
 | 10 challengers/day | ~20 min total | Added to 55-min pipeline |
 | Storage | ~50MB/day per challenger | Parquet forecasts, archived daily |
 | API credits | $0 | No LLM calls in forecast loop |
-| Dino orchestration | Included in Claude Max | SSH trigger + monitoring |
+| Orchestration | $0 | Local launchd job (`shadow_job.py`); no SSH, no Dino |
 
 **Total incremental cost: ~20 minutes of CPU time and 500MB of disk per day.** Negligible.
 
@@ -201,7 +201,7 @@ Water parks are a fundamentally different product with intermittent schedules an
 
 ### Phase 3: Daily Queue (starts after Phase 2 verified)
 1. Add one new challenger per day from the queue
-2. Train challenger models on wilma-server (Dino triggers via SSH)
+2. Train challenger models locally on the production pipeline host (`rolling_shadow.py`; no SSH)
 3. Register in challenger registry
 4. Shadow runs accumulate automatically
 
