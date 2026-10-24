@@ -778,7 +778,7 @@ def test_simulated_is_symlink_error_refused(env, capsys, monkeypatch, connect_sp
 @pytest.mark.parametrize("which", ["lstat", "stat"])
 @pytest.mark.parametrize("mode", [["--apply"], []])
 def test_simulated_lstat_stat_error_during_scan_refused(env, capsys, monkeypatch, connect_spy, mode, which):
-    # lstat: an off-path entry the walk checks; stat: the month dir that day_files stats (exists/is_dir)
+    # lstat: an off-path entry the walk checks; stat: the month dir, first stat'd by the walk's per-entry is_symlink
     target = env["clean"].parent / "2026-09" / "mk_2026-09-01.csv"
     write_csv(target, day_rows("2026-09-01"))
     if which == "stat":
@@ -798,10 +798,8 @@ def test_simulated_lstat_stat_error_during_scan_refused(env, capsys, monkeypatch
     assert "REFUSED" in out and str(target) in out
     assert connect_spy == []
     assert sha(env["db"]) == before and counts(env["db"]) == {}
-    if which == "lstat":
-        assert "cannot check" in out
-    else:
-        assert "any OSError during the pre-open scan exits 2" in out
+    # both hit the walk's per-entry catch first (lstat: the explicit os.lstat; stat: Path.is_symlink calls os.stat(follow_symlinks=False)); the outer whole-scan message is pinned by test_day_files_oserror_refused_before_connect
+    assert "cannot check" in out
 
 
 @pytest.mark.parametrize("mode", [["--apply"], []])
