@@ -72,3 +72,44 @@ def test_anthropic_sdk_logger_pinned_when_installed(bot):
     pytest.importorskip("anthropic")
     assert logging.getLogger("anthropic").level == logging.WARNING
     assert not logging.getLogger("anthropic").isEnabledFor(logging.INFO)
+
+
+def test_ac33_anthropic_log_env_cannot_reenable_sdk_debug(bot, monkeypatch, caplog):
+    """ANTHROPIC_LOG=debug must not re-enable SDK DEBUG: bot.py drops it before any SDK import."""
+    import importlib
+    monkeypatch.setenv("ANTHROPIC_LOG", "debug")
+    monkeypatch.delitem(sys.modules, "bot")  # restored to the fixture's module afterwards
+    bot = importlib.import_module("bot")  # fresh import with ANTHROPIC_LOG=debug set
+    assert "ANTHROPIC_LOG" not in os.environ
+    monkeypatch.setenv("TPCR_ASK_PROVIDER", "openrouter")
+    monkeypatch.setattr(bot, "OPENROUTER_API_KEY", SECRET)
+    real = httpx.AsyncClient
+
+    def client(*a, **k):
+        k["transport"] = httpx.MockTransport(_handler)
+        return real(*a, **k)
+
+    with patch.object(aa.httpx, "AsyncClient", client), \
+         patch("ask_agent._chat", AsyncMock(side_effect=aa.QwenHTTPError(500, "down"))), \
+         patch("ask_agent.track_usage", return_value=(1, -1)), \
+         patch("ask_agent.log_question"), \
+         caplog.at_level(logging.DEBUG):
+        try:  # a fresh SDK import (if installed) must see no ANTHROPIC_LOG
+            for name in [m for m in sys.modules if m == "anthropic" or m.startswith("anthropic.")]:
+                monkeypatch.delitem(sys.modules, name)
+            import anthropic  # noqa: F401
+        except ImportError:
+            pass
+        call_ask(bot, make_interaction([]))
+    assert logging.getLogger("anthropic").getEffectiveLevel() >= logging.WARNING
+    leaked = [(r.name, r.getMessage()) for r in caplog.records
+              if r.levelno == logging.DEBUG and r.name.split(".")[0] in PINNED]
+    assert leaked == [], leaked
+
+
+def test_bot_pops_anthropic_log_after_load_dotenv_before_ask_agent_import():
+    src = open(os.path.join(os.path.dirname(__file__), "..", "bot.py")).read()
+    dotenv = src.index('load_dotenv(os.path.expanduser("~/.env"))')
+    pop = src.index('os.environ.pop("ANTHROPIC_LOG", None)')
+    imp = src.index("from ask_agent import")
+    assert dotenv < pop < imp
