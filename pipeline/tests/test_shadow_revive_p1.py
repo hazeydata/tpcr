@@ -174,7 +174,8 @@ class MainRunListTest(unittest.TestCase):
             return good_metrics(5)
 
         def fake_retrain(ch, run_date):  # Phase 2 retrain step: no model dir in this sandbox
-            return {"trained_at": "2026-10-24T00:00:00+00:00", "entity_count": 3, "eligible_count": 3}
+            return {"trained_at": "2026-10-24T00:00:00+00:00", "entity_count": 3, "eligible_count": 3,
+                    "trained_entities": ["MK01", "MK02", "MK03"], "skipped": {}}
 
         mod = load_rolling_shadow()
         with tempfile.TemporaryDirectory() as d:
@@ -184,6 +185,8 @@ class MainRunListTest(unittest.TestCase):
             mod.write_registry(make_registry("xgb-dow", "chal-a"), registry_path)
 
             with mock.patch.object(mod, "retrain_challenger", fake_retrain), \
+                    mock.patch.object(mod, "production_trained_entities",
+                                      lambda run_date, base=None: {"MK01", "MK02", "MK03"}), \
                     mock.patch.object(mod, "generate_forecasts", fake_forecast), \
                     mock.patch.object(mod, "archive_predictions", fake_archive), \
                     mock.patch.object(mod, "evaluate_previous_day", fake_evaluate), \
