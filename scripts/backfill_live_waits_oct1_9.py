@@ -109,9 +109,13 @@ class RefusedPath(Exception):
 def _refuse_symlinks_under(clean_root: Path) -> None:
     """Fail closed: raise RefusedPath if any file or dir, at any depth, under clean_root is a symlink.
 
-    Walks the whole tree (on or off the read path) and never follows links.
+    Walks the whole tree (on or off the read path) and never follows links. Any OSError during the walk
+    (unreadable dir or entry) also refuses (Spec R3a). Runs before any DB open.
     """
-    for dirpath, dirnames, filenames in os.walk(clean_root, followlinks=False):
+    def _unreadable(err: OSError) -> None:
+        raise RefusedPath(f"{err.filename}: cannot read ({err.strerror}); refusing")
+
+    for dirpath, dirnames, filenames in os.walk(clean_root, followlinks=False, onerror=_unreadable):
         for name in (*dirnames, *filenames):
             entry = Path(dirpath) / name
             if entry.is_symlink():

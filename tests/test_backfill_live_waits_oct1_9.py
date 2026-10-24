@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import os
 import re
 import shutil
 import subprocess
@@ -589,6 +590,72 @@ def test_offpath_file_symlink_under_clean_refused(env, tmp_path, capsys, mode):
     assert run(env, *mode) == 2
     assert "REFUSED" in capsys.readouterr().out
     assert sha(env["db"]) == before and counts(env["db"]) == {}
+
+
+@pytest.fixture
+def connect_spy(monkeypatch):
+    calls = []
+    real = bf.duckdb.connect
+
+    def spy(*a, **k):
+        calls.append((a, k))
+        return real(*a, **k)
+
+    monkeypatch.setattr(bf.duckdb, "connect", spy)
+    return calls
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+@pytest.mark.parametrize("with_symlink", [False, True])
+@pytest.mark.parametrize("mode", [["--apply"], []])
+def test_unreadable_dir_under_clean_refused(env, tmp_path, capsys, connect_spy, mode, with_symlink):
+    bad = env["clean"].parent / "2026-09"
+    write_csv(bad / "mk_2026-09-01.csv", day_rows("2026-09-01"))
+    if with_symlink:
+        outside = tmp_path / "outside_09.csv"
+        write_csv(outside, day_rows("2026-09-02"))
+        (bad / "mk_2026-09-02.csv").symlink_to(outside)
+    before = sha(env["db"])
+    bad.chmod(0o000)
+    try:
+        rc = run(env, *mode)
+    finally:
+        bad.chmod(0o755)
+    out = capsys.readouterr().out
+    assert rc == 2
+    assert "REFUSED" in out and str(bad) in out
+    assert connect_spy == []
+    assert sha(env["db"]) == before and counts(env["db"]) == {}
+
+
+@pytest.mark.parametrize("mode", [["--apply"], []])
+def test_simulated_permission_error_refused_before_connect(env, capsys, monkeypatch, connect_spy, mode):
+    bad = env["clean"].parent / "2026-09"
+    bad.mkdir()
+    real_scandir = os.scandir
+
+    def fake_scandir(path="."):
+        if Path(path) == bad:
+            raise PermissionError(13, "Permission denied", str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", fake_scandir)
+    before = sha(env["db"])
+    assert run(env, *mode) == 2
+    out = capsys.readouterr().out
+    assert "REFUSED" in out and str(bad) in out
+    assert connect_spy == []
+    assert sha(env["db"]) == before
+
+
+@pytest.mark.parametrize("mode", [["--apply"], []])
+def test_offpath_symlink_refused_before_any_connect(env, tmp_path, capsys, connect_spy, mode):
+    outside = tmp_path / "outside_dir"
+    write_csv(outside / "mk_2026-09-01.csv", day_rows("2026-09-01"))
+    (env["clean"].parent / "2026-09").symlink_to(outside, target_is_directory=True)
+    assert run(env, *mode) == 2
+    assert "REFUSED" in capsys.readouterr().out
+    assert connect_spy == []
 
 
 CLASSES = ("null_key", "bad_observed_at", "wait_nonpositive", "duplicate_keys", "park_date_mismatch")
