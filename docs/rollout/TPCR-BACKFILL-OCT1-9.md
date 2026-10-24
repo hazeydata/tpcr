@@ -17,14 +17,14 @@
 
 | Window | Time | Source |
 |--------|------|--------|
-| ETL | 05:30-07:00 | Spec. Daily pipeline cron 6:00 AM ET (`docs/PIPELINE_STATE.md:16,35`); s11 holds the live DB write lock about 6:15 AM ET for about 110 s (`docs/PIPELINE_STATE.md:48`, `docs/DISCORD_BOT_DUCKDB_MIGRATION.md:414`). |
-| replay | 04:30-04:40 | Daily staging replay is due at/after 04:30 ET with a 240 s timeout (`src/get_wait_times_from_queue_times.py:159-161`), plus the 300 s loop interval (`scripts/queue-times-loop.service:30`), so the latest end is 04:39. |
+| ETL | 05:30-09:00 | Spec R1 (OQ1). The ETL starts 06:00 (`docs/PIPELINE_STATE.md:16`), so 05:30 is a 30-min margin. There is no end in the repo; 09:00 covers the 90-min crowd-report wait. |
+| replay | 04:25-04:45 | Spec R1 (OQ1). The daily staging replay runs from 04:30 to 04:40 (`src/get_wait_times_from_queue_times.py:159-161`), plus 5-min margins. |
 
-The ETL end time (07:00) is the spec's value; no end time is in the repo.
+S11 (about 06:15 ET, about 110 s; `docs/PIPELINE_STATE.md:48`) falls inside the ETL window, so no marker is needed.
 
 The script refuses to start inside a window (every mode, including dry runs and rollback) and checks again before each day's insert during `--apply`. Exit 8, `REFUSED: inside <name> window ...`. Days already inserted stay tagged with the load key and the rollback command is printed.
 
-If the DB is locked (S11 or the scraper holds the write lock) the script exits 9 at once with `LOCKED: ...`, no retry. If a load key was already used it prints the rollback command.
+If the DB is locked (S11 or the scraper holds the write lock) the script exits 9 at once (exit 9, no retry; S11 needs no marker) with `LOCKED: ...`, no retry. If a load key was already used it prints the rollback command.
 
 ## Commands
 
@@ -52,14 +52,15 @@ First `MISSING DAYS: none` (else exit 4 with the list, before any DB access). Th
 
 `<day>: clean_posted=<n> excluded_PRIORITY=<n> excluded_ACTUAL=<n> excluded_other=<n> null_key=<n> dropped_nonpositive_or_unparseable=<n> duplicate_keys=<n> park_date_mismatch=<n> expected=<n> already_in_live=<n> would_insert=<n>`
 
-(`inserted=` instead of `would_insert=` after `--apply`.) A reconcile line follows: `clean_posted - null_key - dropped_nonpositive_or_unparseable - duplicate_keys - park_date_mismatch = expected`.
+(`inserted=` instead of `would_insert=` after `--apply`.) Before the DB is opened, a reconcile line per day is printed (`<day> reconcile: clean_posted=<n> == expected=<n> + drops=<n> (null_key=.. + dropped_nonpositive_or_unparseable=.. + duplicate_keys=.. + park_date_mismatch=..) OK`). `clean_posted == expected + sum(drops)` must hold exactly for every day. If it does not, the script prints `MISMATCH` and `RECONCILE FAILED`, exits 7, and writes nothing.
 
 - `clean_posted`: rows with `wait_time_type == 'POSTED'`. `excluded_*`: all other rows by type (`excluded_other` includes a blank type). They are never inserted.
 - `null_key`: POSTED rows with an empty key column (also logged by the prep).
-- `dropped_nonpositive_or_unparseable`: wait not > 0 or unparseable time (scraper prep).
+- `dropped_nonpositive_or_unparseable`: wait <= 0; unparseable waits stay counted here (scraper prep).
 - `duplicate_keys`: repeat of an `(entity_code, observed_at, wait_time_type)` key.
 - `park_date_mismatch`: derived park date (6 AM rule) is not the file's date. These are not inserted, so nothing outside Oct 1-9 is written.
-- `expected`: distinct keys eligible for that day. `already_in_live`: of those, already in `live_waits`. Expect 0.
+- `expected`: clean POSTED minus the four drop classes above (and nothing else). VERIFY equality is checked against it.
+- `expected` rows are the distinct keys eligible for that day. `already_in_live`: of those, already in `live_waits`. Expect 0.
 - After `--apply`, per day `VERIFY PASS|FAIL <day>: live_posted=.. expected=..` (exact equality), then `LOAD KEY inserted_at=<value>` again and `CLEAN CHECKSUMS UNCHANGED (<n> files)`.
 
 A `VERIFY FAIL` exits 5 and prints the exact rollback commands (dry run, then `--apply`). Data stays loaded until you roll back.
@@ -75,5 +76,6 @@ Clean files are sha256-hashed at start, before the first write and at the end. A
 | 4 | A day 2026-10-01..09 has no clean CSV; no DB access |
 | 5 | `VERIFY FAIL` for at least one day (data stays loaded), or the rollback count check failed |
 | 6 | A clean file's checksum changed (`CHECKSUM CHANGED: <file>`) |
+| 7 | Reconcile mismatch: `clean_posted != expected + sum(drops)` for at least one day; nothing written |
 | 8 | Inside a protected window (at start, or before a day's insert) |
 | 9 | DB locked (`LOCKED:`); no retry |

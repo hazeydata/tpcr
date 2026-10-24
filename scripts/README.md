@@ -333,15 +333,15 @@ python scripts/backfill_live_waits_oct1_9.py --output-base "$OB" --rollback --lo
 ```
 
 - `MISSING DAYS: <d1>,<d2>` (or `none`); any missing day: exit `4` before any DB access.
-- Per day it prints `clean_posted`, `excluded_PRIORITY/ACTUAL/other`, `null_key`, `dropped_nonpositive_or_unparseable`, `duplicate_keys`, `park_date_mismatch` (not inserted), `expected`, `already_in_live`, `would_insert` (`inserted` with `--apply`), and the reconciliation.
+- Per day it prints `clean_posted`, `excluded_PRIORITY/ACTUAL/other`, `null_key`, `dropped_nonpositive_or_unparseable`, `duplicate_keys`, `park_date_mismatch` (not inserted), `expected`, `already_in_live`, `would_insert` (`inserted` with `--apply`), plus a reconcile line per day. `clean_posted == expected + sum(drops)` must hold exactly, else exit `7` before any DB access or write.
 - `--apply` tags every inserted row with one `inserted_at` (UTC, microseconds; `--load-key 'YYYY-MM-DD HH:MM:SS.ffffff'` overrides), logged as `LOAD KEY inserted_at=<value>` at start and end. A key already present, or no `inserted_at` column, is refused (exit 2).
 - `VERIFY PASS|FAIL <day>: live_posted=.. expected=..` is an exact match; any FAIL exits `5` and prints the rollback commands.
 - Rollback deletes only rows with `inserted_at` equal to the key; without `--apply` it is a dry run (`ROLLBACK DRY RUN: would delete <n> rows ...`).
 - sha256 of the clean files at start, before the first write and at the end; a change prints `CHECKSUM CHANGED: <file>` and exits `6`.
-- Refused inside the ETL (05:30-07:00 ET) and replay (04:30-04:40 ET) windows, at start and before each day's insert (exit `8`). DB locked: exit `9` at once, no retry. While `--apply` holds the write connection the scraper parks batches in `state/live_waits_pending/`; run mid-afternoon ET.
+- Refused inside the ETL (05:30-09:00 ET) and replay (04:25-04:45 ET) windows, half-open `[start,end)`, at start and before each day's insert (exit `8`). S11 is inside the ETL window, so no marker. DB locked: exit `9` at once, no retry. While `--apply` holds the write connection the scraper parks batches in `state/live_waits_pending/`; run mid-afternoon ET.
 
 Options: `--output-base`, `--db`, `--apply`, `--load-key`, `--rollback`.
-Exit codes: `0` ok, `2` bad input / path refused / no `inserted_at` / key clash / rollback without key, `4` missing days, `5` VERIFY or rollback check failed, `6` clean checksum changed, `8` protected window, `9` DB locked. Rollout: [docs/rollout/TPCR-BACKFILL-OCT1-9.md](../docs/rollout/TPCR-BACKFILL-OCT1-9.md).
+Exit codes: `0` ok, `2` bad input / path refused / no `inserted_at` / key clash / rollback without key, `4` missing days, `5` VERIFY or rollback check failed, `6` clean checksum changed, `7` reconcile mismatch, `8` protected window, `9` DB locked. Rollout: [docs/rollout/TPCR-BACKFILL-OCT1-9.md](../docs/rollout/TPCR-BACKFILL-OCT1-9.md).
 
 ## Additional Scripts (summary)
 

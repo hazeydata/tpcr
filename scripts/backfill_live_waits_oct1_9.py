@@ -7,9 +7,11 @@ Source: output_base/fact_tables/clean/2026-10/{park}_{YYYY-MM-DD}.csv for the fi
 anything else are counted per day (excluded_PRIORITY / excluded_ACTUAL / excluded_other) and never inserted.
 Each day needs at least one clean CSV; otherwise "MISSING DAYS: d1,d2" and exit 4 before any DB access.
 
-Per day, expected = clean POSTED rows - null-key rows - nonpositive/unparseable rows - duplicate keys
-- rows whose derived park_date (6 AM rule, scraper prep) is not that day. Only those expected rows are inserted,
-so nothing outside Oct 1-9 is written. The per-day line prints every term and the reconciliation.
+Per day, Expected = clean POSTED minus exactly four drop classes (the scraper's own prep): null key; wait <= 0
+(unparseable waits stay counted in this class); duplicate exact key; rows whose 6 AM-rule park_date is not that
+file's day. Only Expected rows are inserted, so nothing outside Oct 1-9 is written. The dry run prints each drop
+class per day and a reconcile line; clean_posted == expected + sum(drops) must hold EXACTLY for every day, else the
+run exits 7 before any DB access or write.
 
 Insert is the scraper's exact-key anti-join (insert_missing_live_waits), so a rerun inserts 0.
 
@@ -32,12 +34,14 @@ Without --apply it is a dry run (read-only, "ROLLBACK DRY RUN: would delete <n> 
 Checksums: sha256 of every target clean file at start, before the first write and at the end; a change prints
 "CHECKSUM CHANGED: <file>" and exits 6. Success prints "CLEAN CHECKSUMS UNCHANGED (<n> files)".
 
-Protected windows (America/New_York, half-open [start, end)): the run is refused (exit 8) at start in every mode,
-and again before each day's insert during --apply (earlier days stay key-tagged and rollback-able).
-If the DB is locked (S11 or the scraper holds the write lock) the run exits 9 at once: no retry, no sleep.
+Protected windows (America/New_York, half-open [start, end)): ETL 05:30-09:00, replay 04:25-04:45. The run is
+refused (exit 8) at start in every mode, and again before each day's insert during --apply (earlier days stay
+key-tagged and rollback-able). S11 (~06:15, ~110 s) falls inside the ETL window, so no marker is used; if the DB
+is locked (S11 or the scraper holds the write lock) the run exits 9 at once: no retry, no sleep.
 
 Exit codes: 0 ok, 2 bad input / path refused / no inserted_at / key clash / rollback without key, 4 missing days,
-5 VERIFY failed or rollback count check failed, 6 clean checksum changed, 8 inside protected window, 9 DB locked.
+5 VERIFY failed or rollback count check failed, 6 clean checksum changed, 7 reconcile mismatch,
+8 inside protected window, 9 DB locked.
 """
 
 from __future__ import annotations
@@ -74,17 +78,17 @@ DAYS = [f"2026-10-{d:02d}" for d in range(1, 10)]
 CSV_COLUMNS = list(LIVE_WAITS_KEY) + ["wait_time_minutes"]
 _NAME_RE = re.compile(r"^([A-Za-z0-9]+)_(\d{4}-\d{2}-\d{2})\.csv$")
 
-EXIT_OK, EXIT_PATH, EXIT_MISSING, EXIT_VERIFY, EXIT_CHECKSUM, EXIT_WINDOW, EXIT_LOCKED = 0, 2, 4, 5, 6, 8, 9
+EXIT_OK, EXIT_PATH, EXIT_MISSING, EXIT_VERIFY, EXIT_CHECKSUM, EXIT_RECONCILE, EXIT_WINDOW, EXIT_LOCKED = (
+    0, 2, 4, 5, 6, 7, 8, 9)
 
 ET = ZoneInfo("America/New_York")
 # Protected windows, half-open [start, end), America/New_York.
-# ETL: spec AC8; repo: daily pipeline cron 6:00 AM ET (docs/PIPELINE_STATE.md:16,35), s11 holds the live DB write
-# lock ~6:15 AM ET for ~110s (docs/PIPELINE_STATE.md:48, docs/DISCORD_BOT_DUCKDB_MIGRATION.md:414);
-# the 07:00 end is the spec's value, no end time is in the repo.
-ETL_WINDOW_ET = (time(5, 30), time(7, 0))
-# Replay: src/get_wait_times_from_queue_times.py:159-161 (due at/after 04:30 ET, timeout 240s) + 300s loop interval
-# (scripts/queue-times-loop.service:30) => latest end 04:39.
-REPLAY_WINDOW_ET = (time(4, 30), time(4, 40))
+# ETL (spec R1, OQ1): starts 06:00 per docs/PIPELINE_STATE.md:16, so 05:30 adds a 30-min margin; there is no end in
+# the repo, so 09:00 covers the 90-min crowd-report wait. S11 (~06:15, ~110s; docs/PIPELINE_STATE.md:48) is inside
+# this window, so no marker is needed; a lock exits 9 with no retry.
+ETL_WINDOW_ET = (time(5, 30), time(9, 0))
+# Replay (spec R1, OQ1): 04:30-04:40 per src/get_wait_times_from_queue_times.py:159-161, plus 5-min margins.
+REPLAY_WINDOW_ET = (time(4, 25), time(4, 45))
 WINDOWS = (("ETL", ETL_WINDOW_ET), ("replay", REPLAY_WINDOW_ET))
 
 KEY_FORMAT = "%Y-%m-%d %H:%M:%S.%f"
@@ -268,6 +272,25 @@ def count_present(con, df: pd.DataFrame) -> int:
         con.unregister("_bf_new")
 
 
+# --------------------------------------------------------------------------- reconcile
+
+DROP_CLASSES = ("null_key", "dropped_nonpositive_or_unparseable", "duplicate_keys", "park_date_mismatch")
+
+
+def reconcile(plans: dict) -> bool:
+    """Print each day's reconcile line; True only if clean_posted == expected + sum(drops) exactly for every day."""
+    ok = True
+    for day in DAYS:
+        st, df = plans[day]
+        drops = sum(st[c] for c in DROP_CLASSES)
+        day_ok = st["clean_posted"] == len(df) + drops
+        ok &= day_ok
+        print(f"  {day} reconcile: clean_posted={st['clean_posted']} {'==' if day_ok else '!='} "
+              f"expected={len(df)} + drops={drops} ("
+              + " + ".join(f"{c}={st[c]}" for c in DROP_CLASSES) + f") {'OK' if day_ok else 'MISMATCH'}")
+    return ok
+
+
 # --------------------------------------------------------------------------- load
 
 
@@ -293,8 +316,6 @@ def load_days(con, plans: dict, apply: bool, key: str | None, args, ob: Path, no
                 raise
         print(f"  {day}: " + " ".join(f"{k}={v:,}" for k, v in st.items())
               + f" expected={len(df):,} already_in_live={present:,} {verb}={n:,}")
-        print(f"    reconcile: {st['clean_posted']} - {st['null_key']} - {st['dropped_nonpositive_or_unparseable']}"
-              f" - {st['duplicate_keys']} - {st['park_date_mismatch']} = {len(df)}")
         tot["expected"] += len(df); tot["already_in_live"] += present; tot["n"] += n
     print(f"TOTAL: expected={tot['expected']:,} already_in_live={tot['already_in_live']:,} {verb}={tot['n']:,}")
     if not apply:
@@ -407,6 +428,10 @@ def run_load(args, ob: Path, db: Path, now, state: dict) -> int:
     if checksum_changed():
         print("Clean files changed during the run; aborting before any write.")
         return EXIT_CHECKSUM
+
+    if not reconcile(plans):
+        print("RECONCILE FAILED: clean_posted != expected + drops for at least one day; nothing written.")
+        return EXIT_RECONCILE
 
     con = duckdb.connect(str(db), read_only=not args.apply)
     try:

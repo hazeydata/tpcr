@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, time as dtime
 from pathlib import Path
 
 import duckdb
@@ -173,11 +173,44 @@ def test_ac3_reconciliation_null_key_and_nothing_outside_days(env, capsys):
     day1 = re.search(r"^  2026-10-01: .*$", out, re.M).group(0)
     assert ("clean_posted=10 excluded_PRIORITY=1 excluded_ACTUAL=1 excluded_other=1 null_key=1 "
             "dropped_nonpositive_or_unparseable=1 duplicate_keys=1 park_date_mismatch=1 expected=6 ") in day1
-    assert "reconcile: 10 - 1 - 1 - 1 - 1 = 6" in out and "reconcile: 8 - 1 - 1 - 1 - 1 = 4" in out
+    assert ("2026-10-01 reconcile: clean_posted=10 == expected=6 + drops=4 (null_key=1 + "
+            "dropped_nonpositive_or_unparseable=1 + duplicate_keys=1 + park_date_mismatch=1) OK") in out
+    assert "2026-10-02 reconcile: clean_posted=8 == expected=4 + drops=4" in out
+    assert out.count(" OK\n") == 9 and "MISMATCH" not in out
     assert f"TOTAL: expected={EXPECTED_TOTAL} " in out
     assert run(env, "--apply") == 0
     c = counts(env["db"])
     assert set(c) == set(DAYS) and "2026-09-30" not in c and "2026-10-10" not in c
+
+
+def test_ac3_each_drop_class_counted_and_reconciles(env, capsys):
+    assert run(env) == 0
+    out = capsys.readouterr().out
+    for day in DAYS:
+        line = re.search(rf"^  {day}: .*$", out, re.M).group(0)
+        for c in bf.DROP_CLASSES:
+            assert f"{c}=1 " in line  # one row of each class per day (day_rows)
+        assert f"{day} reconcile:" in out
+    assert out.index("2026-10-01 reconcile:") < out.index("2026-10-01: clean_posted")
+
+
+@pytest.mark.parametrize("extra", [(), ("--apply",)])
+def test_ac3_forced_reconcile_mismatch_exits_nonzero_and_writes_nothing(env, capsys, monkeypatch, extra):
+    orig = bf.read_day
+
+    def skewed(files, day):
+        st, df = orig(files, day)
+        if day == "2026-10-03":
+            st["duplicate_keys"] += 1  # a drop that never happened: clean_posted != expected + drops
+        return st, df
+
+    monkeypatch.setattr(bf, "read_day", skewed)
+    before = sha(env["db"])
+    assert run(env, *extra) == 7
+    out = capsys.readouterr().out
+    assert "2026-10-03 reconcile:" in out and "MISMATCH" in out and "RECONCILE FAILED" in out
+    assert "LOAD KEY" not in out and "TOTAL:" not in out
+    assert sha(env["db"]) == before and counts(env["db"]) == {}
 
 
 # ---------------------------------------------------------------- AC4/AC6 dry run default, rerun
@@ -283,7 +316,7 @@ MODES = [(), ("--apply",), ("--rollback", "--load-key", KEY), ("--rollback", "--
 
 
 @pytest.mark.parametrize("when,name", [
-    ((5, 30), "ETL"), ((6, 15), "ETL"), ((6, 59), "ETL"), ((4, 30), "replay"), ((4, 39), "replay")])
+    ((5, 30), "ETL"), ((6, 15), "ETL"), ((8, 59), "ETL"), ((4, 25), "replay"), ((4, 44), "replay")])
 @pytest.mark.parametrize("mode", MODES)
 def test_ac8_refused_inside_window_at_start(env, capsys, when, name, mode):
     before = sha(env["db"])
@@ -292,7 +325,7 @@ def test_ac8_refused_inside_window_at_start(env, capsys, when, name, mode):
     assert sha(env["db"]) == before
 
 
-@pytest.mark.parametrize("when", [(5, 29), (7, 0), (4, 40), (4, 29)])
+@pytest.mark.parametrize("when", [(5, 29), (9, 0), (4, 45), (4, 24)])
 def test_ac8_accepted_at_boundaries(env, capsys, when):
     assert run(env, now=at(*when)) == 0
 
@@ -494,13 +527,20 @@ def test_ac13_rollout_doc_matches_code():
     for flag in flags:
         assert flag in doc, flag
     for code in (bf.EXIT_OK, bf.EXIT_PATH, bf.EXIT_MISSING, bf.EXIT_VERIFY, bf.EXIT_CHECKSUM,
-                 bf.EXIT_WINDOW, bf.EXIT_LOCKED):
+                 bf.EXIT_RECONCILE, bf.EXIT_WINDOW, bf.EXIT_LOCKED):
         assert f"| {code} |" in doc, code
+    assert bf.ETL_WINDOW_ET == (dtime(5, 30), dtime(9, 0)) and bf.REPLAY_WINDOW_ET == (dtime(4, 25), dtime(4, 45))
+    assert bf.DROP_CLASSES == ("null_key", "dropped_nonpositive_or_unparseable", "duplicate_keys", "park_date_mismatch")
+    readme = (_SCRIPT.parent / "README.md").read_text()
+    for text in (doc, readme[readme.index("### `backfill_live_waits_oct1_9.py`"):]):
+        assert "05:30-09:00" in text and "04:25-04:45" in text and "reconcile" in text
+        assert "05:30-07:00" not in text and "04:30-04:40" not in text
+    assert "clean_posted == expected + sum(drops)" in doc and "exit 9" in doc and "no marker" in doc
     for s in ("MISSING DAYS:", "CHECKSUM CHANGED:", "CLEAN CHECKSUMS UNCHANGED", "LOAD KEY inserted_at=",
               "ROLLBACK DRY RUN: would delete", "ROLLBACK VERIFY PASS", "VERIFY PASS", "VERIFY FAIL",
               "REFUSED: inside", "LOCKED:", "excluded_PRIORITY=", "excluded_ACTUAL=", "excluded_other=",
               "null_key=", "dropped_nonpositive_or_unparseable=", "duplicate_keys=", "park_date_mismatch=",
-              "expected=", "already_in_live=", "would_insert=", "05:30", "07:00", "04:30", "04:40"):
+              "expected=", "already_in_live=", "would_insert=", "05:30", "09:00", "04:25", "04:45", "reconcile"):
         assert s in doc, s
     for gone in ("--parity-date", "--glob", "--start", "--end", "--allow-missing", "--row-tol", "--dry-run",
                  "--entity-tol", "--tp-posted-tol", "HOLD"):
