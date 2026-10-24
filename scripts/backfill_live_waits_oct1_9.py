@@ -53,6 +53,7 @@ import argparse
 import hashlib
 import os
 import re
+import stat
 import sys
 from datetime import datetime, time, timezone
 from pathlib import Path
@@ -121,7 +122,7 @@ def _refuse_symlinks_under(clean_root: Path) -> None:
         for name in (*dirnames, *filenames):
             entry = Path(dirpath) / name
             try:
-                is_link = entry.is_symlink()
+                is_link = stat.S_ISLNK(os.lstat(entry).st_mode)  # explicit lstat: never follows, raises on EACCES
             except OSError as e:
                 raise RefusedPath(f"{entry}: cannot check ({e.strerror}); refusing") from e
             if is_link:
