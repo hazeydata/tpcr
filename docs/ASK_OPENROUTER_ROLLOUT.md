@@ -21,7 +21,11 @@ Set `OPENROUTER_API_KEY` in `~/.env` (name only; never commit or paste the value
 - `openrouter` (default): OpenRouter first, Qwen as fallback.
 - `qwen`: Qwen only.
 - `anthropic`: accepted as an alias for `openrouter`.
-- Any other value is not checked at startup: the bot starts normally, and each /ask call then raises a RuntimeError (no Qwen fallback).
+- Any other value is rejected at startup: `bot.py` calls `validate_config()`, which raises a RuntimeError naming the allowed values, so the bot does not start.
+
+## Logging (Spec R5/AC33)
+
+`bot.py` pins the `anthropic`, `httpx`, `httpcore`, `httpx2` and `httpcore2` loggers to WARNING, and removes `ANTHROPIC_LOG` from the environment right after loading `~/.env`, so `ANTHROPIC_LOG=debug` cannot re-enable SDK DEBUG output if the `anthropic` package is installed.
 
 ## Fallback behavior
 
