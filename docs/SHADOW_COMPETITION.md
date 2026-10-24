@@ -121,7 +121,7 @@ Scoring: `score_scope = "fallback"` — the summary marks it, and the registry's
 }
 ```
 
-A challenger with no matched pairs gets `{"score_scope", "trained_at", "entity_count", "matched_pairs": 0, "status": "no_data"}`. `run_status` is `ok` with no errors, else `failed` (any retrain/forecast/archive/evaluation error, or an `entity_count` mismatch). `win`, `streak`, `ci95_low`, `ci95_high`, `gain_min` arrive with the Phase 4 flag rule. The Phase 3 exit-code and `skipped_lock` behavior is not built: the exit code is unchanged.
+A challenger with no matched pairs gets `{"score_scope", "trained_at", "entity_count", "matched_pairs": 0, "status": "no_data"}`. `run_status` is `ok` with no errors, else `failed` (any retrain/forecast/archive/evaluation error, or an AC5 entity-set mismatch against the production S7 trained set minus extinct, R1a). `win`, `streak`, `ci95_low`, `ci95_high`, `gain_min` arrive with the Phase 4 flag rule. The Phase 3 exit-code and `skipped_lock` behavior is not built: the exit code is unchanged.
 
 ## `shadow_days` rule
 
