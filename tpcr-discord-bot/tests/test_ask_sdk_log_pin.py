@@ -57,5 +57,7 @@ def test_ac33_sdk_debug_lines_do_not_leak_request_id_or_key(bot, monkeypatch, ca
     assert "Claude /ask auth failed (AuthenticationError, status 401)" in text
     assert REQ_ID not in text and "PLANTEDREQID" not in text
     assert TAIL not in text and "sk-ant-" not in text
-    for name in ("anthropic", "httpx", "httpcore"):
+    http_lines = [r.getMessage() for r in caplog.records if r.name.split(".")[0] in ("httpx", "httpx2", "httpcore", "httpcore2")]
+    assert http_lines == [], http_lines
+    for name in ("anthropic", "httpx", "httpcore", "httpx2", "httpcore2"):
         assert logging.getLogger(name).level == logging.WARNING, name
