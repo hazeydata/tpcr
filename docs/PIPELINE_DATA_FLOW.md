@@ -230,7 +230,7 @@ Downloads temporary closure CSV files from S3 (`export/closures/`). These cover 
 ### Part 2: Build Operating Calendar
 
 Combines two sources:
-1. **Permanent closures** — `extinct_on` dates from `dimentity.csv` (e.g., Splash Mountain closed permanently in 2023).
+1. **Permanent closures** — `extinct_on` dates from `dimentity.csv` (e.g., Splash Mountain closed permanently in 2023). An `extinct_on` before 2005-01-01 (including the `2000-01-01` sentinel) is treated as extinct. The calendar build does not warn, fail or change the calendar for it; S7 logs the single `PRE2005_EXTINCT_ON` warning per entity per run.
 2. **Temporary closures** — From the S3 closure files (refurbishments, seasonal closures).
 
 Creates a single table: for every (entity_code, park_date) combination, is that ride operating? `TRUE` or `FALSE`.
@@ -592,8 +592,9 @@ For EU entities not in the training data (unseen entity_code), XGBoost uses grou
 
 ### Entity Filtering:
 - Excludes Lightning Lane booths (`fastpass_booth = FALSE`)
-- Excludes extinct/fully-closed entities (zero operating dates in calendar)
+- Excludes extinct/fully-closed entities (zero operating dates in calendar) — logged as `SKIP … reason=extinct`; entities with no dates in the window are logged as `not_operating`
 - Entities not in the operating calendar at all are assumed operating (graceful fallback)
+- **S8 failure handling:** intended behaviour (Fred, Oct 24 12:28 AM ET): any S8 entity error (`error:<class>`) raises `StageFailed` after outputs are written. `pipeline.py` stops, so S9-S11 do not run, and the process exits nonzero. This applies in `--shadow` mode too (Spec R5, Fred, Oct 24 1:34 AM ET): an S8 entity error is the one failure that stops a shadow run; any other failed step in shadow mode is logged and the run continues (the run still exits nonzero). Contrast with S7, which warns and continues on entity errors.
 - **EU entities with `scope_and_scale` are added even without POSTED data** (use scope-scale group models)
 
 ### Model Type Detection:
@@ -840,7 +841,7 @@ Each pipeline run records which steps actually executed, enabling cascade logic 
 
 ### Filtering Rules Applied Throughout:
 - **Lightning Lane booths excluded** — `dimentity.csv` `fastpass_booth = FALSE`. These record LL return times, not standby waits.
-- **Extinct entities** — Rides with `extinct_on` dates are excluded from future forecasts via the operating calendar.
+- **Extinct entities** — Rides with `extinct_on` dates are excluded from S7 training (via `extinct_on`; pre-2005 values, including the 2000-01-01 sentinel, count as extinct and log a `PRE2005_EXTINCT_ON` warning plus a `SKIP_NOTE … pre2005_extinct_on count=<n>` line) and from future forecasts (via the operating calendar). Skips are logged per entity with a reason and are not counted as `failed`.
 - **Operating calendar** — Temporarily closed rides excluded from forecasts and WTI.
 - **Minimum observation thresholds** — 500 matched pairs for model training, 50 pairs for per-entity fallback ratio, 500 POSTED observations for synthetic actuals.
 
