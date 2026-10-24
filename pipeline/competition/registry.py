@@ -28,6 +28,7 @@ class ChallengerDefinition:
         # Optional attributes
         self.features = getattr(module, 'FEATURES', None)  # None = use baseline
         self.geo_decay_halflife = getattr(module, 'GEO_DECAY_HALFLIFE', 730)
+        self.status = getattr(module, 'STATUS', 'active')  # active | retired | flagged
         
         # Validate
         self._validate()
@@ -119,6 +120,10 @@ class ChallengerRegistry:
         """List names of all loaded challengers."""
         return list(self.challengers.keys())
     
+    def active_challengers(self) -> List[str]:
+        """Names of loaded challengers that are not retired."""
+        return [n for n, c in self.challengers.items() if c.status != 'retired']
+
     def validate_challenger(self, name: str) -> bool:
         """Validate that a challenger is properly defined."""
         try:

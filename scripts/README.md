@@ -4,6 +4,10 @@ Standalone utility scripts that can be run independently of the main pipeline.
 
 ## Current Scripts
 
+### Rolling shadow run — `rolling_shadow.py`
+
+Daily local challenger-vs-production shadow run (forecast, archive, evaluate, registry update); see [docs/SHADOW_COMPETITION.md](../docs/SHADOW_COMPETITION.md). Run: `python scripts/rolling_shadow.py [--run-date YYYY-MM-DD]`.
+
 ### Dropbox Scheduler
 
 **`dropbox_scheduler.sh`** - Controls Dropbox start/stop  
