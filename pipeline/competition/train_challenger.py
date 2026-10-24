@@ -207,7 +207,7 @@ def run_challenger_training(challenger_name: str, output_base: Path,
 
     No subsetting: the entity set is production_eligible_entities (after the
     extinct exclusion). The result records trained_at (UTC ISO), entity_count
-    (models actually trained), eligible_count and skipped {entity: reason}.
+    (models actually trained), trained_entities (their codes), eligible_count and skipped {entity: reason}.
     """
     run_date = run_date or date.today()
 
@@ -272,6 +272,7 @@ def run_challenger_training(challenger_name: str, output_base: Path,
     successful = 0
     failed = 0
     total_mae = 0.0
+    trained: list[str] = []
 
     for park_code in sorted(park_entity_map.keys()):
         park_entities = park_entity_map[park_code]
@@ -305,6 +306,7 @@ def run_challenger_training(challenger_name: str, output_base: Path,
                     )
                     if result is not None:
                         successful += 1
+                        trained.append(entity_code)
                         total_mae += result["mae"]
                     else:
                         failed += 1
@@ -331,6 +333,7 @@ def run_challenger_training(challenger_name: str, output_base: Path,
         "challenger_name": challenger_name,
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "entity_count": successful,
+        "trained_entities": sorted(trained),
         "eligible_count": len(eligible),
         "skipped": skipped,
         "successful": successful,
