@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import sys
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -355,3 +356,202 @@ def test_s7_pre2005_extinct_on_production_rows(tmp_path):
         rows = list(csv.reader(f))
     assert rows[0] == ["stage", "entity_code", "reason"]
     assert all(r[2] == "extinct" for r in rows[1:] if r[1] in PRE2005)
+
+
+# --- AC5: exactly one pre-2005 warning per entity per run -------------------
+
+def _pre2005_s7_cfg(tmp_path: Path) -> PipelineConfig:
+    cfg = _cfg(tmp_path)
+    normal = ["MK01", "MK03", "MK04"]
+    _write_dim(cfg, {**PRE2005, **{c: "" for c in normal}, "MK05": "2019-01-01"})
+    actuals = cfg.output_base / "matched_pairs" / "actuals_training_v2"
+    actuals.mkdir(parents=True)
+    by_park: dict[str, list[pd.DataFrame]] = {}
+    for code in [*PRE2005, *normal, "MK05"]:
+        by_park.setdefault(code[:2], []).append(_actuals(code, date(2020, 1, 1), 300))
+    for park, frames in by_park.items():
+        pd.concat(frames).to_parquet(actuals / f"{park}.parquet", index=False)
+    return cfg
+
+
+def test_pre2005_warns_exactly_once_per_entity_per_run(tmp_path):
+    """AC5/AC5a: S7 is the single owner of PRE2005_EXTINCT_ON; one warning per entity per run."""
+    cfg = _pre2005_s7_cfg(tmp_path)
+    log = PipelineLogger("t7once")
+    s07_training.run(cfg, log)
+
+    warns = [e["message"] for e in log.events
+             if e["level"] == "warning" and e["message"].startswith("PRE2005_EXTINCT_ON")]
+    for code in PRE2005:
+        assert sum(w.startswith(f"PRE2005_EXTINCT_ON entity={code} ") for w in warns) == 1, code
+    assert len(warns) == len(PRE2005)
+
+    # exactly one total-count line per run, with the right n
+    notes = [e["message"] for e in log.events
+             if e["message"].startswith("SKIP_NOTE stage=s07 pre2005_extinct_on")]
+    assert notes == [f"SKIP_NOTE stage=s07 pre2005_extinct_on count={len(PRE2005)}"]
+
+    # the calendar build no longer warns (it would be a second warning per run)
+    src = (Path(__file__).resolve().parents[2] / "src" / "build_operating_calendar.py").read_text()
+    assert "PRE2005" not in src
+    assert "warn_pre2005_extinct_on" not in src
+
+
+# --- M15: the cutoff year itself is kept -------------------------------------
+
+def test_s7_rows_in_cutoff_year_are_kept(tmp_path):
+    """Rows exactly in min_training_year (2016 for MK) count; `years > cut` would drop them."""
+    cfg = _cfg(tmp_path)
+    assert cfg.get_min_training_year("MK") == 2016
+    _write_dim(cfg, {"MK07": ""})
+    actuals = cfg.output_base / "matched_pairs" / "actuals_training_v2"
+    actuals.mkdir(parents=True)
+    _actuals("MK07", date(2016, 1, 1), 300).to_parquet(actuals / "MK.parquet", index=False)
+
+    counts = s07_training._scan_post_cutoff_counts([actuals / "MK.parquet"], cfg)
+    assert counts["MK07"] == 300
+
+    log = PipelineLogger("t7cut")
+    res = s07_training.run(cfg, log)
+    assert "SKIP stage=s07 entity=MK07 reason=below_min_obs" not in _skip_lines(log)
+    assert res["eligible"] == 1
+    assert res["successful"] == 1
+    assert (cfg.models_dir / "MK07" / "model_baseline.json").exists()
+
+
+# --- M21: the forecast-window end date is inclusive --------------------------
+
+def test_operating_window_end_date_is_inclusive(tmp_path):
+    start, end = TODAY, TODAY + timedelta(days=30)
+    assert is_operating_in_window("MK09", {"MK09": {end}}, start, end)
+    assert is_operating_in_window("MK09", {"MK09": {start}}, start, end)
+    assert not is_operating_in_window("MK09", {"MK09": {end + timedelta(days=1)}}, start, end)
+
+    # through S7: the only operating day is exactly today + forecast_days
+    cfg = _cfg(tmp_path)
+    _write_dim(cfg, {"MK09": ""})
+    _write_oc(cfg, [("MK09", end, True)])
+    actuals = cfg.output_base / "matched_pairs" / "actuals_training_v2"
+    actuals.mkdir(parents=True)
+    _actuals("MK09", date(2020, 1, 1), 300).to_parquet(actuals / "MK.parquet", index=False)
+    log = PipelineLogger("t7end")
+    res = s07_training.run(cfg, log)
+    assert "SKIP stage=s07 entity=MK09 reason=not_operating" not in _skip_lines(log)
+    assert res["eligible"] == 1
+
+
+# --- pipeline.py: failed-entity warning (M20) and S8 halt (AC5a / C7) --------
+
+def _install_pipeline_fakes(mp, pp, cfg, steps: dict, ran: list[str]) -> None:
+    """Patch pipeline.pipeline so main() runs only `steps` (name -> run(cfg, log))."""
+    import types
+
+    def make(name, fn):
+        def run(c, log):
+            ran.append(name)
+            print(f"STEP_RAN {name}", flush=True)
+            return fn(c, log)
+        return types.SimpleNamespace(run=run)
+
+    mods = {f"pipeline.steps.{n}": make(n, fn) for n, fn in steps.items()}
+    mp.setattr(pp, "load_config", lambda **kw: cfg)
+    mp.setattr(pp, "STEP_ORDER", list(steps))
+    mp.setattr(pp, "import_module", lambda name: mods[name])
+    mp.setattr(pp, "_HAS_PIPELINE_STATUS", False)
+    mp.setattr(sys, "argv", ["pipeline"])
+
+
+class _Setattr:
+    """monkeypatch stand-in for the subprocess driver (no teardown needed)."""
+
+    def setattr(self, obj, name, value):
+        setattr(obj, name, value)
+
+
+def _install_halt_patches(mp, tmp_path: Path, pp) -> list[str]:
+    """One injected S8 entity error; S7 and S9-S11 are markers that record whether they run."""
+    cfg = _s8_fixture(tmp_path)
+    _s8_setup(cfg, mp, ["MK01", "MK05"], extra_boom="MK05")
+    ran: list[str] = []
+    ok = lambda c, log: {"rows": 0}  # noqa: E731
+    steps = {
+        "s07_training": ok,
+        "s08_forecast": s08_forecast.run,
+        "s09_wti": ok,
+        "s10_accuracy": ok,
+        "s11_deploy": ok,
+    }
+    _install_pipeline_fakes(mp, pp, cfg, steps, ran)
+    return ran
+
+
+def test_pipeline_logs_step_completed_with_failed_entities(tmp_path, monkeypatch):
+    import pipeline.pipeline as pp
+
+    loggers: list[PipelineLogger] = []
+
+    class Rec(PipelineLogger):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            loggers.append(self)
+
+    cfg = _cfg(tmp_path)
+    ran: list[str] = []
+    steps = {
+        "s07_training": lambda c, l: {"rows": 0, "failed": 2},
+        "s08_forecast": lambda c, l: {"rows": 0, "failed": 0},
+    }
+    _install_pipeline_fakes(monkeypatch, pp, cfg, steps, ran)
+    monkeypatch.setattr(pp, "PipelineLogger", Rec)
+
+    assert pp.main() == 0  # warn and continue; run not failed
+    assert ran == ["s07_training", "s08_forecast"]
+    warns = [e["message"] for lg in loggers for e in lg.events if e["level"] == "warning"]
+    assert "Step s07_training completed with 2 failed entities" in warns
+    assert not any(w.startswith("Step s08_forecast completed with") for w in warns)
+
+
+def test_s8_single_entity_error_halts_pipeline(tmp_path, monkeypatch):
+    """AC5a (Fred, Oct 24 12:28 AM ET): one S8 entity error -> StageFailed, S9-S11 never run, nonzero exit."""
+    import pipeline.pipeline as pp
+
+    # (i) S8 itself raises StageFailed for the single injected error, after writing outputs
+    s8_dir = tmp_path / "s8only"
+    s8_dir.mkdir()
+    cfg8 = _s8_fixture(s8_dir)
+    _s8_setup(cfg8, monkeypatch, ["MK01", "MK05"], extra_boom="MK05")
+    log = PipelineLogger("t8halt")
+    with pytest.raises(StageFailed):
+        s08_forecast.run(cfg8, log)
+    assert "SKIP stage=s08 entity=MK05 reason=error:KeyError" in _skip_lines(log)
+    assert (cfg8.forecast_dir / "all_forecasts.parquet").exists()
+
+    # (ii) in-process: main() stops after S8 and returns nonzero
+    ran = _install_halt_patches(monkeypatch, tmp_path / "inproc", pp)
+    assert pp.main() != 0
+    assert ran == ["s07_training", "s08_forecast"]
+
+    # (iii) real process exit code, as `if __name__ == "__main__": sys.exit(main())` does
+    import subprocess
+
+    repo = Path(__file__).resolve().parents[2]
+    driver = tmp_path / "halt_driver.py"
+    driver.write_text(
+        "import sys\n"
+        "from pathlib import Path\n"
+        f"sys.path.insert(0, {str(repo)!r})\n"
+        "import pipeline.pipeline as pp\n"
+        "from pipeline.tests import test_s7_s8_eligibility as t\n"
+        "t._install_halt_patches(t._Setattr(), Path(sys.argv[1]), pp)\n"
+        "sys.exit(pp.main())\n"
+    )
+    work = tmp_path / "proc"
+    work.mkdir()
+    proc = subprocess.run(
+        [sys.executable, str(driver), str(work)],
+        cwd=repo, capture_output=True, text=True, timeout=300,
+    )
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    assert "STEP_RAN s08_forecast" in proc.stdout
+    for later in ("s09_wti", "s10_accuracy", "s11_deploy"):
+        assert f"STEP_RAN {later}" not in proc.stdout

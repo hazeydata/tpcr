@@ -41,11 +41,6 @@ from pathlib import Path
 import duckdb
 import pandas as pd
 
-_repo_root = Path(__file__).resolve().parent.parent
-if str(_repo_root) not in sys.path:
-    sys.path.insert(0, str(_repo_root))
-
-from pipeline.core.eligibility import load_dimentity_extinct, warn_pre2005_extinct_on
 from utils import get_output_base
 from utils.forecast_horizon import get_forecast_end_date
 
@@ -221,8 +216,6 @@ def main() -> None:
         FROM read_csv('{dim_str}', AUTO_DETECT=TRUE)
     """
     entities = con.execute(entities_sql).fetchdf()
-    # Warn only on pre-2005 extinct_on; calendar contents are unchanged.
-    warn_pre2005_extinct_on(load_dimentity_extinct(dim_path), logger)
     logger.info("Loaded %d entities from dimentity", len(entities))
 
     # Step 2: Load temporary closures (if any)
