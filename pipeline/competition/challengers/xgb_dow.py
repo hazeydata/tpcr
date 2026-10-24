@@ -11,6 +11,8 @@ Changes from baseline:
 NAME = "xgb-dow"
 DESCRIPTION = "Add day-of-week as 6th feature"
 DATE_REGISTERED = "2026-04-06"
+STATUS = "retired"
+NOTES = "Retired: day-of-week is already in production via #470; never forecast or scored."
 
 HYPERPARAMS = {}  # Use baseline hyperparams
 
