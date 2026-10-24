@@ -1,5 +1,18 @@
 # Tests
 
+## Live Waits Lock Tests (TPCR-S11-LOCK-001)
+
+**File**: `tests/test_live_waits_lock.py`
+
+Covers the scraper's `live_waits` write retry (~180s budget), the pending-batch dir
+(`state/live_waits_pending/`), the daily staging replay (`src/replay_live_waits.py`),
+row prep (6 AM park-date rule) and `replay_due`. The s11 write lock is simulated with a
+child process holding the DuckDB file open. Uses `tmp_path` only; takes ~15s.
+
+```bash
+python -m pytest tests/test_live_waits_lock.py
+```
+
 ## Entity Metadata Index Tests
 
 **File**: `tests/test_entity_index.py`

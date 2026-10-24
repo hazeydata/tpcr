@@ -45,6 +45,7 @@ Single reference for the current Theme Park pipeline setup (Linux, user **fred**
 ### 3.2 Queue-times loop (systemd, on boot + always)
 
 - **What:** Fetches wait times from queue-times.com every 5 minutes; writes to `output_base/staging/queue_times/`. Morning ETL later merges staging into `fact_tables/clean`.
+- **Live DB dual-write:** each batch is also written to `tpcr_live.duckdb` `live_waits` (anti-join on `entity_code, observed_at, wait_time_type`). If s11 holds the write lock (~6:15 AM ET, ~110s) the write retries with backoff for ~180s; on failure the batch stays in `output_base/state/live_waits_pending/` and is flushed by the next write (60s cool-down after an exhausted batch). Once per ET day, first loop cycle at/after 04:30 ET, `src/replay_live_waits.py --days 2` backfills any missing rows from staging (TPCR-S11-LOCK-001).
 - **Service:** `queue-times-loop.service` (user fred, project dir = repo path).
 - **Starts:** Automatically on boot if you ran `sudo bash scripts/install_queue_times_service.sh`.
 - **Log (systemd):** `sudo journalctl -u queue-times-loop -f`
@@ -79,7 +80,7 @@ All under **output_base** unless noted.
 | `output_base/models/` | Per-entity XGBoost (or mean) models |
 | `output_base/curves/forecast/` | Forecast curves (actual/posted predicted) |
 | `output_base/state/` | entity_index.sqlite, pipeline_state.json, run_manifest.json, pipeline_status.json, daily_pipeline.lock, encoding_mappings.json, **etl_last_run.json** (timestamp of last successful ETL; ETL only processes files modified since), processed_files.json, failed_files.json, dedupe.sqlite, etc. |
-| `output_base/tpcr_live.duckdb` | Shared DuckDB for bot + dashboard (live_waits, wti, forecasts, entities, data_freshness). Created by `init_live_duckdb.py`; dual-written by scraper, WTI, forecast, dimension scripts. |
+| `output_base/tpcr_live.duckdb` | Shared DuckDB for bot + dashboard (live_waits, wti, forecasts, entities, data_freshness). Created by `init_live_duckdb.py`; dual-written by scraper, WTI, forecast, dimension scripts. Scraper batches that hit the s11 lock wait in `state/live_waits_pending/`; `replay_live_waits.py` backfills from staging daily. |
 | `output_base/raw/` | Synced S3 data: `raw/export/wait_times/`, `raw/export/fastpass_times/` (ETL reads from here only; sync-only, no S3 streaming). |
 | `output_base/reports/` | wait_time_db_report.md, etc. |
 
