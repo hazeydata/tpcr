@@ -554,6 +554,32 @@ class Signed(Base):
         os.symlink(out, self.q / "sub")
         self._key_path_refused(self.q / "sub" / "pub.pem", "queue dir")
 
+    def test_real_key_path_with_symlinked_queue_arg_refused(self):  # R04: queue given as alias, key by real path
+        real = Path(self.tmp.name) / "realq"; real.mkdir(mode=0o700)
+        k = real / "pub.pem"; k.write_bytes(self.pub.read_bytes()); os.chmod(k, 0o644)
+        self.q.rmdir(); os.symlink(real, self.q)
+        self._key_path_refused(k, "queue dir")
+
+    def test_key_via_symlinked_alias_dir_into_queue_refused(self):  # R06: key file not a link, parent alias -> queue
+        inq = self.q / "pub.pem"; inq.write_bytes(self.pub.read_bytes()); os.chmod(inq, 0o644)
+        alias = Path(self.tmp.name) / "alias"; os.symlink(self.q, alias)
+        self._key_path_refused(alias / "pub.pem", "queue dir")
+
+    def test_key_via_symlinked_parent_outside_queue_accepted(self):  # spec R7: only a key FILE symlink is refused
+        out = Path(self.tmp.name) / "keys"; out.mkdir(mode=0o755)
+        k = out / "pub.pem"; k.write_bytes(self.pub.read_bytes()); os.chmod(k, 0o644)
+        alias = Path(self.tmp.name) / "keys_alias"; os.symlink(out, alias)
+        self.put(entry()); self.assertEqual(self._main(alias / "pub.pem"), 0)
+
+    def test_bad_key_path_builds_no_client(self):  # R14: key refusals happen before any X client is built
+        inq = self.q / "pub.pem"; inq.write_bytes(self.pub.read_bytes()); os.chmod(inq, 0o644)
+        self.put(entry())
+        with mock.patch.object(P, "XClient") as xc:
+            with self.assertRaises(SystemExit) as cm:
+                self._main(inq, offline=False)
+        self.assertIn("refused_verify_key_path", str(cm.exception.code))
+        xc.assert_not_called(); self.assertFalse(self.ledger.exists())
+
     def test_plain_key_outside_queue_accepted(self):
         self.put(entry()); self.assertEqual(self._main(self.pub), 0)
 

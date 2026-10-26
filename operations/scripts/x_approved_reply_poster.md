@@ -9,7 +9,7 @@ Spec: X-APPROVED-REPLY-POSTER-001. Dry run is the default. Live `--apply` on the
     python3 operations/scripts/x_approved_reply_poster.py --apply      # posts; at most 5 per run, >=30 s apart
 Options: `--queue-dir` (default `operations/x_reply_queue/`), `--ledger` (default `operations/x_reply_ledger.jsonl`),
 `--max N` (capped at 5), `--verify-key PATH` (default: env `X_REPLY_VERIFY_KEY`; **required**, see AC 3c below).
-`--apply` with `--offline` is refused. Exit 1 if any `api_error` or `refused_unsigned`, or if the run is refused outright
+`--apply` with `--offline` is refused. Exit 1 if any `api_error`, `refused_unsigned` or `rejected_hash_mismatch`, or if the run is refused outright
 (queue dir mode, missing/bad verify key).
 
 Secrets come only from the process env: `TWITTER_CONSUMER_KEY`, `TWITTER_CONSUMER_SECRET`, `TWITTER_ACCESS_TOKEN`,
