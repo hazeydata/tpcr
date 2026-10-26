@@ -64,4 +64,9 @@ Results: 7 passed, 0 failed
 Run: `unshare -rn python3 tests/test_x_approved_reply_poster.py`. Covers hash binding, validation, mention pre-check,
 dry run, duplicate/crash recovery, 500/429/media failures, the 5-per-run cap and 30 s spacing, non-object approvals (AC 2),
 403 scope (POST only -> manual), fsync per ledger line (patched `os.fsync`), queue-dir permission refusal (AC 3a) and the
-ledger's queue commit SHA (AC 3b, local `git init` in a temp dir). 42 tests. Test fixtures use synthetic handles and post ids only.
+ledger's queue commit SHA (AC 3b, local `git init` in a temp dir, including a recovered post), refusal before the ledger is
+even created (no empty ledger file), and signed approvals (R5 / AC 3c): unsigned, garbage, tampered payload (text with recomputed
+hashes, target, entry_id, quote, approved_at, alt text, image bytes), tampered signature and other-key signatures are
+`refused_unsigned` with 0 calls; a good signature posts on the mock; `main()` exits 1; the poster refuses a missing, private,
+non-Ed25519 or in-queue verify key; and the signing helper `x_reply_sign_approval.py` (keygen 0600, no overwrite, refuses loose
+mode / in-queue / in-git keys, refuses to sign a hash mismatch). Keys are generated per test in a temp dir. 72 tests. Test fixtures use synthetic handles and post ids only.
