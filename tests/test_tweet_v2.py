@@ -435,6 +435,29 @@ class LivePosting(Base):
         for kind, alerts in self.run_sequence([(0, "skip"), (1, "ok"), (2, "skip")]).items():
             self.assertEqual(alerts, [], kind)
 
+    def test_ac5b_stale_day_is_not_counted_as_a_skip(self):
+        """B04: skip, stale -> no alert (a stale day must not count as a second no-data day)."""
+        for kind, alerts in self.run_sequence([(0, "skip"), (1, "stale")]).items():
+            self.assertEqual(alerts, [], kind)
+        for kind, alerts in self.run_sequence([(0, "skip"), (1, "skip"), (2, "stale"), (3, "skip")]).items():
+            self.assertEqual(len(alerts), 1, kind)
+
+    def test_ac5b_stale_day_after_a_gap_does_not_bridge(self):
+        """B05: skip D, (no run D+1), stale D+2, skip D+3 -> no alert: a stale day bridges only the next day."""
+        for kind, alerts in self.run_sequence([(0, "skip"), (2, "stale"), (3, "skip")]).items():
+            self.assertEqual(alerts, [], kind)
+
+    def test_ac5b_dry_stale_run_writes_no_bridge_state(self):
+        """B06: a dry stale run must not write bridge state; the same call live does."""
+        p = tweet_v2.no_data_state_path(self.state)
+        seed = json.dumps({k: {"last_skipped": "2026-10-27", "streak": 1, "alerted": False}
+                           for k in ("predicted", "observed")}, indent=2) + "\n"
+        p.write_text(seed)
+        tweet_v2.record_stale("observed", "2026-10-28", "test", lambda m: None, self.state, True)
+        self.assertEqual(p.read_text(), seed)
+        tweet_v2.record_stale("observed", "2026-10-28", "test", lambda m: None, self.state, False)
+        self.assertEqual(json.loads(p.read_text())["observed"]["bridged_to"], "2026-10-28")  # live run does bridge
+
     def test_data_rerun_clears_streak_so_next_skip_does_not_alert(self):
         """A05/A06: skip D, rerun D with data, skip D+1 -> streak restarts at 1, no 2-day alert (both scripts)."""
         for kind, alerts in self.run_sequence([(0, "skip"), (0, "ok"), (1, "skip")]).items():
