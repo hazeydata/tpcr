@@ -450,17 +450,21 @@ class PhaseG(Env):
         post = mock.Mock(return_value="111")
         creds = {k: "x" for k in ("TWITTER_CONSUMER_KEY", "TWITTER_CONSUMER_SECRET", "TWITTER_ACCESS_TOKEN", "TWITTER_ACCESS_TOKEN_SECRET")}
         with mock.patch.multiple(wpt, STATE_FILE=state, load_env=mock.DEFAULT, enforce=mock.DEFAULT, post_discord=mock.DEFAULT,
-                                 render_video_on_wilma=mock.Mock(return_value=None), load_content=mock.Mock(return_value=FORECAST),
-                                 post_tweet=post), \
+                                 load_content=mock.Mock(return_value=(json.dumps(FORECAST), FORECAST)),
+                                 upload_media=mock.Mock(return_value="M1"), post_tweet=post), \
+                mock.patch.object(wpt.tweet_v2, "fetch_history", mock.Mock(return_value="h.parquet")), \
+                mock.patch.object(wpt.tweet_v2, "forecast_staleness", mock.Mock(return_value=None)), \
+                mock.patch.object(wpt.tweet_v2, "post_text", mock.Mock(return_value=MAIN_FORECAST_TEXT)), \
+                mock.patch.object(wpt.tweet_v2, "build", mock.Mock(return_value={"F": {"mp4": "F.mp4", "png": "F.png", "alt": "alt"}})), \
                 mock.patch.dict(os.environ, creds), mock.patch.object(tweet_note, "date", type("D", (date,), {"today": classmethod(lambda c: AS_OF)})), \
                 redirect_stdout(io.StringIO()):
-            wpt.main()
+            wpt.main(["--date", FORECAST["target_date"]])
         return post, state
 
     def test_ac23_forecast_unchanged_and_reply_drafted(self):
         self.assertEqual(wpt.format_tweet(FORECAST), MAIN_FORECAST_TEXT)
         post, state = self.run_forecast(systematic(("AK", "high")))
-        post.assert_called_once_with(MAIN_FORECAST_TEXT, media_id=None)
+        post.assert_called_once_with(MAIN_FORECAST_TEXT, media_id="M1")
         draft = json.loads(state.read_text())["note_drafts"]["2026-10-13"]
         text = "Note: our Animal Kingdom forecasts have been running high lately. We're working on it."
         self.assertEqual(draft, {"text": text, "in_reply_to": "111", "status": "draft",

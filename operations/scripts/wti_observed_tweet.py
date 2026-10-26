@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """WTI Observed Tweet — Posts yesterday's actual WTI as a reply to the prediction at 8:30 AM ET.
 
+Timing rule (Fred, Oct 26 2026): for reference day D this runs at 8:30 AM ET on D+1, after D's observed
+values are gathered that morning, and replies to D's forecast tweet (posted 4 PM ET on D-1, two days earlier).
+It builds the TPCR-TWEET-V2 scorecard reply (design C) card + 7.1s MP4 locally from observed_D.json,
+predicted_D.json and wilma's wti.parquet, and uploads the MP4 with alt text.
+--dry-run builds everything, computes the reply target, and posts nothing.
+
 Every tweet has two dates:
   - tweet_date: when the tweet is posted (today)
   - reference_date: the date the statistics apply to (yesterday for observed)
@@ -16,7 +22,6 @@ import json
 import os
 import subprocess
 import sys
-import tempfile
 import time
 from datetime import date, timedelta
 from pathlib import Path
@@ -24,12 +29,13 @@ from pathlib import Path
 import requests
 from requests_oauthlib import OAuth1
 
-from tweet_guard import enforce, preflight_legacy
+import tweet_note
+import tweet_v2
+from tweet_guard import enforce, preflight_legacy, status as guard_status
 
 # --- Configuration ---
-SSH_HOST = "wilma@192.168.2.75"
-CONTENT_DIR = "/home/wilma/hazeydata/pipeline/content"
-REMOTION_DIR = "/home/wilma/clawd-anthropic/remotion-experiments/remotion-tpcr"
+# Data host from env, no defaults: TPCR_SSH_HOST (ssh target), TPCR_CONTENT_DIR (Step 14 content dir there).
+# tweet_v2.env_required raises '<NAME> is not set' when one is needed (see operations/tweet_v2/README.md).
 STATE_FILE = Path.home() / "hazeydata" / "reports" / "wti_daily" / "tweet_state.json"
 DISCORD_CHANNEL_ID = "1479351574177513576"
 DISCORD_API = "https://discord.com/api/v10"
@@ -61,7 +67,7 @@ def get_twitter_auth():
 def ssh_read_file(path):
     """Read a file from wilma-server via SSH."""
     result = subprocess.run(
-        ["ssh", SSH_HOST, f"cat '{path}'"],
+        ["ssh", tweet_v2.env_required("TPCR_SSH_HOST"), f"cat '{path}'"],
         capture_output=True, text=True, timeout=15
     )
     if result.returncode != 0:
@@ -69,69 +75,8 @@ def ssh_read_file(path):
     return result.stdout.strip()
 
 
-def render_video_on_wilma(target_date, content):
-    """Write content data to Remotion, render, SCP the video back."""
-    remote_output = f"{REMOTION_DIR}/out/observed-wti-{target_date}.mp4"
-    data_path = f"{REMOTION_DIR}/public/daily-wti-data.json"
-
-    parks_data = []
-    for p in content.get("parks", []):
-        parks_data.append({
-            "parkCode": p.get("park_code", ""),
-            "parkName": p.get("park_name", ""),
-            "parkEmoji": p.get("park_emoji", ""),
-            "wtiScore": p.get("wti", 0),
-            "wtiEmoji": p.get("wti_emoji", ""),
-            "wtiLabel": p.get("wti_label", ""),
-            "headlinerRide": p.get("headliner_ride", "Check the app!"),
-            "headlinerWait": p.get("headliner_wait", 0),
-            "bestRide": p.get("best_ride", "Check the app!"),
-            "bestRideWait": p.get("best_ride_wait", 0),
-        })
-
-    remotion_data = json.dumps({
-        "date": target_date,
-        "dateISO": target_date,
-        "mode": "observed",
-        "parks": parks_data,
-    })
-
-    print("Writing observed data to Remotion...")
-    write_result = subprocess.run(
-        ["ssh", SSH_HOST, f"cat > '{data_path}'"],
-        input=remotion_data, capture_output=True, text=True, timeout=15,
-    )
-    if write_result.returncode != 0:
-        print(f"Data write failed: {write_result.stderr}", file=sys.stderr)
-
-    print("Rendering video on wilma-server...")
-    render_cmd = (
-        f"cd {REMOTION_DIR} && "
-        f"npx remotion render DailyWTIAll '{remote_output}' --codec h264 --crf 18 --log=error"
-    )
-    result = subprocess.run(
-        ["ssh", SSH_HOST, render_cmd],
-        capture_output=True, text=True, timeout=120,
-    )
-    if result.returncode != 0:
-        print(f"Render failed: {result.stderr}", file=sys.stderr)
-        return None
-
-    local_path = Path(tempfile.mkdtemp()) / f"observed-wti-{target_date}.mp4"
-    scp_result = subprocess.run(
-        ["scp", f"{SSH_HOST}:{remote_output}", str(local_path)],
-        capture_output=True, text=True, timeout=30,
-    )
-    if scp_result.returncode != 0:
-        print(f"SCP failed: {scp_result.stderr}", file=sys.stderr)
-        return None
-
-    print(f"Video downloaded: {local_path} ({local_path.stat().st_size} bytes)")
-    return local_path
-
-
-def upload_media(video_path):
-    """Upload video to Twitter via v1.1 chunked media upload. Returns media_id or None."""
+def upload_media(video_path, alt_text=None):
+    """Upload video to Twitter via v1.1 chunked media upload, then attach alt text. Returns media_id or None."""
     auth = get_twitter_auth()
     file_size = video_path.stat().st_size
 
@@ -178,6 +123,10 @@ def upload_media(video_path):
         processing = resp.json().get("processing_info")
 
     print(f"Media uploaded: {media_id}")
+    # Fail closed: no tweet without alt text (metadata/create runs after FINALIZE, before the tweet).
+    if not alt_text or not tweet_v2.set_alt_text(media_id, alt_text, auth, requests.post):
+        print("ERROR: alt text not set on media; refusing to tweet", file=sys.stderr)
+        return None
     return media_id
 
 
@@ -191,66 +140,49 @@ def _wdw_only(content):
     return content
 
 
-def load_content():
-    """Load yesterday's observed content JSON from wilma."""
-    yesterday = (date.today() - timedelta(days=1)).isoformat()
-
-    path = f"{CONTENT_DIR}/observed_{yesterday}.json"
-    raw = ssh_read_file(path)
+def load_content(reference_date, content_dir=None):
+    """Load D's observed content JSON (raw text + parsed WDW-only dict)."""
+    path = f"observed_{reference_date}.json"
+    raw = tweet_v2.read_content(path, content_dir, ssh_read_file)
     if raw:
         try:
             data = json.loads(raw)
             if data.get("status") in ("ready", "released"):
-                return _wdw_only(data)
-            print(f"Content for {yesterday} is held: {data.get('held_reasons')}")
+                return raw, _wdw_only(data)
+            print(f"Content for {reference_date} is held: {data.get('held_reasons')}")
         except json.JSONDecodeError:
             print(f"Invalid JSON in {path}")
+    return None, None
 
-    return None
+
+def save_state(tweet_id, reference_date, reply_to):
+    """Record the observed tweet under observed[D] so the #468 idempotency check can see it."""
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with tweet_note.locked(STATE_FILE):
+        state = {}
+        if STATE_FILE.exists():
+            try:
+                state = json.loads(STATE_FILE.read_text())
+            except json.JSONDecodeError:
+                pass
+        state.setdefault("observed", {})[reference_date] = {
+            "tweet_id": tweet_id, "in_reply_to": reply_to,
+            "posted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        cutoff = (date.today() - timedelta(days=14)).isoformat()
+        state["observed"] = {k: v for k, v in state["observed"].items() if k >= cutoff}
+        tweet_note._save(STATE_FILE, state)
 
 
-def find_predicted_tweet_id(reference_date):
-    """Look up the predicted tweet ID for a specific reference_date.
+def find_predicted_tweet_id(reference_date, state_file=None):
+    """D's forecast tweet id: tweet_state.json["predicted"][D] (then last_predicted if it is for D).
 
-    The observed tweet for reference_date X replies to the predicted
-    tweet for that same reference_date X.
-
-    State file structure:
-      {
-        "predicted": {
-          "2026-03-31": {"tweet_id": "...", "posted_at": "..."},
-          "2026-03-30": {"tweet_id": "...", "posted_at": "..."},
-        },
-        "last_predicted": {...}  // legacy fallback
-      }
+    The observed reply for reference day D (8:30 AM ET on D+1) replies to the forecast tweet for the
+    same D, which was posted at 4 PM ET on D-1, two days earlier.
     """
-    if not STATE_FILE.exists():
-        print(f"No state file found at {STATE_FILE}")
-        return None
-
-    try:
-        state = json.loads(STATE_FILE.read_text())
-    except json.JSONDecodeError:
-        print("State file is invalid JSON")
-        return None
-
-    # Primary lookup: by reference_date in the predicted dict
-    predicted = state.get("predicted", {})
-    if reference_date in predicted:
-        tweet_id = predicted[reference_date].get("tweet_id")
-        print(f"Found predicted tweet for ref={reference_date}: {tweet_id}")
-        return tweet_id
-
-    # Fallback: check last_predicted if reference_date matches
-    last = state.get("last_predicted", {})
-    last_ref = last.get("reference_date") or last.get("target_date")
-    if last_ref == reference_date:
-        tweet_id = last.get("tweet_id")
-        print(f"Found predicted tweet via last_predicted fallback: {tweet_id}")
-        return tweet_id
-
-    print(f"No predicted tweet found for reference_date={reference_date}")
-    return None
+    tweet_id, how = tweet_v2.lookup_predicted_tweet(state_file or STATE_FILE, reference_date)
+    print(f"Predicted tweet for ref={reference_date}: {tweet_id} ({how})")
+    return tweet_id
 
 
 def format_tweet(content, is_reply=False):
@@ -319,76 +251,124 @@ def post_discord(message):
     )
 
 
-def main():
-    load_env()
-    enforce(preflight_legacy)
+def main(argv=None):
+    global STATE_FILE
+    args = tweet_v2.parse_args("observed", argv)
+    dry = args.dry_run
+    if dry:
+        tweet_v2.block_http_for_dry_run()
+        print("DRY RUN: building only; nothing will be posted and no state will be written")
+        guard = guard_status()
+    else:
+        load_env()
+        enforce(preflight_legacy)
+        guard = "enforced"
 
-    print(f"WTI Observed Tweet \u2014 {date.today().isoformat()}")
+    reference_date = args.date or tweet_v2.default_reference_date("observed")
+    state_file = STATE_FILE = Path(args.state_file) if args.state_file else STATE_FILE
+    print(f"WTI Observed Tweet \u2014 {date.today().isoformat()} (ref={reference_date})")
 
-    for key in ["TWITTER_CONSUMER_KEY", "TWITTER_CONSUMER_SECRET",
-                "TWITTER_ACCESS_TOKEN", "TWITTER_ACCESS_TOKEN_SECRET"]:
-        if not os.environ.get(key):
-            print(f"ERROR: {key} not set", file=sys.stderr)
-            sys.exit(1)
+    if not dry:
+        for key in ["TWITTER_CONSUMER_KEY", "TWITTER_CONSUMER_SECRET",
+                    "TWITTER_ACCESS_TOKEN", "TWITTER_ACCESS_TOKEN_SECRET"]:
+            if not os.environ.get(key):
+                print(f"ERROR: {key} not set", file=sys.stderr)
+                sys.exit(1)
 
-    # Load content
-    content = load_content()
+    if not tweet_v2.check_closures("observed", reference_date, args.closures, print if dry else post_discord):
+        sys.exit(1)  # R3: bad or missing closures.csv fails the run before any post
+
+    raw, content = load_content(reference_date, args.content_dir)
     if not content:
-        print("No ready observed content found \u2014 skipping tweet")
-        post_discord(":warning: **WTI Observed Tweet** \u2014 No ready content found, tweet skipped")
-        return
-
-    # The reference_date is the date the stats apply to (yesterday)
-    reference_date = content["target_date"]
+        # AC 5a (closed-row R2): missing data is a skip, not a failure -> exit 0; alert after 2 days in a row
+        tweet_v2.record_no_data("observed", reference_date, state_file, post_discord if not dry else print, dry)
+        return 0
+    alert = print if dry else post_discord
+    tweet_v2.check_park_hours("observed", reference_date, args.park_hours, alert)  # AC 2a
 
     # Idempotency guard (#468): skip if already posted for this reference_date
-    if STATE_FILE.exists():
+    if state_file.exists():
         try:
-            existing = json.loads(STATE_FILE.read_text())
+            existing = json.loads(state_file.read_text())
             if existing.get("observed", {}).get(reference_date, {}).get("tweet_id"):
                 print(f"Already posted observed tweet for {reference_date}, exiting.")
-                return
+                return None
         except (json.JSONDecodeError, KeyError):
             pass
 
-    # Find the predicted tweet for THIS reference_date to reply to
-    reply_to = find_predicted_tweet_id(reference_date)
-    is_reply = reply_to is not None
+    # Reply target: D's forecast tweet (posted 4 PM ET on D-1)
+    reply_to, how = tweet_v2.lookup_predicted_tweet(state_file, reference_date)
+    print(f"Reply target for ref={reference_date}: {reply_to or 'none, staying silent'} ({how})")
 
-    if is_reply:
-        print(f"Will reply to predicted tweet {reply_to} (ref={reference_date})")
-    else:
-        print(f"No predicted tweet found for ref={reference_date} \u2014 posting standalone")
+    work, tmp = tweet_v2.new_workdir(args.out)
+    try:
+        arts, build_error = {}, None
+        try:
+            pred_raw = tweet_v2.read_content(f"predicted_{reference_date}.json", args.content_dir, ssh_read_file)
+            if not pred_raw:
+                raise RuntimeError(f"predicted_{reference_date}.json not found (needed for the forecast side of the scorecard)")
+            history = tweet_v2.fetch_history(work, args.history)
+            stale = tweet_v2.observed_staleness(history, reference_date)
+            if stale:  # AC 16: the reply posts only when wti.parquet ends on D
+                tweet_v2.record_stale("observed", reference_date, stale, alert, state_file, dry)
+                return 0
+            tweet_v2.clear_no_data("observed", state_file, dry)  # AC 5b: only a fresh data day ends the streak
+            arts = tweet_v2.build(reference_date, work, history, pred_raw, raw, park_hours=args.park_hours, closures=args.closures)
+            if "R" not in arts and not arts.get("skipped_all_closed"):
+                raise RuntimeError("build produced no R (scorecard) MP4")
+        except Exception as e:  # noqa: BLE001 - any build failure means no card, so the bot stays silent
+            build_error = str(e)
+            print(f"WARNING: v2 card build failed \u2014 {build_error}", file=sys.stderr)
+        if arts.get("skipped_all_closed"):  # closed-row R1: every park closed -> no reply
+            print(f"skipped_all_closed ref={reference_date}: every park closed; nothing posted")
+            if dry:
+                tweet_v2.write_manifest(work, {"would_post": False, "mode": "dry-run", "kind": "observed",
+                                               "reference_date": reference_date, "result": "skipped_all_closed"})
+            return 0 if dry else None
+        tweet_text = tweet_v2.post_text("observed", arts)
+        r = arts.get("R") if tweet_text else None
+        print(f"\nTweet ({len(tweet_text or '')} chars, ref={reference_date}, reply_to={reply_to}):\n{tweet_text}\n")
 
-    # Format tweet
-    tweet_text = format_tweet(content, is_reply=is_reply)
-    print(f"\nTweet ({len(tweet_text)} chars, ref={reference_date}, reply_to={reply_to}):\n{tweet_text}\n")
+        if dry:
+            tweet_v2.write_manifest(work, {
+                "would_post": bool(r and reply_to),
+                "mode": "dry-run", "kind": "observed", "reference_date": reference_date,
+                "posts_at": f"{(date.fromisoformat(reference_date) + timedelta(days=1)).isoformat()} 08:30 America/New_York",
+                "reply_to_tweet_id": reply_to, "reply_to_lookup": how, "state_file": str(state_file),
+                "tweet_text": tweet_text, "media": str(r["mp4"]) if r else None,
+                "alt_text": r["alt"] if r else None, "build_error": build_error, "guard_status": guard,
+            })
+            return 0 if r else 1
 
-    # Render and upload video
-    media_id = None
-    video_path = render_video_on_wilma(reference_date, content)
-    if video_path:
-        media_id = upload_media(video_path)
+        # Fred, Oct 26 2026: "Stay silent on missing-data days". No scorecard card or no forecast tweet
+        # to reply to = no tweet (edge copy v2 E1/E5/E6/E7; default silent, no text-only fallback).
+        if not r or not reply_to:
+            why = build_error or f"no forecast tweet for {reference_date} ({how})"
+            print(f"SILENT: no observed reply for {reference_date} ({why}); nothing posted")
+            post_discord(f":mute: **WTI Observed Tweet** \u2014 ref={reference_date}: staying silent ({why})"[:1900])
+            return None
+        media_id = upload_media(r["mp4"], r["alt"])
         if not media_id:
-            print("WARNING: Video upload failed \u2014 posting text-only tweet")
-    else:
-        print("WARNING: Video render failed \u2014 posting text-only tweet")
+            print("SILENT: video upload failed; nothing posted", file=sys.stderr)
+            post_discord(f":x: **WTI Observed Tweet** \u2014 ref={reference_date}: video upload failed, nothing posted")
+            sys.exit(1)
 
-    # Post tweet
-    tweet_id = post_tweet(tweet_text, reply_to=reply_to, media_id=media_id)
-    if not tweet_id:
-        post_discord(":x: **WTI Observed Tweet** \u2014 Twitter API error, tweet failed")
-        sys.exit(1)
+        tweet_id = post_tweet(tweet_text, reply_to=reply_to, media_id=media_id)
+        if not tweet_id:
+            post_discord(":x: **WTI Observed Tweet** \u2014 Twitter API error, tweet failed")
+            sys.exit(1)
+        save_state(tweet_id, reference_date, reply_to)
 
-    # Discord confirmation — include reference_date and reply target for debugging
-    mode = "reply thread" if is_reply else "standalone"
-    post_discord(
-        f":white_check_mark: **WTI Observed Tweet posted** ({mode}) \u2014 ref={reference_date}\n"
-        f"Replied to predicted tweet: {reply_to or 'none (standalone)'}\n"
-        f"https://x.com/DisneyStatsWhiz/status/{tweet_id}"
-    )
-    print("Done.")
+        post_discord(
+            f":white_check_mark: **WTI Observed Tweet posted** (reply) \u2014 ref={reference_date}"
+            "\n"
+            f"Replied to predicted tweet: {reply_to}\n"
+            f"https://x.com/DisneyStatsWhiz/status/{tweet_id}"
+        )
+        print("Done.")
+    finally:
+        tweet_v2.cleanup(tmp)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
