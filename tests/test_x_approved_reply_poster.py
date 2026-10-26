@@ -549,7 +549,7 @@ class SignHelper(Base):
 class KeyPlacementGuard(unittest.TestCase):
     """AC 3c: the signing key never lives in the repo, the queue dir, or the poster's env."""
     REPO = Path(__file__).resolve().parents[1]
-    PEM_PRIV = "-----BEGIN " + "PRIVATE KEY-----"
+    PEM_PRIV = "-----BEGIN " + "PRIV" + "ATE KEY-----"  # split so push scanners do not flag the detector itself
 
     def test_no_private_key_tracked_in_repo(self):
         r = subprocess.run(["git", "ls-files", "-z"], cwd=self.REPO, capture_output=True)
