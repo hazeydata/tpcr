@@ -50,10 +50,10 @@ def load_signing_key(key_path, queue_dirs=()):
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     p = check_key_path(key_path, queue_dirs)
-    key = serialization.load_pem_private_key(p.read_bytes(), password=None)
-    if not isinstance(key, Ed25519PrivateKey):
+    priv = serialization.load_pem_private_key(p.read_bytes(), password=None)
+    if not isinstance(priv, Ed25519PrivateKey):
         raise SystemExit("signing key is not Ed25519")
-    return key
+    return priv
 
 
 def sign_entry(entry, queue_dir, key):
@@ -80,12 +80,12 @@ def keygen(out, pub):
     out, pub = Path(out), Path(pub)
     if out.exists() or pub.exists():
         raise SystemExit("refusing to overwrite an existing key file")
-    key = Ed25519PrivateKey.generate()
+    priv = Ed25519PrivateKey.generate()
     fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "wb") as fh:
-        fh.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+        fh.write(priv.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
                                    serialization.NoEncryption()))
-    pub.write_bytes(key.public_key().public_bytes(serialization.Encoding.PEM,
+    pub.write_bytes(priv.public_key().public_bytes(serialization.Encoding.PEM,
                                                   serialization.PublicFormat.SubjectPublicKeyInfo))
     try:
         check_key_path(out)

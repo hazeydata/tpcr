@@ -189,7 +189,7 @@ def load_verify_key(path, queue_dir=None):
     except OSError as e:
         raise SystemExit(f"refusing to run: cannot read verify key ({e.__class__.__name__}) (AC 3c)")
     try:
-        key = serialization.load_pem_public_key(data)
+        pub = serialization.load_pem_public_key(data)
     except ValueError:
         try:
             serialization.load_pem_private_key(data, password=None)
@@ -199,9 +199,9 @@ def load_verify_key(path, queue_dir=None):
         if is_private:
             raise SystemExit("refusing to run: verify key is a PRIVATE key; the poster must hold only the public key (AC 3c)")
         raise SystemExit("refusing to run: verify key is not a PEM public key (AC 3c)")
-    if not isinstance(key, Ed25519PublicKey):
+    if not isinstance(pub, Ed25519PublicKey):
         raise SystemExit("refusing to run: verify key is not Ed25519 (AC 3c)")
-    return key
+    return pub
 
 
 def signature_ok(entry, queue_dir, verify_key):
