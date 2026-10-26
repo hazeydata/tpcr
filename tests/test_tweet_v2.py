@@ -383,6 +383,118 @@ class LivePosting(Base):
         rc, _, _ = self.live(wpt, post)
         self.assertEqual(rc, 1)
 
+    # --- Kitty T2 gaps (A04, A05, A06, A08, F05, F10, H03) ---
+    def nodata_run(self, mod, day, sent, extra=(), build=None):
+        """Live run for one reference day; alerts go to sent; posting is an error unless state says already posted."""
+        post = mock.Mock(side_effect=AssertionError("posted in a streak test"))
+        env = {k: "x" for k in ("TWITTER_CONSUMER_KEY", "TWITTER_CONSUMER_SECRET", "TWITTER_ACCESS_TOKEN", "TWITTER_ACCESS_TOKEN_SECRET")}
+        with mock.patch.object(mod, "post_discord", side_effect=sent.append), mock.patch.object(mod, "load_env"), \
+             mock.patch.object(mod, "enforce"), mock.patch.dict("os.environ", env), \
+             mock.patch.object(requests, "post", post), mock.patch.object(tweet_v2, "build", build or self.fake_build):
+            return self.run_main(mod, ["--date", day, "--content-dir", str(self.cdir), "--history", "h",
+                                       "--state-file", str(self.state), *extra])
+
+    def run_sequence(self, steps):
+        """Run (day_offset, 'skip'|'stale'|'ok') steps through both scripts; return {kind: [no-data alerts]}.
+        Each day's run happens at 4 PM ET on day-1; 'ok' content is fresh and the build stops before any post."""
+        from datetime import datetime, timedelta
+        d0 = date.fromisoformat(D)
+        result = {}
+        for mod, kind in ((wpt, "predicted"), (wot, "observed")):
+            self.state.write_text("{}")
+            tweet_v2.no_data_state_path(self.state).unlink(missing_ok=True)
+            sent = []
+            for off, what in steps:
+                day = (d0 + timedelta(days=off)).isoformat()
+                prev = (d0 + timedelta(days=off - 1)).isoformat()
+                for f in self.cdir.iterdir():
+                    f.unlink()
+                gen = "2026-09-04T06:00:00-04:00" if what == "stale" and kind == "predicted" else f"{prev}T10:00:00-04:00"
+                if what != "skip":
+                    (self.cdir / f"predicted_{day}.json").write_text(content(day, [20, 21, 26, 33], generated_at=gen))
+                    (self.cdir / f"observed_{day}.json").write_text(content(day, [19, 22, 25, 27]))
+                last = "2026-09-04" if what == "stale" else day
+                stop = mock.Mock(side_effect=RuntimeError("stop before posting"))
+                with mock.patch.object(tweet_v2, "now", return_value=datetime.fromisoformat(f"{prev}T16:00:00-04:00")), \
+                     mock.patch.object(tweet_v2, "parquet_last_date", return_value=last):
+                    rc, out, _ = self.nodata_run(mod, day, sent, build=stop)
+                self.assertEqual(rc if what != "ok" else 0, 0, (kind, off, what))
+                want = {"skip": "skipped_no_data", "stale": "skipped_stale", "ok": "stop before posting"}[what]
+                if what != "ok":
+                    self.assertIn(want, out, (kind, off, what))
+            result[kind] = [m for m in sent if "skipped_no_data" in m]
+        return result
+
+    def test_ac5b_skip_stale_skip_sends_no_data_alert(self):
+        """AC 5b (R5): a stale day neither counts nor resets the streak: skip, stale, skip -> one no-data alert."""
+        for kind, alerts in self.run_sequence([(0, "skip"), (1, "stale"), (2, "skip")]).items():
+            self.assertEqual(len(alerts), 1, kind)
+
+    def test_ac5b_skip_ok_skip_sends_no_alert(self):
+        """AC 5b (R5): a fresh data day ends the streak: skip, ok, skip -> no no-data alert."""
+        for kind, alerts in self.run_sequence([(0, "skip"), (1, "ok"), (2, "skip")]).items():
+            self.assertEqual(alerts, [], kind)
+
+    def test_data_rerun_clears_streak_so_next_skip_does_not_alert(self):
+        """A05/A06: skip D, rerun D with data, skip D+1 -> streak restarts at 1, no 2-day alert (both scripts)."""
+        for kind, alerts in self.run_sequence([(0, "skip"), (0, "ok"), (1, "skip")]).items():
+            self.assertEqual(alerts, [], kind)
+
+    def test_same_day_skip_rerun_does_not_double_count(self):
+        """A04: two no-data runs for the same day keep streak 1 and send no alert."""
+        (self.cdir / f"predicted_{D}.json").unlink()
+        sent = []
+        for _ in range(2):
+            rc, _, _ = self.nodata_run(wpt, D, sent)
+            self.assertEqual(rc, 0)
+        self.assertEqual(sent, [])
+        self.assertEqual(json.loads(tweet_v2.no_data_state_path(self.state).read_text())["predicted"]["streak"], 1)
+
+    def test_dry_run_no_data_writes_no_streak_state(self):
+        """A08: a dry-run skip must not create or change the no-data streak file."""
+        for f in self.cdir.iterdir():
+            f.unlink()
+        p = tweet_v2.no_data_state_path(self.state)
+        for mod in (wpt, wot):
+            rc, out, _ = self.run_main(mod, ["--dry-run", "--date", D, "--content-dir", str(self.cdir), "--history", "h",
+                                             "--state-file", str(self.state), "--out", str(self.tmp / "dry")])
+            self.assertEqual(rc, 0); self.assertIn("skipped_no_data", out)
+            self.assertFalse(p.exists(), mod.__name__)
+        p.write_text(json.dumps({"predicted": {"last_skipped": "2026-10-27", "streak": 1, "alerted": False}}) + "\n")
+        before = p.read_text()
+        self.run_main(wpt, ["--dry-run", "--date", D, "--content-dir", str(self.cdir), "--history", "h",
+                            "--state-file", str(self.state), "--out", str(self.tmp / "dry")])
+        self.assertEqual(p.read_text(), before)
+
+    def test_naive_generated_at_is_stale(self):
+        """F05: generated_at with no timezone is stale (fail safe), even when its wall time looks fresh."""
+        from datetime import datetime
+        why = tweet_v2.forecast_staleness(content(D, [1, 2, 3, 4], generated_at="2026-10-27T10:00:00"), D,
+                                          datetime.fromisoformat(NOW))
+        self.assertIsNotNone(why)
+        self.assertIn("timezone", why)
+
+    def test_parquet_ending_after_target_is_stale(self):
+        """F10: wti.parquet whose last date is after D is not 'ends on D' -> skipped_stale, no build, no post."""
+        with mock.patch.object(tweet_v2, "parquet_last_date", return_value="2026-10-29"):
+            self.assertIn("2026-10-29 != target", tweet_v2.observed_staleness("h", D))
+            sent = []
+            build = mock.Mock(side_effect=AssertionError("built on a parquet ending after D"))
+            with mock.patch.object(wot, "post_discord", side_effect=sent.append):
+                rc, out = self.live_alerts(wot, mock.Mock(side_effect=AssertionError("posted")), build)
+        self.assertEqual(rc, 0); self.assertIn("skipped_stale", out); self.assertEqual(len(sent), 1)
+        build.assert_not_called()
+
+    def test_observed_park_hours_unreadable_alerts_once(self):
+        """H03: the observed script also checks park hours: one park_hours_unreadable alert per run."""
+        sent = []
+        with mock.patch.object(wot, "post_discord", side_effect=sent.append):
+            self.live_alerts(wot, mock.Mock(side_effect=AssertionError("no post expected")),
+                             mock.Mock(side_effect=RuntimeError("stop after checks")),
+                             extra=["--park-hours", str(self.tmp / "no-such-hours.csv")])
+        self.assertEqual(sum("park_hours_unreadable" in m for m in sent), 1)
+
+
 
 class Closures(unittest.TestCase):
     """Closed-row R3 (AC 1b-1d): data/closures.csv is the only closure source, and it is strict."""

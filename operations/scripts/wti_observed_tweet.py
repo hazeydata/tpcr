@@ -283,7 +283,6 @@ def main(argv=None):
         # AC 5a (closed-row R2): missing data is a skip, not a failure -> exit 0; alert after 2 days in a row
         tweet_v2.record_no_data("observed", reference_date, state_file, post_discord if not dry else print, dry)
         return 0
-    tweet_v2.clear_no_data("observed", state_file, dry)
     alert = print if dry else post_discord
     tweet_v2.check_park_hours("observed", reference_date, args.park_hours, alert)  # AC 2a
 
@@ -311,8 +310,9 @@ def main(argv=None):
             history = tweet_v2.fetch_history(work, args.history)
             stale = tweet_v2.observed_staleness(history, reference_date)
             if stale:  # AC 16: the reply posts only when wti.parquet ends on D
-                tweet_v2.record_stale("observed", reference_date, stale, alert)
+                tweet_v2.record_stale("observed", reference_date, stale, alert, state_file, dry)
                 return 0
+            tweet_v2.clear_no_data("observed", state_file, dry)  # AC 5b: only a fresh data day ends the streak
             arts = tweet_v2.build(reference_date, work, history, pred_raw, raw, park_hours=args.park_hours, closures=args.closures)
             if "R" not in arts and not arts.get("skipped_all_closed"):
                 raise RuntimeError("build produced no R (scorecard) MP4")

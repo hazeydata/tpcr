@@ -198,9 +198,10 @@ def record_no_data(kind, reference_date, state_file, alert, dry=False):
         st = {}
     cur = st.get(kind, {})
     last = cur.get("last_skipped")
+    prev = cur.get("bridged_to") or last  # AC 5b: stale days after the last skip keep the streak alive
     if last == reference_date:
         streak = cur.get("streak", 1)  # same day re-run: no double count
-    elif last and date.fromisoformat(last) + timedelta(days=1) == date.fromisoformat(reference_date):
+    elif prev and date.fromisoformat(prev) + timedelta(days=1) == date.fromisoformat(reference_date):
         streak = cur.get("streak", 1) + 1
     else:
         streak = 1
@@ -243,7 +244,7 @@ def check_closures(kind, reference_date, path, alert):
         return False
 
 
-# AC 16 (closed-row R4): freshness. 36h is a placeholder (OQ-6, chief or Fred).
+# AC 16 (closed-row R4): freshness. 36h is final (R5 closed OQ-6).
 FORECAST_MAX_AGE_H = 36
 ET = "America/New_York"
 
@@ -289,11 +290,27 @@ def observed_staleness(history, D):
     return None if last == D else f"wti.parquet last date {last} != target {D}"
 
 
-def record_stale(kind, reference_date, why, alert):
-    """AC 16: skipped_stale -> log + one alert for this run; caller exits 0."""
+def record_stale(kind, reference_date, why, alert, state_file=None, dry=False):
+    """AC 16: skipped_stale -> log + one alert for this run; caller exits 0.
+    AC 5b (R5): a stale day neither counts toward the no-data streak nor resets it. If it directly follows the
+    streak's last day (a skip or an earlier stale day), it bridges the streak so the next day's skip continues it."""
     msg = f"skipped_stale kind={kind} ref={reference_date}: {why}; nothing posted"
     print(msg)
     alert(f":warning: **WTI {kind} tweet** \u2014 {msg}"[:1900])
+    if dry or state_file is None:
+        return
+    p = no_data_state_path(state_file)
+    try:
+        st = json.loads(p.read_text()) if p.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        return
+    cur = st.get(kind)
+    if not cur:
+        return
+    prev = cur.get("bridged_to") or cur.get("last_skipped")
+    if prev and date.fromisoformat(prev) + timedelta(days=1) == date.fromisoformat(reference_date):
+        cur["bridged_to"] = reference_date
+        p.write_text(json.dumps(st, indent=2) + "\n")
 
 
 def check_park_hours(kind, reference_date, path, alert):

@@ -29,9 +29,10 @@ Env for `build_day.sh`: `PY` (python with pandas + pyarrow), `PYIMG` (python wit
 2. Validate `data/closures.csv` (or `--closures` / `TPCR_CLOSURES`). Missing file, wrong header, unknown park, bad date or a
    non-https `source_url` = exit 1 plus a Discord alert, before anything is built or posted.
 3. No ready content = `skipped_no_data`: exit 0, nothing posted. Streak kept in `no_data_streak.json` next to `tweet_state.json`
-   (per kind, consecutive reference days); one Discord alert when it reaches 2 days in a row. A day with content clears it.
+   (per kind, consecutive reference days); one Discord alert when it reaches 2 days in a row. A day with fresh content clears it.
+   AC 5b (R5): a `skipped_stale` day neither counts toward the streak nor resets it, so skip, stale, skip alerts on the second skip.
    Dry runs log it but write no streak state. Crashes and API errors (upload, alt text, tweet) still exit 1.
-4. Freshness (AC 16): the forecast posts only if the content's `generated_at` is within 36h of the run (placeholder, OQ-6) and its
+4. Freshness (AC 16): the forecast posts only if the content's `generated_at` is within 36h of the run (final, R5 closed OQ-6) and its
    ET date is on or after D - 1; missing `generated_at` counts as stale. The reply posts only if `wti.parquet`'s last `park_date`
    equals D. Otherwise `skipped_stale`: exit 0, one Discord alert, nothing built or posted.
 5. Unreadable `--park-hours` file (AC 2a): every park `unknown` (silent, never Closed) and one `park_hours_unreadable` alert per run.
@@ -54,7 +55,11 @@ Env for `build_day.sh`: `PY` (python with pandas + pyarrow), `PYIMG` (python wit
 
 ## Dry run
 Both scripts take `--dry-run`: builds everything, blocks every HTTP call in-process, skips `~/.env` and credentials,
-writes no state, and writes `dry_run.json` (would_post, posts_at, text, media, alt text, reply target, guard status).
+writes no state (no tweet state, no no-data streak). A dry run that reaches the build step writes `dry_run.json`
+(would_post, posts_at, text, media, alt text, reply target, guard status; `result: skipped_all_closed` when every park is
+closed). Runs that stop before the build write no `dry_run.json`; they only print the log line: `skipped_no_data`,
+`skipped_stale` (forecast content, or wti.parquet not ending on D), "Already posted" (idempotency guard), and a bad
+`closures.csv` (exit 1).
 
 ```
 python3 operations/scripts/wti_predicted_tweet.py --dry-run --date 2026-10-28 --out /tmp/f28
