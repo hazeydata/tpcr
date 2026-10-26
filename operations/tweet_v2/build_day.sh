@@ -1,5 +1,5 @@
 #!/bin/bash
-# usage: build_day.sh DATE OUTDIR --history WTI_PARQUET (--predicted JSON [--observed JSON] | --csv PATH) [--park-hours CSV [--closed-marker COL=VAL]] [--forecast-only] [--png-only]
+# usage: build_day.sh DATE OUTDIR --history WTI_PARQUET (--predicted JSON [--observed JSON] | --csv PATH) [--park-hours CSV] [--closures CSV] [--forecast-only] [--png-only]
 # Builds the forecast post (F-DATE.png, F-DATE-390.png, F-DATE.mp4, F-DATE.alt.txt) and, if observed WTI is given,
 # the scorecard reply (R-DATE.png, R-DATE-390.png, R-DATE.mp4, R-DATE.alt.txt). Fails loudly on missing numbers.
 # Env: PY (python with pandas+pyarrow, default python3), PYIMG (python with Pillow for the end-frame check, default $PY), CHROME (default google-chrome), FFMPEG (default ffmpeg).
@@ -12,7 +12,7 @@ PNGONLY=0; ARGS=()
 while [ $# -gt 0 ]; do case $1 in
   --png-only) PNGONLY=1;;
   --forecast-only) ARGS+=("$1");;
-  --csv|--history|--predicted|--observed|--park-hours|--closed-marker) ARGS+=("$1" "$2"); shift;;
+  --csv|--history|--predicted|--observed|--park-hours|--closures) ARGS+=("$1" "$2"); shift;;
   *) echo "unknown arg $1" >&2; exit 2;; esac; shift; done
 mkdir -p "$OUT"; OUT=$(cd "$OUT" && pwd)
 "$PY" -c "import shutil,sys,tempfile; g=shutil.disk_usage(tempfile.gettempdir()).free/2**30; sys.exit(0 if g>=2 else 'low disk on tmp: %.1fG'%g)"

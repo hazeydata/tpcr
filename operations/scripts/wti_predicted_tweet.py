@@ -284,12 +284,21 @@ def main(argv=None):
                 print(f"ERROR: {key} not set", file=sys.stderr)
                 sys.exit(1)
 
+    if not tweet_v2.check_closures("predicted", reference_date, args.closures, print if dry else post_discord):
+        sys.exit(1)  # R3: bad or missing closures.csv fails the run before any post
+
     raw, content = load_content(reference_date, args.content_dir)
     if not content:
-        print("No ready content found \u2014 skipping tweet")
-        if not dry:
-            post_discord(":warning: **WTI Predicted Tweet** \u2014 No ready content found, tweet skipped")
-        return 1 if dry else None
+        # AC 5a (closed-row R2): missing data is a skip, not a failure -> exit 0; alert after 2 days in a row
+        tweet_v2.record_no_data("predicted", reference_date, state_file, post_discord if not dry else print, dry)
+        return 0
+    tweet_v2.clear_no_data("predicted", state_file, dry)
+    alert = print if dry else post_discord
+    stale = tweet_v2.forecast_staleness(raw, reference_date)
+    if stale:  # AC 16: old content never posts
+        tweet_v2.record_stale("predicted", reference_date, stale, alert)
+        return 0
+    tweet_v2.check_park_hours("predicted", reference_date, args.park_hours, alert)  # AC 2a
 
     # Idempotency guard (#468): skip if already posted for this reference_date
     if state_file.exists():
@@ -305,7 +314,7 @@ def main(argv=None):
         arts, build_error = {}, None
         try:
             history = tweet_v2.fetch_history(work, args.history)
-            arts = tweet_v2.build(reference_date, work, history, raw, park_hours=args.park_hours)
+            arts = tweet_v2.build(reference_date, work, history, raw, park_hours=args.park_hours, closures=args.closures)
         except Exception as e:  # noqa: BLE001 - any build failure means no card, so the bot stays silent
             build_error = str(e)
             print(f"WARNING: v2 card build failed \u2014 {build_error}", file=sys.stderr)

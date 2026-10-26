@@ -8,6 +8,8 @@ Writes OUTDIR/F-DATE.html, F-DATE.alt.txt and (if observed exists) R-DATE.html, 
 REAL numbers only: any missing forecast (or, for the reply, observed) value is a hard error. Never estimates."""
 import csv, json, sys, os, argparse, datetime as dt
 import pandas as pd
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import headline_copy as HC  # all fallback headline copy (closed-row R2)
 
 P = ["MK", "EP", "HS", "AK"]
 N = {"MK": "Magic Kingdom", "EP": "EPCOT", "HS": "Hollywood Studios", "AK": "Animal Kingdom"}
@@ -98,8 +100,8 @@ def pick_line(vals, S, status=None):
     word = lambda p: "busy" if vals[p] > S[p][1] else "quiet" if vals[p] < S[p][0] else "normal"
     o = [p for p in op if dist(S, p, vals[p]) > 0]
     if not o:
-        if len(op) == 1: return f"{N[op[0]]} normal"
-        return "All four parks normal" if len(op) == len(P) else "All open parks normal"
+        if len(op) == 1: return HC.ONE_PARK_NORMAL.format(park=N[op[0]])
+        return HC.ALL_FOUR_NORMAL if len(op) == len(P) else HC.ALL_OPEN_NORMAL
     top = max(dist(S, p, vals[p]) for p in o)
     t = [p for p in o if abs(dist(S, p, vals[p]) - top) < 1e-9]
     w = {p: word(p) for p in t}
@@ -126,7 +128,7 @@ def reply_headline(fc, ob, status=None):
     e = {p: gap(fc, ob, p) for p in Q}
     miss = sorted([p for p in Q if abs(e[p]) > ON_TARGET], key=lambda p: -abs(e[p]))
     on = len(Q) - len(miss)
-    if not miss: return "All four parks within 2 of forecast" if len(Q) == len(P) else "All open parks within 2 of forecast"
+    if not miss: return HC.ALL_FOUR_ON_TARGET if len(Q) == len(P) else HC.ALL_OPEN_ON_TARGET
     t = miss[0]; x = f"{abs(e[t]):.1f}"; lh = "low" if e[t] < 0 else "high"
     if on == 0:
         if all(e[p] < 0 for p in Q): return f"Every park came in low. {N[t]} by {x}"
@@ -208,15 +210,19 @@ if __name__ == "__main__":
     a = argparse.ArgumentParser(); a.add_argument("date"); a.add_argument("out")
     a.add_argument("--history", required=True); a.add_argument("--predicted"); a.add_argument("--observed"); a.add_argument("--csv")
     a.add_argument("--forecast-only", action="store_true")
-    a.add_argument("--park-hours", help="dimparkhours.csv: closed parks get a Closed row (TPCR-TWEET-V2-CLOSED-ROW-001)")
-    a.add_argument("--closed-marker", help="COLUMN=VALUE marking a closure on an official row (OQ-1; none known yet)")
+    a.add_argument("--park-hours", help="dimparkhours.csv: open/unknown only, never closure (AC 1d). Unset = non-closed parks open")
+    a.add_argument("--closures", help="closures.csv (park,date,source_url,note); default data/closures.csv. Only closure source (R3)")
     a = a.parse_args(); D = str(dt.date.fromisoformat(a.date)); os.makedirs(a.out, exist_ok=True)
     if bool(a.predicted) == bool(a.csv): die("give exactly one of --predicted (live Step 14 content) or --csv")
     status = {}
-    if a.park_hours:
-        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import park_status
-        mk = tuple(a.closed_marker.split("=", 1)) if a.closed_marker else park_status.CLOSED_MARKER
-        status = park_status.load_statuses(a.park_hours, P, D, mk); print(f"PARK STATUS {D}: {json.dumps(status)}")
+    import park_status  # closures.csv is the only closure source (R3); dimparkhours only gives open/unknown
+    try:
+        closures = park_status.load_closures(a.closures or park_status.DEFAULT_CLOSURES)
+    except park_status.ClosuresError as e:
+        die(str(e))
+    status = park_status.load_statuses(a.park_hours, P, D, closures)
+    if a.park_hours or any(v == "closed" for v in status.values()):
+        print(f"PARK STATUS {D}: {json.dumps(status)}")
     cl = {p for p in P if status.get(p) == "closed"}
     if len(cl) == len(P):
         open(f"{a.out}/skipped_all_closed", "w").write(D + "\n"); print(f"skipped_all_closed {D}"); sys.exit(0)

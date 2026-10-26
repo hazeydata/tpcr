@@ -52,6 +52,7 @@ web/figma_node.json
 
 # Data directories (but keep README files)
 data/**
+!data/closures.csv
 !data/README.md
 !data/.gitkeep
 

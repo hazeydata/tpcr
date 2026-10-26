@@ -28,6 +28,8 @@ CONTENT_DIR = "/home/wilma/hazeydata/pipeline/content"
 WTI_PARQUET = "/home/wilma/hazeydata/pipeline/wti/wti.parquet"
 TWITTER_METADATA_API = "https://upload.twitter.com/1.1/media/metadata/create.json"
 ALT_MAX = 1000
+# Closed-row R3: the hand-filled closures file, the only closure source. Runs outside a checkout set TPCR_CLOSURES.
+DEFAULT_CLOSURES = ROOT / "data" / "closures.csv"
 
 
 class DryRunWrite(RuntimeError):
@@ -43,7 +45,10 @@ def parse_args(kind, argv=None):
     ap.add_argument("--history", help="local wti.parquet instead of scp from wilma")
     ap.add_argument("--state-file", help="tweet_state.json to read (default: the live one)")
     ap.add_argument("--park-hours", default=os.environ.get("TPCR_PARK_HOURS"),
-                    help="dimparkhours.csv for Closed rows (default $TPCR_PARK_HOURS; unset = every park treated as open)")
+                    help="dimparkhours.csv for open/unknown (default $TPCR_PARK_HOURS; unset = non-closed parks open). Never closure")
+    ap.add_argument("--closures", default=os.environ.get("TPCR_CLOSURES"),
+                    help="hand-filled closures.csv, the only closure source (default $TPCR_CLOSURES, else data/closures.csv "
+                         "next to build_day.sh's repo). Missing or bad file = exit 1 + alert before any post")
     ap.add_argument("--out", help="build output dir (default: a temp dir)")
     return ap.parse_args(argv)
 
@@ -82,7 +87,7 @@ def fetch_history(work, local=None):
     return dst
 
 
-def build(D, out, history, predicted_json, observed_json=None, runner=subprocess.run, park_hours=None):
+def build(D, out, history, predicted_json, observed_json=None, runner=subprocess.run, park_hours=None, closures=None):
     """Run build_day.sh. Returns dict of artifact paths (keys F/R -> {mp4, png, alt}) for what was built,
     or {"skipped_all_closed": True} when every park is closed (closed-row R1: no post at all)."""
     out = Path(out)
@@ -98,8 +103,7 @@ def build(D, out, history, predicted_json, observed_json=None, runner=subprocess
         cmd += ["--forecast-only"]
     if park_hours:
         cmd += ["--park-hours", str(park_hours)]
-        if os.environ.get("TPCR_CLOSED_MARKER"):
-            cmd += ["--closed-marker", os.environ["TPCR_CLOSED_MARKER"]]
+    cmd += ["--closures", str(closures or DEFAULT_CLOSURES)]
     env = dict(os.environ)
     env.setdefault("PY", sys.executable)
     r = runner(cmd, capture_output=True, text=True, timeout=1500, env=env)
@@ -172,3 +176,137 @@ def new_workdir(out=None):
 def cleanup(tmp):
     if tmp:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+NO_DATA_ALERT_AFTER = 2  # closed-row R2 / AC 5a: alert once after this many consecutive skipped_no_data days
+
+
+def no_data_state_path(state_file):
+    """Streak state lives next to tweet_state.json, in its own file so the tweet state is never rewritten."""
+    return Path(state_file).parent / "no_data_streak.json"
+
+
+def record_no_data(kind, reference_date, state_file, alert, dry=False):
+    """AC 5a: log skipped_no_data and keep a per-kind streak of consecutive reference days.
+    Calls alert(msg) exactly once, when the streak reaches NO_DATA_ALERT_AFTER. Dry runs write no state.
+    Returns the streak length. The caller then exits 0."""
+    print(f"skipped_no_data kind={kind} ref={reference_date}: no ready content; nothing posted")
+    p = no_data_state_path(state_file)
+    try:
+        st = json.loads(p.read_text()) if p.exists() else {}
+    except (OSError, json.JSONDecodeError):
+        st = {}
+    cur = st.get(kind, {})
+    last = cur.get("last_skipped")
+    if last == reference_date:
+        streak = cur.get("streak", 1)  # same day re-run: no double count
+    elif last and date.fromisoformat(last) + timedelta(days=1) == date.fromisoformat(reference_date):
+        streak = cur.get("streak", 1) + 1
+    else:
+        streak = 1
+    alerted = cur.get("alerted", False) if last == reference_date or streak > 1 else False
+    if streak >= NO_DATA_ALERT_AFTER and not alerted:
+        alert(f":warning: **WTI {kind} tweet** \u2014 skipped_no_data {streak} days in a row (latest ref={reference_date})")
+        alerted = True
+    if not dry:
+        st[kind] = {"last_skipped": reference_date, "streak": streak, "alerted": alerted}
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(st, indent=2) + "\n")
+    return streak
+
+
+def clear_no_data(kind, state_file, dry=False):
+    """A day with data ends the streak."""
+    p = no_data_state_path(state_file)
+    if dry or not p.exists():
+        return
+    try:
+        st = json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError):
+        st = {}
+    if st.pop(kind, None) is not None:
+        p.write_text(json.dumps(st, indent=2) + "\n")
+
+
+def check_closures(kind, reference_date, path, alert):
+    """R3 AC 1b/1c: validate closures.csv before anything is built or posted. A missing file, unknown park,
+    bad date or non-https source_url -> alert + False (caller exits 1). Never ignored silently."""
+    sys.path.insert(0, str(BUILD_DAY.parent))
+    import park_status
+    try:
+        park_status.load_closures(path or DEFAULT_CLOSURES)
+        return True
+    except park_status.ClosuresError as e:
+        msg = f"closures_error kind={kind} ref={reference_date}: {e}; nothing posted"
+        print(msg, file=sys.stderr)
+        alert(f":x: **WTI {kind} tweet** \u2014 {msg}"[:1900])
+        return False
+
+
+# AC 16 (closed-row R4): freshness. 36h is a placeholder (OQ-6, chief or Fred).
+FORECAST_MAX_AGE_H = 36
+ET = "America/New_York"
+
+
+def now():
+    """Run time, tz-aware. Patched in tests."""
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc)
+
+
+def forecast_staleness(raw, D, at=None):
+    """None if predicted content is fresh, else the reason. Fresh = generated_at within FORECAST_MAX_AGE_H of the run
+    and its ET date on or after D - 1. Missing or unparseable generated_at counts as stale (fail safe)."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    at = at or now()
+    try:
+        g = datetime.fromisoformat(str(json.loads(raw)["generated_at"]).replace("Z", "+00:00"))
+        if g.tzinfo is None:
+            raise ValueError("generated_at has no timezone")
+    except (KeyError, ValueError, TypeError, json.JSONDecodeError) as e:
+        return f"generated_at missing or unreadable ({e})"
+    age_h = (at - g).total_seconds() / 3600
+    if age_h > FORECAST_MAX_AGE_H:
+        return f"generated_at {g.isoformat()} is {age_h:.1f}h old (max {FORECAST_MAX_AGE_H}h)"
+    if g.astimezone(ZoneInfo(ET)).date() < date.fromisoformat(D) - timedelta(days=1):
+        return f"generated_at {g.isoformat()} is before {D} minus 1 day (ET)"
+    return None
+
+
+def parquet_last_date(path):
+    import pandas as pd
+    h = pd.read_parquet(path, columns=["park_date"])
+    return None if h.empty else pd.to_datetime(h.park_date).max().date().isoformat()
+
+
+def observed_staleness(history, D):
+    """None if wti.parquet's last date equals D, else the reason."""
+    try:
+        last = parquet_last_date(history)
+    except Exception as e:  # noqa: BLE001 - unreadable parquet is stale data, not a post
+        return f"wti.parquet unreadable ({e})"
+    return None if last == D else f"wti.parquet last date {last} != target {D}"
+
+
+def record_stale(kind, reference_date, why, alert):
+    """AC 16: skipped_stale -> log + one alert for this run; caller exits 0."""
+    msg = f"skipped_stale kind={kind} ref={reference_date}: {why}; nothing posted"
+    print(msg)
+    alert(f":warning: **WTI {kind} tweet** \u2014 {msg}"[:1900])
+
+
+def check_park_hours(kind, reference_date, path, alert):
+    """AC 2a: unreadable hours file -> every park unknown (silent on the card, never Closed) plus one
+    park_hours_unreadable alert per run. Returns True if readable (or not configured)."""
+    if not path:
+        return True
+    try:
+        with open(path, newline="") as f:
+            f.read(1)
+        return True
+    except (OSError, UnicodeDecodeError) as e:
+        msg = f"park_hours_unreadable kind={kind} ref={reference_date}: {path}: {e}; every park unknown"
+        print(msg, file=sys.stderr)
+        alert(f":warning: **WTI {kind} tweet** \u2014 {msg}"[:1900])
+        return False

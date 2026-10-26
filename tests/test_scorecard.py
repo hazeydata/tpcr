@@ -453,6 +453,7 @@ class PhaseG(Env):
                                  load_content=mock.Mock(return_value=(json.dumps(FORECAST), FORECAST)),
                                  upload_media=mock.Mock(return_value="M1"), post_tweet=post), \
                 mock.patch.object(wpt.tweet_v2, "fetch_history", mock.Mock(return_value="h.parquet")), \
+                mock.patch.object(wpt.tweet_v2, "forecast_staleness", mock.Mock(return_value=None)), \
                 mock.patch.object(wpt.tweet_v2, "post_text", mock.Mock(return_value=MAIN_FORECAST_TEXT)), \
                 mock.patch.object(wpt.tweet_v2, "build", mock.Mock(return_value={"F": {"mp4": "F.mp4", "png": "F.png", "alt": "alt"}})), \
                 mock.patch.dict(os.environ, creds), mock.patch.object(tweet_note, "date", type("D", (date,), {"today": classmethod(lambda c: AS_OF)})), \

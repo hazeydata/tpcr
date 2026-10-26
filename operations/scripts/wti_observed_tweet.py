@@ -275,12 +275,17 @@ def main(argv=None):
                 print(f"ERROR: {key} not set", file=sys.stderr)
                 sys.exit(1)
 
+    if not tweet_v2.check_closures("observed", reference_date, args.closures, print if dry else post_discord):
+        sys.exit(1)  # R3: bad or missing closures.csv fails the run before any post
+
     raw, content = load_content(reference_date, args.content_dir)
     if not content:
-        print("No ready observed content found \u2014 skipping tweet")
-        if not dry:
-            post_discord(":warning: **WTI Observed Tweet** \u2014 No ready content found, tweet skipped")
-        return 1 if dry else None
+        # AC 5a (closed-row R2): missing data is a skip, not a failure -> exit 0; alert after 2 days in a row
+        tweet_v2.record_no_data("observed", reference_date, state_file, post_discord if not dry else print, dry)
+        return 0
+    tweet_v2.clear_no_data("observed", state_file, dry)
+    alert = print if dry else post_discord
+    tweet_v2.check_park_hours("observed", reference_date, args.park_hours, alert)  # AC 2a
 
     # Idempotency guard (#468): skip if already posted for this reference_date
     if state_file.exists():
@@ -304,7 +309,11 @@ def main(argv=None):
             if not pred_raw:
                 raise RuntimeError(f"predicted_{reference_date}.json not found (needed for the forecast side of the scorecard)")
             history = tweet_v2.fetch_history(work, args.history)
-            arts = tweet_v2.build(reference_date, work, history, pred_raw, raw, park_hours=args.park_hours)
+            stale = tweet_v2.observed_staleness(history, reference_date)
+            if stale:  # AC 16: the reply posts only when wti.parquet ends on D
+                tweet_v2.record_stale("observed", reference_date, stale, alert)
+                return 0
+            arts = tweet_v2.build(reference_date, work, history, pred_raw, raw, park_hours=args.park_hours, closures=args.closures)
             if "R" not in arts and not arts.get("skipped_all_closed"):
                 raise RuntimeError("build produced no R (scorecard) MP4")
         except Exception as e:  # noqa: BLE001 - any build failure means no card, so the bot stays silent

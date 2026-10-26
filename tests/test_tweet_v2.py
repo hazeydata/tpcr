@@ -24,13 +24,19 @@ import tweet_v2  # noqa: E402
 import wti_observed_tweet as wot  # noqa: E402
 import wti_predicted_tweet as wpt  # noqa: E402
 
+REAL_PARQUET_LAST_DATE = tweet_v2.parquet_last_date
+
 GFIX = Path(__file__).resolve().parent / "fixtures" / "tweet_guard"
 PARKS = [("MK", "Magic Kingdom"), ("EP", "EPCOT"), ("HS", "Hollywood Studios"), ("AK", "Animal Kingdom")]
 D = "2026-10-28"
 
 
-def content(d, vals, status="ready"):
-    return json.dumps({"status": status, "target_date": d,
+GEN = "2026-10-27T10:00:00-04:00"  # content generated_at for D (fresh at NOW)
+NOW = "2026-10-27T16:00:00-04:00"  # 4 PM ET on D-1, the forecast run
+
+
+def content(d, vals, status="ready", generated_at=GEN):
+    return json.dumps({"status": status, "target_date": d, "generated_at": generated_at,
                        "parks": [{"park_code": c, "park_name": n, "wti": v} for (c, n), v in zip(PARKS, vals)]})
 
 
@@ -52,6 +58,11 @@ class Base(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="tweetv2-test-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.addCleanup(keep_requests())
+        from datetime import datetime
+        p1 = mock.patch.object(tweet_v2, "now", return_value=datetime.fromisoformat(NOW))
+        p2 = mock.patch.object(tweet_v2, "parquet_last_date", return_value=D)  # fake history "h" ends on D
+        p1.start(); p2.start()
+        self.addCleanup(p1.stop); self.addCleanup(p2.stop)
         self.cdir = self.tmp / "content"
         self.cdir.mkdir()
         (self.cdir / f"predicted_{D}.json").write_text(content(D, [20.1, 21.0, 26.0, 33.3]))
@@ -59,7 +70,7 @@ class Base(unittest.TestCase):
         self.state = self.tmp / "tweet_state.json"
         self.state.write_text(json.dumps({"predicted": {D: {"tweet_id": "1850000000000000001"}}}))
 
-    def fake_build(self, d, out, history, pred, obs=None, park_hours=None):
+    def fake_build(self, d, out, history, pred, obs=None, park_hours=None, closures=None):
         out = Path(out)
         arts = {}
         metas = {"F": {"date": d, "headline": "Animal Kingdom busy", "named": ["Animal Kingdom"], "dirs": ["busy"],
@@ -266,6 +277,184 @@ class LivePosting(Base):
             self.assertIn("skipped_all_closed", out, mod.__name__)
         post.assert_not_called()
 
+    def test_skipped_no_data_exits_0_and_alerts_after_two_days(self):
+        """AC 5a: missing content -> exit 0, log skipped_no_data; one alert on the 2nd consecutive day (state persisted)."""
+        from datetime import timedelta
+        post = mock.Mock(side_effect=AssertionError("posted on a no-data day"))
+        d0 = date.fromisoformat(D)
+        for mod, kind in ((wpt, "predicted"), (wot, "observed")):
+            for f in self.cdir.iterdir():
+                f.unlink()
+            sent = []
+            for i in range(3):
+                day = (d0 + timedelta(days=i)).isoformat()
+                with mock.patch.object(mod, "post_discord", side_effect=sent.append):
+                    env = {k: "x" for k in ("TWITTER_CONSUMER_KEY", "TWITTER_CONSUMER_SECRET",
+                                            "TWITTER_ACCESS_TOKEN", "TWITTER_ACCESS_TOKEN_SECRET")}
+                    with mock.patch.object(mod, "load_env"), mock.patch.object(mod, "enforce"), \
+                         mock.patch.dict("os.environ", env), mock.patch.object(requests, "post", post):
+                        rc, out, _ = self.run_main(mod, ["--date", day, "--content-dir", str(self.cdir),
+                                                         "--history", "h", "--state-file", str(self.state)])
+                self.assertEqual(rc, 0, kind)
+                self.assertIn("skipped_no_data", out)
+                self.assertEqual(len(sent), 0 if i == 0 else 1, (kind, i))  # one alert, on day 2 only
+            st = json.loads(tweet_v2.no_data_state_path(self.state).read_text())
+            self.assertEqual(st[kind]["streak"], 3)
+            # a gap resets the streak: no new alert on the next isolated skip
+            self.assertEqual(tweet_v2.record_no_data(kind, (d0 + timedelta(days=10)).isoformat(), self.state,
+                                                     sent.append), 1)
+            self.assertEqual(len(sent), 1)
+            tweet_v2.clear_no_data(kind, self.state)
+            self.assertNotIn(kind, json.loads(tweet_v2.no_data_state_path(self.state).read_text()))
+        post.assert_not_called()
+
+    def test_stale_forecast_and_observed_skip_exit_0_with_alert(self):
+        """AC 16: Sep 4 content for today's target and a parquet ending Sep 4 both skip (skipped_stale, exit 0, alert)."""
+        post = mock.Mock(side_effect=AssertionError("posted stale data"))
+        build = mock.Mock(side_effect=AssertionError("built stale data"))
+        (self.cdir / f"predicted_{D}.json").write_text(content(D, [20.1, 21.0, 26.0, 33.3],
+                                                                generated_at="2026-09-04T06:00:00-04:00"))
+        self.state.write_text("{}")
+        sent = []
+        with mock.patch.object(wpt, "post_discord", side_effect=sent.append):
+            rc, out = self.live_alerts(wpt, post, build)
+        self.assertEqual(rc, 0); self.assertIn("skipped_stale", out); self.assertEqual(len(sent), 1)
+        self.assertIn("skipped_stale", sent[0])
+        (self.cdir / f"predicted_{D}.json").write_text(content(D, [20.1, 21.0, 26.0, 33.3]))
+        self.state.write_text(json.dumps({"predicted": {D: {"tweet_id": "P1"}}}))
+        sent.clear()
+        with mock.patch.object(tweet_v2, "parquet_last_date", return_value="2026-09-04"), \
+             mock.patch.object(wot, "post_discord", side_effect=sent.append):
+            rc, out = self.live_alerts(wot, post, build)
+        self.assertEqual(rc, 0); self.assertIn("skipped_stale", out); self.assertEqual(len(sent), 1)
+        build.assert_not_called(); post.assert_not_called()
+
+    def test_forecast_staleness_rules(self):
+        from datetime import datetime
+        at = datetime.fromisoformat(NOW)
+        ok = content(D, [1, 2, 3, 4])
+        self.assertIsNone(tweet_v2.forecast_staleness(ok, D, at))
+        self.assertIn("old", tweet_v2.forecast_staleness(content(D, [1, 2, 3, 4], generated_at="2026-10-26T03:00:00-04:00"), D, at))
+        self.assertIn("minus 1 day", tweet_v2.forecast_staleness(content(D, [1, 2, 3, 4], generated_at="2026-10-26T23:00:00-04:00"), D, at))
+        self.assertIn("missing", tweet_v2.forecast_staleness(json.dumps({"target_date": D}), D, at))
+
+    def test_observed_staleness_reads_parquet_last_date(self):
+        try:
+            import pandas as pd
+            pd.DataFrame({"park_date": ["2026-09-03", "2026-09-04"]}).to_parquet(self.tmp / "w.parquet")
+        except ImportError:
+            self.skipTest("pandas/pyarrow not installed")
+        with mock.patch.object(tweet_v2, "parquet_last_date", REAL_PARQUET_LAST_DATE):
+            self.assertEqual(tweet_v2.parquet_last_date(self.tmp / "w.parquet"), "2026-09-04")
+            self.assertIn("2026-09-04 != target", tweet_v2.observed_staleness(self.tmp / "w.parquet", D))
+            self.assertIsNone(tweet_v2.observed_staleness(self.tmp / "w.parquet", "2026-09-04"))
+            self.assertIn("unreadable", tweet_v2.observed_staleness(self.tmp / "missing.parquet", D))
+
+    def test_park_hours_unreadable_alerts_once(self):
+        """AC 2a: unreadable hours -> one park_hours_unreadable alert per run; nothing shows Closed."""
+        sent = []
+        self.state.write_text("{}")
+        with mock.patch.object(wpt, "post_discord", side_effect=sent.append):
+            self.live_alerts(wpt, mock.Mock(side_effect=AssertionError("no post expected")),
+                             mock.Mock(side_effect=RuntimeError("stop after checks")),
+                             extra=["--park-hours", str(self.tmp / "no-such-hours.csv")])
+        self.assertEqual(sum("park_hours_unreadable" in m for m in sent), 1)
+        import park_status as ps
+        self.assertEqual(set(ps.load_statuses(str(self.tmp / "no-such-hours.csv"), ["MK", "EP"], D).values()), {"unknown"})
+
+    def live_alerts(self, mod, post, build, extra=()):
+        """Live run with post_discord left to the caller's patch."""
+        env = {k: "x" for k in ("TWITTER_CONSUMER_KEY", "TWITTER_CONSUMER_SECRET", "TWITTER_ACCESS_TOKEN", "TWITTER_ACCESS_TOKEN_SECRET")}
+        with mock.patch.object(mod, "load_env"), mock.patch.object(mod, "enforce"), \
+             mock.patch.dict("os.environ", env), mock.patch.object(requests, "post", post), \
+             mock.patch.object(tweet_v2, "build", build):
+            try:
+                rc, out, _ = self.run_main(mod, ["--date", D, "--content-dir", str(self.cdir), "--history", "h",
+                                                 "--state-file", str(self.state), *extra])
+            except SystemExit as e:
+                return e.code, ""
+        return rc, out
+
+    def test_api_error_still_exits_1(self):
+        """AC 5a: crashes and API errors are not skips; exit 1 is unchanged."""
+        def post(url, **kw):
+            return self.resp(500, {"errors": ["down"]})
+        self.state.write_text("{}")
+        rc, _, _ = self.live(wpt, post)
+        self.assertEqual(rc, 1)
+
+
+class Closures(unittest.TestCase):
+    """Closed-row R3 (AC 1b-1d): data/closures.csv is the only closure source, and it is strict."""
+    H = "park,date,source_url,note\n"
+
+    def setUp(self):
+        import park_status
+        self.ps = park_status
+        self.tmp = Path(tempfile.mkdtemp(prefix="tweetv2-closures-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def f(self, body):
+        p = self.tmp / "closures.csv"
+        p.write_text(self.H + body)
+        return p
+
+    def test_committed_file_is_header_only(self):
+        self.assertEqual(self.ps.DEFAULT_CLOSURES.read_text(), self.H)
+        self.assertEqual(self.ps.load_closures(self.ps.DEFAULT_CLOSURES), set())
+
+    def test_empty_file_gives_no_closed_parks(self):
+        cl = self.ps.load_closures(self.f(""))
+        self.assertEqual(cl, set())
+        self.assertNotIn("closed", self.ps.load_statuses(None, ["MK", "EP", "HS", "AK"], D, cl).values())
+
+    def test_one_row_closes_that_park_that_date_only(self):
+        cl = self.ps.load_closures(self.f(f"HS,{D},https://disneyworld.disney.go.com/alerts/,hurricane\n"))
+        self.assertEqual(self.ps.load_statuses(None, ["MK", "EP", "HS", "AK"], D, cl),
+                         {"MK": "open", "EP": "open", "HS": "closed", "AK": "open"})
+        self.assertEqual(self.ps.park_status(None, "HS", "2026-10-29", cl), "open")
+
+    def test_bad_url_unknown_park_bad_date_and_missing_file_are_errors(self):
+        bad = [f"HS,{D},http://example.com/x,plain http\n", f"HS,{D},,no url\n", f"HS,{D},not a url,\n",
+               f"XX,{D},https://example.com/x,unknown park\n", "HS,2026-13-01,https://example.com/x,bad date\n",
+               "HS,10/28/2026,https://example.com/x,bad date\n"]
+        for body in bad:
+            with self.assertRaises(self.ps.ClosuresError, msg=body):
+                self.ps.load_closures(self.f(body))
+        with self.assertRaises(self.ps.ClosuresError):
+            self.ps.load_closures(self.tmp / "missing.csv")
+
+    def test_tokyo_date_edge(self):
+        from datetime import datetime, timezone
+        cl = self.ps.load_closures(self.f("TDL,2026-10-28,https://www.tokyodisneyresort.jp/,typhoon\n"
+                                          "MK,2026-10-28,https://disneyworld.disney.go.com/,hurricane\n"))
+        at = datetime(2026, 10, 28, 3, 0, tzinfo=timezone.utc)  # 11 PM ET Oct 27 = noon Oct 28 in Tokyo
+        self.assertTrue(self.ps.is_closed(cl, "TDL", at))
+        self.assertFalse(self.ps.is_closed(cl, "MK", at))  # still Oct 27 at MK
+
+    def test_scripts_exit_1_with_alert_before_any_post(self):
+        """AC 1b/1c end to end: bad or missing closures file -> exit 1, alert sent, nothing built or posted."""
+        for body in (f"HS,{D},http://bad,x\n", None):
+            path = self.f(body) if body else self.tmp / "gone.csv"
+            for mod in (wpt, wot):
+                sent, build = [], mock.Mock(side_effect=AssertionError("built despite bad closures"))
+                post = mock.Mock(side_effect=AssertionError("posted despite bad closures"))
+                env = {k: "x" for k in ("TWITTER_CONSUMER_KEY", "TWITTER_CONSUMER_SECRET",
+                                        "TWITTER_ACCESS_TOKEN", "TWITTER_ACCESS_TOKEN_SECRET")}
+                with mock.patch.object(mod, "load_env"), mock.patch.object(mod, "enforce"), \
+                     mock.patch.dict("os.environ", env), mock.patch.object(requests, "post", post), \
+                     mock.patch.object(tweet_v2, "build", build), \
+                     mock.patch.object(mod, "post_discord", side_effect=sent.append), \
+                     redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as cm:
+                        mod.main(["--date", D, "--content-dir", str(self.tmp), "--history", "h",
+                                  "--state-file", str(self.tmp / "s.json"), "--closures", str(path)])
+                self.assertEqual(cm.exception.code, 1)
+                self.assertEqual(len(sent), 1)
+                self.assertIn("closures_error", sent[0])
+                build.assert_not_called()
+                post.assert_not_called()
+
 
 class Cards(unittest.TestCase):
     @classmethod
@@ -325,6 +514,43 @@ class Cards(unittest.TestCase):
         self.assertEqual(html.count(">Closed<"), 1)
         self.assertIn("Hollywood Studios closed", alt)
 
+    def test_tie_next_to_closed_park_names_both_open_parks(self):
+        """A tie between two open parks with a closed park at the same value: name both open parks, MK EP HS AK order."""
+        fc = {"MK": 5.0, "EP": 15.0, "HS": 5.0, "AK": 5.0}
+        st = {"MK": "open", "EP": "open", "HS": "closed", "AK": "open"}
+        self.assertEqual(self.c.forecast_headline(fc, self.S, st), "Magic Kingdom and Animal Kingdom quiet")
+        st = {"MK": "closed", "EP": "open", "HS": "open", "AK": "open"}
+        fc = {"MK": 25.0, "EP": 25.0, "HS": 15.0, "AK": 25.0}
+        self.assertEqual(self.c.forecast_headline(fc, self.S, st), "EPCOT and Animal Kingdom busy")
+
+    def test_fallback_headlines_come_from_one_constants_module(self):
+        import headline_copy as hc
+        self.assertEqual(hc.ALL_OPEN_NORMAL, "All open parks normal")
+        self.assertEqual(hc.ONE_PARK_NORMAL.format(park="EPCOT"), "EPCOT normal")
+        self.assertEqual(hc.ALL_OPEN_ON_TARGET, "All open parks within 2 of forecast")
+        st = {"MK": "closed", "EP": "open", "HS": "open", "AK": "open"}
+        self.assertEqual(self.c.forecast_headline({p: 15.0 for p in self.c.P}, self.S, st), hc.ALL_OPEN_NORMAL)
+        self.assertEqual(self.c.forecast_headline({"EP": 15.0}, self.S, {"EP": "open", "MK": "closed",
+                         "HS": "closed", "AK": "closed"}), "EPCOT normal")
+        fc = {p: 15.0 for p in self.c.P}
+        self.assertEqual(self.c.reply_headline(fc, {**fc, "MK": 16.0}, {"HS": "closed"}), hc.ALL_OPEN_ON_TARGET)
+        self.assertEqual(self.c.reply_headline(fc, fc), hc.ALL_FOUR_ON_TARGET)
+
+    def test_missing_official_row_is_unknown_never_closed(self):
+        """R2: no official row (absent, or only an unofficial row) -> unknown, even with a closure marker set."""
+        import park_status as ps
+        tmp = Path(tempfile.mkdtemp(prefix="tweetv2-test-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        f = tmp / "dimparkhours.csv"
+        f.write_text("park,date,opening_time,closing_time,is_official,flag\n"
+                     "MK,2026-10-28,2026-10-28T09:00:00-04:00,2026-10-28T22:00:00-04:00,True,\n"
+                     "EP,2026-10-28,,,False,CLOSED\n"
+                     "HS,2026-10-27,2026-10-27T09:00:00-04:00,2026-10-27T21:00:00-04:00,True,\n")
+        for cl in (frozenset(), ps.load_closures(ps.DEFAULT_CLOSURES)):  # committed file is header-only
+            st = ps.load_statuses(str(f), ["MK", "EP", "HS", "AK"], D, cl)
+            self.assertEqual(st, {"MK": "open", "EP": "unknown", "HS": "unknown", "AK": "unknown"})
+            self.assertNotIn("closed", st.values())
+
     def test_park_status_reads_official_rows_only(self):
         import park_status as ps
         tmp = Path(tempfile.mkdtemp(prefix="tweetv2-test-"))
@@ -335,10 +561,11 @@ class Cards(unittest.TestCase):
                      "EP,2026-10-28,,,False,\n"
                      "HS,2026-10-28,2026-10-28T09:00:00-04:00,2026-10-28T21:00:00-04:00,True,CLOSED\n"
                      "AK,2026-10-28,2026-10-28T09:00:00-04:00,2026-10-28T17:00:00-04:00,False,CLOSED\n")
-        mk = ("flag", "CLOSED")
-        self.assertEqual(ps.load_statuses(str(f), ["MK", "EP", "HS", "AK"], D, mk),
-                         {"MK": "open", "EP": "unknown", "HS": "closed", "AK": "unknown"})
-        self.assertEqual(ps.park_status(str(f), "HS", D), "open")  # no marker known yet (OQ-1): never closed
+        # AC 1d: dimparkhours never marks closure, whatever its columns say; only closures.csv does
+        self.assertEqual(ps.load_statuses(str(f), ["MK", "EP", "HS", "AK"], D),
+                         {"MK": "open", "EP": "unknown", "HS": "open", "AK": "unknown"})
+        self.assertEqual(ps.load_statuses(str(f), ["MK", "EP", "HS", "AK"], D, {("HS", D), ("EP", D)}),
+                         {"MK": "open", "EP": "closed", "HS": "closed", "AK": "unknown"})
         self.assertEqual(ps.park_status(str(tmp / "missing.csv"), "MK", D), "unknown")
         from datetime import datetime, timezone
         at = datetime(2026, 10, 28, 3, 0, tzinfo=timezone.utc)  # 11 PM ET Oct 27 = noon Oct 28 in Tokyo
