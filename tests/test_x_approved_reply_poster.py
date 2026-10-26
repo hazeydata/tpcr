@@ -136,6 +136,12 @@ class P2(Base):
         self.put(entry()); c = Mock(tweet=QUOTES_FRED); r = self.go(c)
         self.assertEqual(r[0].outcome, "posted"); self.assertIn("post_reply", c.calls)
 
+    def test_reply_to_fred_post_is_not_quote(self):  # OQ-1 R2: thread position doesn't count
+        tw = {"data": {"id": "4", "author_id": "9", "referenced_tweets": [{"type": "replied_to", "id": "60"}]},
+              "includes": {"tweets": [{"id": "60", "author_id": "42"}], "users": [{"id": "42", "username": "HazeyDataFred"}]}}
+        self.put(entry()); c = Mock(tweet=tw); r = self.go(c)
+        self.assertEqual(r[0].outcome, "manual_not_mentioned"); self.assertEqual(c.posts(), 0)
+
     def test_get_failure_stops_run_no_post(self):
         self.put(entry("a")); self.put(entry("b", rid="5"))
         c = Mock(fail={"get_tweet": 503}); r = self.go(c)
