@@ -73,6 +73,7 @@ class Base(unittest.TestCase):
         self.pub = Path(self.tmp.name) / "approval_pub.pem"
         self.pub.write_bytes(self.vk.public_bytes(serialization.Encoding.PEM,
                                                   serialization.PublicFormat.SubjectPublicKeyInfo))
+        os.chmod(self.pub, 0o644)  # AC 3e: not group/world-writable regardless of the caller umask
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -493,6 +494,108 @@ class Signed(Base):
             P.load_verify_key(str(inq), self.q)
         self.assertIsNotNone(P.load_verify_key(str(self.pub), self.q))
 
+    # --- spec R6 / AC 3e: verify key path refusals (refused_verify_key_path, exit 1)
+    def _main(self, key, offline=True):
+        argv = ["--queue-dir", str(self.q), "--ledger", str(self.ledger)] + (["--offline"] if offline else [])
+        if key is not None:
+            argv += ["--verify-key", str(key)]
+        with mock.patch("sys.stdout", io.StringIO()):
+            return P.main(argv)
+
+    def _key_path_refused(self, key, why=""):
+        self.put(entry())
+        with self.assertRaises(SystemExit) as cm:
+            self._main(key)
+        self.assertEqual(cm.exception.code if isinstance(cm.exception.code, int) else 1, 1)
+        self.assertIn("refused_verify_key_path", str(cm.exception.code))
+        self.assertIn(why, str(cm.exception.code))
+        self.assertFalse(self.ledger.exists())
+
+    def test_symlink_in_queue_to_outside_key_refused(self):  # D2: resolved path is outside, link is inside
+        link = self.q / "pub.pem"; os.symlink(self.pub, link)
+        self._key_path_refused(link, "symlink")
+
+    def test_symlink_outside_queue_refused(self):  # AC 3e: any symlink
+        link = Path(self.tmp.name) / "pub_link.pem"; os.symlink(self.pub, link)
+        self._key_path_refused(link, "symlink")
+
+    def test_symlink_outside_pointing_into_queue_refused(self):
+        inq = self.q / "pub.pem"; inq.write_bytes(self.pub.read_bytes()); os.chmod(inq, 0o644)
+        link = Path(self.tmp.name) / "pub_link.pem"; os.symlink(inq, link)
+        self._key_path_refused(link, "symlink")
+
+    def test_key_through_symlinked_queue_dir_refused(self):  # unresolved queue path vs resolved key path
+        real = Path(self.tmp.name) / "realq"; real.mkdir(mode=0o700)
+        k = real / "pub.pem"; k.write_bytes(self.pub.read_bytes()); os.chmod(k, 0o644)
+        self.q.rmdir(); os.symlink(real, self.q)
+        self._key_path_refused(self.q / "pub.pem", "queue dir")
+
+    def test_key_in_queue_dir_refused_via_main(self):
+        inq = self.q / "pub.pem"; inq.write_bytes(self.pub.read_bytes()); os.chmod(inq, 0o644)
+        self._key_path_refused(inq, "queue dir")
+
+    def test_group_writable_key_refused(self):
+        os.chmod(self.pub, 0o664); self._key_path_refused(self.pub, "group/world-writable")
+
+    def test_world_writable_key_refused(self):
+        os.chmod(self.pub, 0o646); self._key_path_refused(self.pub, "group/world-writable")
+
+    def test_non_regular_key_refused(self):
+        d = Path(self.tmp.name) / "keydir"; d.mkdir(mode=0o755)
+        self._key_path_refused(d, "not a regular file")
+
+    def test_fifo_key_refused(self):
+        f = Path(self.tmp.name) / "keyfifo"; os.mkfifo(f, 0o644)
+        self._key_path_refused(f, "not a regular file")
+
+    def test_key_under_symlinked_subdir_of_queue_refused(self):  # unresolved path inside queue, resolved outside
+        out = Path(self.tmp.name) / "outside"; out.mkdir(mode=0o755)
+        k = out / "pub.pem"; k.write_bytes(self.pub.read_bytes()); os.chmod(k, 0o644)
+        os.symlink(out, self.q / "sub")
+        self._key_path_refused(self.q / "sub" / "pub.pem", "queue dir")
+
+    def test_plain_key_outside_queue_accepted(self):
+        self.put(entry()); self.assertEqual(self._main(self.pub), 0)
+
+    # --- D1: queue-dir mode check runs before the verify key loads
+    def test_queue_mode_checked_before_key_loads(self):
+        os.chmod(self.q, 0o777); self.put(entry())
+        with mock.patch.object(P, "load_verify_key", side_effect=AssertionError("key loaded first")) as lk:
+            with self.assertRaises(SystemExit) as cm:
+                self._main(self.pub)
+        self.assertIn("group/world-writable", str(cm.exception.code)); lk.assert_not_called()
+        os.chmod(self.q, 0o700)
+
+    # --- S16: missing key refused before any X client is built
+    def test_missing_key_builds_no_client(self):
+        self.put(entry())
+        with mock.patch.dict(os.environ, {}, clear=False), mock.patch.object(P, "XClient") as xc:
+            os.environ.pop("X_REPLY_VERIFY_KEY", None)
+            with self.assertRaises(SystemExit):
+                self._main(None, offline=False)
+        xc.assert_not_called(); self.assertFalse(self.ledger.exists())
+
+    # --- spec R6 / AC 3d: hash mismatch posts nothing and exits 1
+    def test_hash_mismatch_exits_1_posts_nothing(self):
+        e = entry(); e["text"] = e["text"] + "!"; self.put(e); self.put(entry("b", rid="5"))
+        c = Mock()
+        with mock.patch.object(P, "XClient", return_value=c):
+            rc = self._main(self.pub, offline=False)
+        self.assertEqual(rc, 1)
+        out = {l["entry_id"]: l["outcome"] for l in self.lines()}
+        self.assertEqual(out, {"e1": "rejected_hash_mismatch", "b": "dry_run"})
+        self.assertEqual(c.posts(), 0); self.assertNotIn("post_reply", c.calls)
+
+    def test_hash_mismatch_apply_posts_nothing(self):
+        e = entry(); e["approval"]["text_sha256"] = "0" * 64; self.put(e)
+        c = Mock()
+        with mock.patch.object(P, "XClient", return_value=c):
+            with mock.patch("sys.stdout", io.StringIO()):
+                rc = P.main(["--apply", "--queue-dir", str(self.q), "--ledger", str(self.ledger),
+                             "--verify-key", str(self.pub)])
+        self.assertEqual(rc, 1); self.assertEqual(c.calls, [])
+        self.assertEqual(self.lines()[0]["outcome"], "rejected_hash_mismatch")
+
     def test_poster_source_has_no_signing_capability(self):
         src = Path(P.__file__).read_text()
         for bad in ("Ed25519PrivateKey", ".sign(", "private_bytes", "generate("):
@@ -509,7 +612,11 @@ class SignHelper(Base):
         return priv, pub
 
     def test_keygen_sign_verify_roundtrip(self):
-        priv, pub = self._keygen()
+        old = os.umask(0o022)  # H06: a 0644 keygen must show as 0644 here, whatever the caller's umask
+        try:
+            priv, pub = self._keygen()
+        finally:
+            os.umask(old)
         self.assertEqual(oct(os.stat(priv).st_mode & 0o777), "0o600")
         self.put(entry(), sign=False)
         with mock.patch("sys.stdout", io.StringIO()):

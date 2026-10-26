@@ -12,6 +12,7 @@ latest ledger line.
 Signed approvals (spec R5 / AC 3c): every approval carries an Ed25519 signature made by
 the approval flow (x_reply_sign_approval.py). The poster holds only the PUBLIC key and
 refuses an unsigned or badly signed approval (ledger ``refused_unsigned``, exit 1).
+A hash mismatch is ``rejected_hash_mismatch``, 0 calls, exit 1 (spec R6 / AC 3d).
 """
 
 import argparse
@@ -174,18 +175,38 @@ def approval_message(entry, queue_dir):
     return json.dumps(msg, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
+def _refuse_key_path(why):
+    raise SystemExit(f"refusing to run: refused_verify_key_path: {why} (AC 3e)")
+
+
 def load_verify_key(path, queue_dir=None):
-    """Load the Ed25519 PUBLIC key. Refuses a private key, a non-Ed25519 key, or a key file inside
-    the queue dir (whoever can write the queue must not be able to swap the verifier)."""
+    """Load the Ed25519 PUBLIC key. Refuses a private key, a non-Ed25519 key, and (spec R6 / AC 3e,
+    status refused_verify_key_path, exit 1) a key path that is a symlink, is not a regular file, is
+    group/world-writable, or sits inside the queue dir by its unresolved or resolved location
+    (whoever can write the queue must not be able to swap the verifier)."""
     from cryptography.hazmat.primitives import serialization
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
     if not path:
         raise SystemExit("refusing to run: no approval verify key (--verify-key or X_REPLY_VERIFY_KEY) (AC 3c)")
-    p = Path(path).resolve()
-    if queue_dir is not None and Path(queue_dir).resolve() in p.parents:
-        raise SystemExit("refusing to run: verify key must not live in the queue dir (AC 3c)")
+    raw = Path(os.path.abspath(path))  # unresolved location: symlinks NOT followed
     try:
-        data = p.read_bytes()
+        st = os.lstat(raw)
+    except OSError as e:
+        raise SystemExit(f"refusing to run: cannot read verify key ({e.__class__.__name__}) (AC 3c)")
+    if stat.S_ISLNK(st.st_mode):
+        _refuse_key_path("verify key is a symlink")
+    if not stat.S_ISREG(st.st_mode):
+        _refuse_key_path("verify key is not a regular file")
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        _refuse_key_path("verify key is group/world-writable")
+    if queue_dir is not None:
+        qa, qr = Path(os.path.abspath(queue_dir)), Path(queue_dir).resolve()
+        if any(q in loc.parents for q in (qa, qr) for loc in (raw, raw.resolve())):
+            _refuse_key_path("verify key must not live in the queue dir")
+    try:
+        fd = os.open(raw, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as fh:
+            data = fh.read()
     except OSError as e:
         raise SystemExit(f"refusing to run: cannot read verify key ({e.__class__.__name__}) (AC 3c)")
     try:
@@ -508,12 +529,15 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.apply and a.offline:
         ap.error("--apply and --offline are exclusive")
+    check_queue_dir(a.queue_dir)  # AC 3a first, before the verify key is loaded
+    if not a.verify_key:  # AC 3c: refuse before any X client is built
+        raise SystemExit("refusing to run: no approval verify key (--verify-key or X_REPLY_VERIFY_KEY) (AC 3c)")
     vk = load_verify_key(a.verify_key, a.queue_dir)
     client = None if a.offline else XClient()
     res = run(a.queue_dir, a.ledger, a.apply, client, offline=a.offline, max_posts=a.max, verify_key=vk)
     for o in res:
         print(json.dumps(o.ledger_line(), ensure_ascii=False, sort_keys=True))
-    return 1 if any(o.outcome in ("api_error", "refused_unsigned") for o in res) else 0
+    return 1 if any(o.outcome in ("api_error", "refused_unsigned", "rejected_hash_mismatch") for o in res) else 0
 
 
 if __name__ == "__main__":

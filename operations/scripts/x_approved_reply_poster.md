@@ -32,9 +32,11 @@ the approved text hash to its target post, Fred's quote/name/time, the alt text 
 - The **approval flow** signs with `operations/scripts/x_reply_sign_approval.py sign --key PRIV.pem ENTRY.json`. The private key
   path is given at runtime only (never env). The helper refuses a key that is group/world-accessible (must be 0600), inside the
   queue dir, or inside a git work tree, and refuses to sign an entry whose hashes don't match its text.
-- The **poster** holds only the PUBLIC key (`--verify-key`). It refuses a private key, a non-Ed25519 key, or a key file inside the
-  queue dir (whoever writes the queue must not be able to swap the verifier). With no usable key it refuses the whole run before
-  the ledger is opened. The poster code has no signing capability.
+- The **poster** holds only the PUBLIC key (`--verify-key`). It refuses a private key or a non-Ed25519 key. Spec R6 / AC 3e: it
+  refuses the key path (`refused_verify_key_path`, exit 1) if it is a symlink at all, is not a regular file, is group- or
+  world-writable, or lies inside the queue dir by its unresolved (lstat) or resolved location (whoever writes the queue must not
+  be able to swap the verifier). The file is then opened with `O_NOFOLLOW`. With no usable key it refuses the whole run before
+  the ledger is opened and before any X client is built. The poster code has no signing capability.
 - Unsigned, malformed or bad signatures -> ledger `refused_unsigned`, 0 calls, the run moves on to the next entry, exit 1.
   This applies in dry run and `--offline` too, so a dry run already proves the entries are signed.
 
@@ -61,10 +63,10 @@ Only entries whose effective status is `approved` are processed. Re-queueing a f
 edit to the ledger. A torn last ledger line (crash mid-write) is ignored on read.
 
 ## Per-entry flow
-Before any entry: queue dir mode check (AC 3a), then the verify key (AC 3c); either failing refuses the run before the ledger is opened.
+Before any entry: queue dir mode check (AC 3a), then the verify key (AC 3c/3e), both in `main()` before the X client is built; either failing refuses the run (exit 1) before the ledger is opened.
 1. Ledger already has `posted` for (entry_id, text_sha256) -> `skipped_duplicate`, 0 calls. Entries whose effective status isn't `approved` are skipped silently.
 2. The approval must be a JSON object, e.g. `"approval": "yes"` is `rejected_invalid` and the run continues with the next entry. 0 calls.
-3. sha256 of the stored UTF-8 text (no trimming) must equal `text_sha256` and `approval.text_sha256`, else `rejected_hash_mismatch`. 0 calls.
+3. sha256 of the stored UTF-8 text (no trimming) must equal `text_sha256` and `approval.text_sha256`, else `rejected_hash_mismatch`. 0 calls, nothing posted, the run continues, exit 1 (spec R6 / AC 3d).
 4. Ed25519 signature check (AC 3c), else `refused_unsigned`. 0 calls.
 5. Validation (quote non-empty, approved_by Fred, approved_at ISO-8601 with offset, digits-only reply_to_id, <=280 weighted chars,
    alt_text <=1000 and required with an image, image file exists), else `rejected_invalid`. 0 calls.
