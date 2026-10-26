@@ -6,7 +6,7 @@ const num=s=>parseFloat(s.replace('\u2212','-'));
 const fmt=(v,signed)=>{const r=Math.round(v*10)/10;if(!signed)return r.toFixed(1);if(r===0)return '0.0';return (r<0?'\u2212':'+')+Math.abs(r).toFixed(1);};
 const k=document.querySelector('.k'),h=document.querySelector('.h'),hdr=h.nextElementSibling,wrap=hdr.nextElementSibling;
 const ticks=wrap.nextElementSibling,note=ticks.nextElementSibling,br=document.querySelector('.brand');
-const kids=[...wrap.children],axis=kids.pop();
+const kids=[...wrap.children].filter(r=>!r.classList.contains('closed')),axis=kids.pop(); // Closed rows are static
 const rows=kids.map(r=>{const c=r.children,rect=c[1].querySelector('rect'),tx=c[1].querySelector('text'),sp=c[2].querySelectorAll('span');
  const x=+rect.getAttribute('x'),w=+rect.getAttribute('width'),neg=x<280,lx=+tx.getAttribute('x');
  return {name:c[0],rect,tx,obsEl:sp[0],fcEl:sp[1],obs:num(sp[0].textContent),fc:num(sp[1].textContent),gapTxt:tx.textContent,obsTxt:sp[0].textContent,

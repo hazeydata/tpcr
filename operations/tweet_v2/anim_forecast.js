@@ -5,7 +5,7 @@ const eo=x=>1-Math.pow(1-Math.min(1,Math.max(0,x)),3);
 const p=(s,d)=>eo((t-s)/d);
 const back=x=>{x=Math.min(1,Math.max(0,x));const c=1.70158;return 1+(c+1)*Math.pow(x-1,3)+c*Math.pow(x-1,2);};
 const k=document.querySelector('.k'),h=document.querySelector('.h'),sub=h.nextElementSibling,br=document.querySelector('.brand');
-const rows=[...document.querySelectorAll('.r')].map(r=>{const c=r.children;const circ=c[3].querySelector('circle');
+const rows=[...document.querySelectorAll('.r:not(.closed)')].map(r=>{const c=r.children;const circ=c[3].querySelector('circle');
  return {name:c[0],num:c[1].querySelector('span'),qual:c[2],line:c[3].querySelector('line'),rect:c[3].querySelector('rect'),circ,cx:parseFloat(circ.getAttribute('cx')),val:parseFloat(c[1].textContent)};});
 const fade=(el,a,dy)=>{el.style.opacity=a;if(dy)el.style.transform=`translateY(${(1-a)*dy}px)`;};
 let T; // timing table
