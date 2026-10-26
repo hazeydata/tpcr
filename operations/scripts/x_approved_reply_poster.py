@@ -8,9 +8,15 @@ operations/scripts/x_approved_reply_poster.md.
 Status (spec OQ-2): kept in the append-only ledger, never in the queue. The queue
 is opened read-only. ``effective_status()`` derives an entry's status from its
 latest ledger line.
+
+Signed approvals (spec R5 / AC 3c): every approval carries an Ed25519 signature made by
+the approval flow (x_reply_sign_approval.py). The poster holds only the PUBLIC key and
+refuses an unsigned or badly signed approval (ledger ``refused_unsigned``, exit 1).
+A hash mismatch is ``rejected_hash_mismatch``, 0 calls, exit 1 (spec R6 / AC 3d).
 """
 
 import argparse
+import base64
 import fcntl
 import hashlib
 import json
@@ -136,6 +142,102 @@ def validate(entry, queue_dir):
     return None
 
 
+# ---------------- AC 3c: signed approvals (Ed25519, poster holds the public key only) ----------------
+
+SIG_VERSION = "x-approved-reply-v1"
+
+
+def file_sha256(path):
+    p = Path(path)
+    if not p.is_file():
+        return None
+    return hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+def image_file(entry, queue_dir):
+    img = entry.get("image_path")
+    if not isinstance(img, str) or not img:
+        return None
+    return Path(img) if Path(img).is_absolute() else Path(queue_dir) / img
+
+
+def approval_message(entry, queue_dir):
+    """Canonical bytes the approval flow signs. Binds the approved text hash to the target post,
+    Fred's quote/name/time, the alt text and the image bytes, so none of them can be swapped."""
+    appr = entry.get("approval") if isinstance(entry.get("approval"), dict) else {}
+    alt = entry.get("alt_text")
+    img = image_file(entry, queue_dir)
+    msg = {"v": SIG_VERSION, "entry_id": entry.get("entry_id"), "reply_to_id": entry.get("reply_to_id"),
+           "text_sha256": entry.get("text_sha256"), "quote": appr.get("quote"),
+           "approved_by": appr.get("approved_by"), "approved_at": appr.get("approved_at"),
+           "alt_text_sha256": sha256_text(alt) if isinstance(alt, str) else None,
+           "image_sha256": file_sha256(img) if img is not None else None}
+    return json.dumps(msg, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _refuse_key_path(why):
+    raise SystemExit(f"refusing to run: refused_verify_key_path: {why} (AC 3e)")
+
+
+def load_verify_key(path, queue_dir=None):
+    """Load the Ed25519 PUBLIC key. Refuses a private key, a non-Ed25519 key, and (spec R6 / AC 3e,
+    status refused_verify_key_path, exit 1) a key path that is a symlink, is not a regular file, is
+    group/world-writable, or sits inside the queue dir by its unresolved or resolved location
+    (whoever can write the queue must not be able to swap the verifier)."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    if not path:
+        raise SystemExit("refusing to run: no approval verify key (--verify-key or X_REPLY_VERIFY_KEY) (AC 3c)")
+    raw = Path(os.path.abspath(path))  # unresolved location: symlinks NOT followed
+    try:
+        st = os.lstat(raw)
+    except OSError as e:
+        raise SystemExit(f"refusing to run: cannot read verify key ({e.__class__.__name__}) (AC 3c)")
+    if stat.S_ISLNK(st.st_mode):
+        _refuse_key_path("verify key is a symlink")
+    if not stat.S_ISREG(st.st_mode):
+        _refuse_key_path("verify key is not a regular file")
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        _refuse_key_path("verify key is group/world-writable")
+    if queue_dir is not None:
+        qa, qr = Path(os.path.abspath(queue_dir)), Path(queue_dir).resolve()
+        if any(q in loc.parents for q in (qa, qr) for loc in (raw, raw.resolve())):
+            _refuse_key_path("verify key must not live in the queue dir")
+    try:
+        fd = os.open(raw, os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as fh:
+            data = fh.read()
+    except OSError as e:
+        raise SystemExit(f"refusing to run: cannot read verify key ({e.__class__.__name__}) (AC 3c)")
+    try:
+        pub = serialization.load_pem_public_key(data)
+    except ValueError:
+        try:
+            serialization.load_pem_private_key(data, password=None)
+            is_private = True
+        except (ValueError, TypeError):
+            is_private = False
+        if is_private:
+            raise SystemExit("refusing to run: verify key is a PRIVATE key; the poster must hold only the public key (AC 3c)")
+        raise SystemExit("refusing to run: verify key is not a PEM public key (AC 3c)")
+    if not isinstance(pub, Ed25519PublicKey):
+        raise SystemExit("refusing to run: verify key is not Ed25519 (AC 3c)")
+    return pub
+
+
+def signature_ok(entry, queue_dir, verify_key):
+    from cryptography.exceptions import InvalidSignature
+    sig = (entry.get("approval") or {}).get("signature")
+    if not isinstance(sig, str) or not sig:
+        return False
+    try:
+        raw = base64.b64decode(sig, validate=True)
+        verify_key.verify(raw, approval_message(entry, queue_dir))
+        return True
+    except (ValueError, InvalidSignature):
+        return False
+
+
 # ---------------- ledger ----------------
 
 def read_ledger(path):
@@ -233,11 +335,13 @@ def load_queue(queue_dir):
 
 
 def run(queue_dir, ledger_path, apply, client, offline=False, max_posts=MAX_PER_RUN,
-        sleep=time.sleep, out=sys.stdout):
+        sleep=time.sleep, out=sys.stdout, verify_key=None):
     if apply and offline:
         raise ValueError("--apply and --offline are exclusive")
     max_posts = min(int(max_posts), MAX_PER_RUN)
     check_queue_dir(queue_dir)
+    if verify_key is None:  # AC 3c: no verifier -> refuse before the ledger or X
+        raise SystemExit("refusing to run: no approval verify key (AC 3c)")
     results = []
     Path(ledger_path).parent.mkdir(parents=True, exist_ok=True)
     with open(ledger_path, "a", encoding="utf-8") as lfh:
@@ -279,6 +383,10 @@ def run(queue_dir, ledger_path, apply, client, offline=False, max_posts=MAX_PER_
             # AC 1
             if not check_hash(entry):
                 emit(Outcome(eid, sha, "rejected_hash_mismatch"))
+                continue
+            # AC 3c: Ed25519 signature from the approval flow, 0 calls if missing or bad
+            if not signature_ok(entry, queue_dir, verify_key):
+                emit(Outcome(eid, sha, "refused_unsigned", detail="approval unsigned or signature invalid"))
                 continue
             # AC 2
             reason = validate(entry, queue_dir)
@@ -415,15 +523,21 @@ def main(argv=None):
     ap.add_argument("--ledger", default=str(here / "x_reply_ledger.jsonl"))
     ap.add_argument("--apply", action="store_true", help="actually post (needs Fred's go via chief)")
     ap.add_argument("--offline", action="store_true", help="dry run with no HTTP at all (skips the mention GET)")
+    ap.add_argument("--verify-key", default=os.environ.get("X_REPLY_VERIFY_KEY"),
+                    help="Ed25519 PUBLIC key (PEM) of the approval flow; required (AC 3c)")
     ap.add_argument("--max", type=int, default=MAX_PER_RUN, help="cap on posts this run (hard max 5)")
     a = ap.parse_args(argv)
     if a.apply and a.offline:
         ap.error("--apply and --offline are exclusive")
+    check_queue_dir(a.queue_dir)  # AC 3a first, before the verify key is loaded
+    if not a.verify_key:  # AC 3c: refuse before any X client is built
+        raise SystemExit("refusing to run: no approval verify key (--verify-key or X_REPLY_VERIFY_KEY) (AC 3c)")
+    vk = load_verify_key(a.verify_key, a.queue_dir)
     client = None if a.offline else XClient()
-    res = run(a.queue_dir, a.ledger, a.apply, client, offline=a.offline, max_posts=a.max)
+    res = run(a.queue_dir, a.ledger, a.apply, client, offline=a.offline, max_posts=a.max, verify_key=vk)
     for o in res:
         print(json.dumps(o.ledger_line(), ensure_ascii=False, sort_keys=True))
-    return 1 if any(o.outcome == "api_error" for o in res) else 0
+    return 1 if any(o.outcome in ("api_error", "refused_unsigned", "rejected_hash_mismatch") for o in res) else 0
 
 
 if __name__ == "__main__":
