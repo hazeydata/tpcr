@@ -74,4 +74,5 @@
 - `ssh fred@wilma-server` → `sudo su - wilma`
 - Pipeline output: `/home/wilma/hazeydata/pipeline` on wilma-server
 - Mac Mini: runs canonical `wti_predicted_tweet.py` (4 PM ET, forecast for tomorrow) and `wti_observed_tweet.py` (8:30 AM ET, reply about yesterday) crons. Both post the v2 card MP4 built by `operations/tweet_v2/build_day.sh`; see `operations/tweet_v2/README.md`
-- `operations/scripts/x_approved_reply_poster.py`: posts Fred-approved, hash-bound X replies; dry run by default, `--apply` needs Fred's go via chief. Not yet scheduled on the Mini. See `operations/scripts/x_approved_reply_poster.md`.
+- `operations/scripts/x_approved_reply_poster.py`: posts Fred-approved, hash-bound, Ed25519-signed X replies (poster holds the public key only); dry run by default, `--apply` needs Fred's go via chief. Not yet scheduled on the Mini. See `operations/scripts/x_approved_reply_poster.md`.
+- `operations/scripts/x_reply_sign_approval.py`: approval-flow helper that Ed25519-signs queue entries (AC 3c); private key path given at runtime, never in the repo, queue or poster env.

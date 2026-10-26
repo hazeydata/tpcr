@@ -5,6 +5,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "operations" / "scripts"))
 import x_approved_reply_poster as P  # noqa: E402
+import x_reply_sign_approval as S  # noqa: E402
+from cryptography.hazmat.primitives import serialization  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey  # noqa: E402
 
 FAKE_SECRET = "FAKE-SECRET-VALUE-zzz"
 
@@ -64,14 +67,27 @@ class Base(unittest.TestCase):
         self.q = Path(self.tmp.name) / "q"; self.q.mkdir()
         self.ledger = Path(self.tmp.name) / "ledger.jsonl"
         self.sleeps = []
+        # AC 3c: throwaway Ed25519 key per test, generated in the temp dir; never a fixture on disk in the repo
+        self.sk = Ed25519PrivateKey.generate()
+        self.vk = self.sk.public_key()
+        self.pub = Path(self.tmp.name) / "approval_pub.pem"
+        self.pub.write_bytes(self.vk.public_bytes(serialization.Encoding.PEM,
+                                                  serialization.PublicFormat.SubjectPublicKeyInfo))
+        os.chmod(self.pub, 0o644)  # AC 3e: not group/world-writable regardless of the caller umask
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def put(self, e):
+    def put(self, e, sign=True):
+        """Write a queue entry; by default signed by the approval-flow key over its current content."""
+        if sign and isinstance(e.get("approval"), dict) and "signature" not in e["approval"]:
+            e = json.loads(json.dumps(e))
+            e["approval"]["signature"] = __import__("base64").b64encode(
+                self.sk.sign(P.approval_message(e, self.q))).decode()
         (self.q / f"{e['entry_id']}.json").write_text(json.dumps(e, ensure_ascii=False))
 
     def go(self, client, apply=True, **kw):
+        kw.setdefault("verify_key", self.vk)
         return P.run(self.q, self.ledger, apply, client, sleep=self.sleeps.append, out=io.StringIO(), **kw)
 
     def lines(self):
@@ -259,6 +275,13 @@ class Review1(Base):
         r = self.go(Mock())
         self.assertEqual([o.outcome for o in r], ["rejected_invalid", "posted"])
 
+    def test_403_on_post_prints_manual_url_and_text(self):  # AC 6a output for Fred (kills M30)
+        self.put(entry()); buf = io.StringIO()
+        P.run(self.q, self.ledger, True, Mock(fail={"post_reply": 403}), sleep=self.sleeps.append, out=buf,
+              verify_key=self.vk)
+        self.assertIn("https://x.com/i/status/1000000000000000001", buf.getvalue())
+        self.assertIn(entry()["text"], buf.getvalue())
+
     def test_403_on_media_is_failed_not_manual(self):  # AC 6a: only a 403 on the POST goes manual
         img = self.q / "i.png"; img.write_bytes(b"x")
         self.put(entry(image_path="i.png", alt_text="chart"))
@@ -292,7 +315,8 @@ class Review1(Base):
                 self.go(c)
             with self.assertRaises(SystemExit):
                 self.go(None, apply=False, offline=True)
-            self.assertEqual(c.calls, []); self.assertFalse(self.ledger.exists() and self.ledger.read_text())
+            # M25: refusal must come before the ledger is even opened (no empty ledger file either)
+            self.assertEqual(c.calls, []); self.assertFalse(self.ledger.exists())
         finally:
             os.chmod(self.q, 0o700)
 
@@ -329,9 +353,374 @@ class Review1(Base):
         self.go(Mock(fail={"post_reply": 403}))
         self.assertEqual(self.lines()[0]["queue_commit"], sha + "+dirty")
 
+    def test_recovered_post_records_queue_commit(self):  # AC 3b, M27
+        self._git("init", "-q"); self.put(entry("a"))
+        self._git("add", "a.json"); self._git("commit", "-q", "-m", "q")
+        sha = self._git("rev-parse", "HEAD")
+        os.chmod(self.q, 0o700)
+        c = Mock(replies=[{"id": "778", "text": entry()["text"]}]); r = self.go(c)
+        self.assertEqual(r[0].detail, "recovered: found existing identical reply")
+        self.assertNotIn("post_reply", c.calls)
+        self.assertEqual(self.lines()[0]["queue_commit"], sha)
+
     def test_dry_run_has_no_queue_commit(self):
         self.put(entry()); self.go(Mock(), apply=False)
         self.assertNotIn("queue_commit", self.lines()[0])
+
+
+class Signed(Base):
+    """Spec R5 / AC 3c: Ed25519-signed approvals; the poster holds only the public key."""
+
+    def _refused(self, r, c):
+        self.assertEqual([o.outcome for o in r], ["refused_unsigned"])
+        self.assertEqual(c.calls, [])
+        self.assertEqual(self.lines()[0]["outcome"], "refused_unsigned")
+
+    def test_good_signature_posts(self):
+        self.put(entry()); c = Mock(); r = self.go(c)
+        self.assertEqual(r[0].outcome, "posted"); self.assertIn("post_reply", c.calls)
+
+    def test_unsigned_refused(self):
+        self.put(entry(), sign=False); c = Mock(); self._refused(self.go(c), c)
+
+    def test_unsigned_refused_in_dry_run_too(self):
+        self.put(entry(), sign=False); c = Mock(); self._refused(self.go(c, apply=False), c)
+
+    def test_empty_or_garbage_signature_refused(self):
+        for sig in ("", "not base64 !!", 5):
+            e = entry(); e["approval"]["signature"] = sig; self.put(e)
+            c = Mock(); r = self.go(c)
+            self.assertEqual(r[-1].outcome, "refused_unsigned", sig); self.assertEqual(c.calls, [])
+
+    def _tamper(self, change):
+        self.put(entry())
+        f = self.q / "e1.json"; e = json.loads(f.read_text()); change(e); f.write_text(json.dumps(e))
+        c = Mock(); self._refused(self.go(c), c)
+
+    def _retext(self, e, t):
+        h = hashlib.sha256(t.encode()).hexdigest(); e["text"] = t; e["text_sha256"] = h; e["approval"]["text_sha256"] = h
+
+    def test_tampered_text_with_recomputed_hashes_refused(self):
+        self._tamper(lambda e: self._retext(e, "A different reply nobody approved"))
+
+    def test_tampered_target_refused(self):
+        self._tamper(lambda e: e.update(reply_to_id="1000000000000000999"))
+
+    def test_tampered_entry_id_refused(self):
+        self._tamper(lambda e: e.update(entry_id="e1"[::-1]) or None)
+
+    def test_tampered_quote_refused(self):
+        self._tamper(lambda e: e["approval"].update(quote="something else"))
+
+    def test_tampered_approved_at_refused(self):
+        self._tamper(lambda e: e["approval"].update(approved_at="2026-10-27T09:30:00-04:00"))
+
+    def test_tampered_alt_text_refused(self):
+        img = self.q / "i.png"; img.write_bytes(b"x")
+        self.put(entry(image_path="i.png", alt_text="chart"))
+        f = self.q / "e1.json"; e = json.loads(f.read_text()); e["alt_text"] = "other chart"; f.write_text(json.dumps(e))
+        c = Mock(); self._refused(self.go(c), c)
+
+    def test_swapped_image_bytes_refused(self):
+        img = self.q / "i.png"; img.write_bytes(b"x")
+        self.put(entry(image_path="i.png", alt_text="chart")); img.write_bytes(b"y")
+        c = Mock(); self._refused(self.go(c), c)
+
+    def test_tampered_signature_refused(self):
+        def flip(e):
+            raw = bytearray(__import__("base64").b64decode(e["approval"]["signature"])); raw[0] ^= 1
+            e["approval"]["signature"] = __import__("base64").b64encode(bytes(raw)).decode()
+        self._tamper(flip)
+
+    def test_signature_from_other_key_refused(self):
+        other = Ed25519PrivateKey.generate()
+        def resign(e):
+            del e["approval"]["signature"]
+            e["approval"]["signature"] = __import__("base64").b64encode(other.sign(P.approval_message(e, self.q))).decode()
+        self._tamper(resign)
+
+    def test_refused_entry_does_not_block_others(self):
+        self.put(entry("a"), sign=False); self.put(entry("b", rid="5"))
+        self.assertEqual([o.outcome for o in self.go(Mock())], ["refused_unsigned", "posted"])
+
+    def test_no_verify_key_refuses_before_ledger(self):
+        self.put(entry()); c = Mock()
+        with self.assertRaises(SystemExit):
+            self.go(c, verify_key=None)
+        self.assertEqual(c.calls, []); self.assertFalse(self.ledger.exists())
+
+    def test_main_exit_1_on_unsigned(self):
+        self.put(entry(), sign=False)
+        with mock.patch("sys.stdout", io.StringIO()):
+            rc = P.main(["--offline", "--queue-dir", str(self.q), "--ledger", str(self.ledger),
+                         "--verify-key", str(self.pub)])
+        self.assertEqual(rc, 1); self.assertEqual(self.lines()[0]["outcome"], "refused_unsigned")
+
+    def test_main_exit_0_on_signed_dry_run(self):
+        self.put(entry())
+        with mock.patch("sys.stdout", io.StringIO()):
+            rc = P.main(["--offline", "--queue-dir", str(self.q), "--ledger", str(self.ledger),
+                         "--verify-key", str(self.pub)])
+        self.assertEqual(rc, 0); self.assertEqual(self.lines()[0]["outcome"], "dry_run")
+
+    def test_main_without_verify_key_exits_1(self):
+        self.put(entry())
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("X_REPLY_VERIFY_KEY", None)
+            with self.assertRaises(SystemExit) as cm:
+                P.main(["--offline", "--queue-dir", str(self.q), "--ledger", str(self.ledger)])
+        self.assertNotEqual(cm.exception.code, 0); self.assertFalse(self.ledger.exists())
+
+    def test_poster_refuses_private_key_as_verifier(self):
+        priv = Path(self.tmp.name) / "wrong.pem"
+        priv.write_bytes(self.sk.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                               serialization.NoEncryption()))
+        with self.assertRaises(SystemExit) as cm:
+            P.load_verify_key(str(priv))
+        self.assertIn("PRIVATE", str(cm.exception.code))
+
+    def test_poster_refuses_non_ed25519_verifier(self):
+        from cryptography.hazmat.primitives.asymmetric import ec
+        k = ec.generate_private_key(ec.SECP256R1()).public_key()
+        f = Path(self.tmp.name) / "ec_pub.pem"
+        f.write_bytes(k.public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
+        with self.assertRaises(SystemExit) as cm:
+            P.load_verify_key(str(f))
+        self.assertIn("Ed25519", str(cm.exception.code))
+
+    def test_poster_refuses_verify_key_in_queue_dir(self):
+        inq = self.q / "pub.pem"; inq.write_bytes(self.pub.read_bytes())
+        with self.assertRaises(SystemExit):
+            P.load_verify_key(str(inq), self.q)
+        self.assertIsNotNone(P.load_verify_key(str(self.pub), self.q))
+
+    # --- spec R6 / AC 3e: verify key path refusals (refused_verify_key_path, exit 1)
+    def _main(self, key, offline=True):
+        argv = ["--queue-dir", str(self.q), "--ledger", str(self.ledger)] + (["--offline"] if offline else [])
+        if key is not None:
+            argv += ["--verify-key", str(key)]
+        with mock.patch("sys.stdout", io.StringIO()):
+            return P.main(argv)
+
+    def _key_path_refused(self, key, why=""):
+        self.put(entry())
+        with self.assertRaises(SystemExit) as cm:
+            self._main(key)
+        self.assertEqual(cm.exception.code if isinstance(cm.exception.code, int) else 1, 1)
+        self.assertIn("refused_verify_key_path", str(cm.exception.code))
+        self.assertIn(why, str(cm.exception.code))
+        self.assertFalse(self.ledger.exists())
+
+    def test_symlink_in_queue_to_outside_key_refused(self):  # D2: resolved path is outside, link is inside
+        link = self.q / "pub.pem"; os.symlink(self.pub, link)
+        self._key_path_refused(link, "symlink")
+
+    def test_symlink_outside_queue_refused(self):  # AC 3e: any symlink
+        link = Path(self.tmp.name) / "pub_link.pem"; os.symlink(self.pub, link)
+        self._key_path_refused(link, "symlink")
+
+    def test_symlink_outside_pointing_into_queue_refused(self):
+        inq = self.q / "pub.pem"; inq.write_bytes(self.pub.read_bytes()); os.chmod(inq, 0o644)
+        link = Path(self.tmp.name) / "pub_link.pem"; os.symlink(inq, link)
+        self._key_path_refused(link, "symlink")
+
+    def test_key_through_symlinked_queue_dir_refused(self):  # unresolved queue path vs resolved key path
+        real = Path(self.tmp.name) / "realq"; real.mkdir(mode=0o700)
+        k = real / "pub.pem"; k.write_bytes(self.pub.read_bytes()); os.chmod(k, 0o644)
+        self.q.rmdir(); os.symlink(real, self.q)
+        self._key_path_refused(self.q / "pub.pem", "queue dir")
+
+    def test_key_in_queue_dir_refused_via_main(self):
+        inq = self.q / "pub.pem"; inq.write_bytes(self.pub.read_bytes()); os.chmod(inq, 0o644)
+        self._key_path_refused(inq, "queue dir")
+
+    def test_group_writable_key_refused(self):
+        os.chmod(self.pub, 0o664); self._key_path_refused(self.pub, "group/world-writable")
+
+    def test_world_writable_key_refused(self):
+        os.chmod(self.pub, 0o646); self._key_path_refused(self.pub, "group/world-writable")
+
+    def test_non_regular_key_refused(self):
+        d = Path(self.tmp.name) / "keydir"; d.mkdir(mode=0o755)
+        self._key_path_refused(d, "not a regular file")
+
+    def test_fifo_key_refused(self):
+        f = Path(self.tmp.name) / "keyfifo"; os.mkfifo(f, 0o644)
+        self._key_path_refused(f, "not a regular file")
+
+    def test_key_under_symlinked_subdir_of_queue_refused(self):  # unresolved path inside queue, resolved outside
+        out = Path(self.tmp.name) / "outside"; out.mkdir(mode=0o755)
+        k = out / "pub.pem"; k.write_bytes(self.pub.read_bytes()); os.chmod(k, 0o644)
+        os.symlink(out, self.q / "sub")
+        self._key_path_refused(self.q / "sub" / "pub.pem", "queue dir")
+
+    def test_real_key_path_with_symlinked_queue_arg_refused(self):  # R04: queue given as alias, key by real path
+        real = Path(self.tmp.name) / "realq"; real.mkdir(mode=0o700)
+        k = real / "pub.pem"; k.write_bytes(self.pub.read_bytes()); os.chmod(k, 0o644)
+        self.q.rmdir(); os.symlink(real, self.q)
+        self._key_path_refused(k, "queue dir")
+
+    def test_key_via_symlinked_alias_dir_into_queue_refused(self):  # R06: key file not a link, parent alias -> queue
+        inq = self.q / "pub.pem"; inq.write_bytes(self.pub.read_bytes()); os.chmod(inq, 0o644)
+        alias = Path(self.tmp.name) / "alias"; os.symlink(self.q, alias)
+        self._key_path_refused(alias / "pub.pem", "queue dir")
+
+    def test_key_via_symlinked_parent_outside_queue_accepted(self):  # spec R7: only a key FILE symlink is refused
+        out = Path(self.tmp.name) / "keys"; out.mkdir(mode=0o755)
+        k = out / "pub.pem"; k.write_bytes(self.pub.read_bytes()); os.chmod(k, 0o644)
+        alias = Path(self.tmp.name) / "keys_alias"; os.symlink(out, alias)
+        self.put(entry()); self.assertEqual(self._main(alias / "pub.pem"), 0)
+
+    def test_bad_key_path_builds_no_client(self):  # R14: key refusals happen before any X client is built
+        inq = self.q / "pub.pem"; inq.write_bytes(self.pub.read_bytes()); os.chmod(inq, 0o644)
+        self.put(entry())
+        with mock.patch.object(P, "XClient") as xc:
+            with self.assertRaises(SystemExit) as cm:
+                self._main(inq, offline=False)
+        self.assertIn("refused_verify_key_path", str(cm.exception.code))
+        xc.assert_not_called(); self.assertFalse(self.ledger.exists())
+
+    def test_plain_key_outside_queue_accepted(self):
+        self.put(entry()); self.assertEqual(self._main(self.pub), 0)
+
+    # --- D1: queue-dir mode check runs before the verify key loads
+    def test_queue_mode_checked_before_key_loads(self):
+        os.chmod(self.q, 0o777); self.put(entry())
+        with mock.patch.object(P, "load_verify_key", side_effect=AssertionError("key loaded first")) as lk:
+            with self.assertRaises(SystemExit) as cm:
+                self._main(self.pub)
+        self.assertIn("group/world-writable", str(cm.exception.code)); lk.assert_not_called()
+        os.chmod(self.q, 0o700)
+
+    # --- S16: missing key refused before any X client is built
+    def test_missing_key_builds_no_client(self):
+        self.put(entry())
+        with mock.patch.dict(os.environ, {}, clear=False), mock.patch.object(P, "XClient") as xc:
+            os.environ.pop("X_REPLY_VERIFY_KEY", None)
+            with self.assertRaises(SystemExit):
+                self._main(None, offline=False)
+        xc.assert_not_called(); self.assertFalse(self.ledger.exists())
+
+    # --- spec R6 / AC 3d: hash mismatch posts nothing and exits 1
+    def test_hash_mismatch_exits_1_posts_nothing(self):
+        e = entry(); e["text"] = e["text"] + "!"; self.put(e); self.put(entry("b", rid="5"))
+        c = Mock()
+        with mock.patch.object(P, "XClient", return_value=c):
+            rc = self._main(self.pub, offline=False)
+        self.assertEqual(rc, 1)
+        out = {l["entry_id"]: l["outcome"] for l in self.lines()}
+        self.assertEqual(out, {"e1": "rejected_hash_mismatch", "b": "dry_run"})
+        self.assertEqual(c.posts(), 0); self.assertNotIn("post_reply", c.calls)
+
+    def test_hash_mismatch_apply_posts_nothing(self):
+        e = entry(); e["approval"]["text_sha256"] = "0" * 64; self.put(e)
+        c = Mock()
+        with mock.patch.object(P, "XClient", return_value=c):
+            with mock.patch("sys.stdout", io.StringIO()):
+                rc = P.main(["--apply", "--queue-dir", str(self.q), "--ledger", str(self.ledger),
+                             "--verify-key", str(self.pub)])
+        self.assertEqual(rc, 1); self.assertEqual(c.calls, [])
+        self.assertEqual(self.lines()[0]["outcome"], "rejected_hash_mismatch")
+
+    def test_poster_source_has_no_signing_capability(self):
+        src = Path(P.__file__).read_text()
+        for bad in ("Ed25519PrivateKey", ".sign(", "private_bytes", "generate("):
+            self.assertNotIn(bad, src)
+
+
+class SignHelper(Base):
+    """The approval-flow helper: private key path given at runtime, mode 0600, outside queue and git."""
+
+    def _keygen(self):
+        d = Path(self.tmp.name) / "keys"; d.mkdir(mode=0o700)
+        priv, pub = d / "approval.pem", d / "approval_pub.pem"
+        S.keygen(priv, pub)
+        return priv, pub
+
+    def test_keygen_sign_verify_roundtrip(self):
+        old = os.umask(0o022)  # H06: a 0644 keygen must show as 0644 here, whatever the caller's umask
+        try:
+            priv, pub = self._keygen()
+        finally:
+            os.umask(old)
+        self.assertEqual(oct(os.stat(priv).st_mode & 0o777), "0o600")
+        self.put(entry(), sign=False)
+        with mock.patch("sys.stdout", io.StringIO()):
+            self.assertEqual(S.main(["sign", "--key", str(priv), str(self.q / "e1.json")]), 0)
+        r = self.go(Mock(), verify_key=P.load_verify_key(str(pub), self.q))
+        self.assertEqual(r[0].outcome, "posted")
+
+    def test_keygen_refuses_overwrite(self):
+        priv, pub = self._keygen()
+        with self.assertRaises(SystemExit):
+            S.keygen(priv, Path(self.tmp.name) / "x.pem")
+
+    def test_helper_refuses_loose_key_mode(self):
+        priv, _ = self._keygen(); os.chmod(priv, 0o640)
+        with self.assertRaises(SystemExit):
+            S.load_signing_key(priv)
+
+    def test_helper_refuses_key_in_queue_dir(self):
+        priv, _ = self._keygen(); inq = self.q / "k.pem"
+        inq.write_bytes(priv.read_bytes()); os.chmod(inq, 0o600)
+        with self.assertRaises(SystemExit):
+            S.load_signing_key(inq, [self.q])
+
+    def test_helper_refuses_key_in_git_worktree(self):
+        priv, _ = self._keygen()
+        env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull)
+        subprocess.run(["git", "init", "-q"], cwd=priv.parent, env=env, check=True)
+        with self.assertRaises(SystemExit):
+            S.load_signing_key(priv)
+
+    def test_helper_refuses_to_sign_hash_mismatch(self):
+        e = entry(); e["text"] += "!"
+        with self.assertRaises(ValueError):
+            S.sign_entry(e, self.q, self.sk)
+
+
+class KeyPlacementGuard(unittest.TestCase):
+    """AC 3c: the signing key never lives in the repo, the queue dir, or the poster's env."""
+    REPO = Path(__file__).resolve().parents[1]
+    PEM_PRIV = "-----BEGIN " + "PRIV" + "ATE KEY-----"  # split so push scanners do not flag the detector itself
+
+    def test_no_private_key_tracked_in_repo(self):
+        r = subprocess.run(["git", "ls-files", "-z"], cwd=self.REPO, capture_output=True)
+        if r.returncode != 0:
+            self.skipTest("not a git checkout")
+        hits = []
+        for f in filter(None, r.stdout.decode().split("\0")):
+            fp = self.REPO / f
+            if fp.is_file() and fp.stat().st_size < 2_000_000 and self.PEM_PRIV.encode() in fp.read_bytes():
+                hits.append(f)
+        self.assertEqual(hits, [])
+
+    def test_default_queue_dir_has_no_private_key(self):
+        q = self.REPO / "operations" / "x_reply_queue"
+        for fp in (q.rglob("*") if q.exists() else []):
+            if fp.is_file():
+                self.assertNotIn(self.PEM_PRIV.encode(), fp.read_bytes(), fp.name)
+
+    def test_poster_env_reads_are_twitter_creds_and_public_verifier_only(self):
+        import re
+        src = Path(P.__file__).read_text()
+        names = set(re.findall(r'os\.environ(?:\.get)?[\[(]"([A-Z0-9_]+)"', src))
+        self.assertEqual(names, {"TWITTER_CONSUMER_KEY", "TWITTER_CONSUMER_SECRET", "TWITTER_ACCESS_TOKEN",
+                                 "TWITTER_ACCESS_TOKEN_SECRET", "X_REPLY_VERIFY_KEY"})
+        self.assertNotIn("getenv", src)
+
+    def test_helper_never_reads_key_from_env(self):
+        src = Path(S.__file__).read_text()
+        self.assertNotIn("os.environ", src); self.assertNotIn("getenv", src)
+
+    def test_private_key_in_verifier_env_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            priv = Path(d) / "k.pem"
+            priv.write_bytes(Ed25519PrivateKey.generate().private_bytes(
+                serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+            os.chmod(priv, 0o600)
+            with self.assertRaises(SystemExit):
+                P.load_verify_key(str(priv), None)
 
 
 if __name__ == "__main__":
