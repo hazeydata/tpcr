@@ -4,8 +4,8 @@ Timing rule (Fred, Oct 26 2026: "we never post about today... always posting abo
   reference day D -> forecast tweet at 4 PM ET on D-1; observed reply at 8:30 AM ET on D+1,
   in reply to D's forecast tweet (looked up in tweet_state.json["predicted"][D]).
 
-Data sources are the ones the tweet scripts already use: Step 14 content JSONs on wilma
-(CONTENT_DIR/predicted_D.json, observed_D.json) and the pipeline's wti.parquet on wilma (normal boxes).
+Data sources are the ones the tweet scripts already use: Step 14 content JSONs on the data host
+(CONTENT_DIR/predicted_D.json, observed_D.json) and the pipeline's wti.parquet on the data host (normal boxes).
 The cards + MP4s are built locally by operations/tweet_v2/build_day.sh.
 """
 
@@ -23,9 +23,14 @@ ROOT = Path(__file__).resolve().parents[2]
 # TPCR_TWEET_V2_DIR: where build_day.sh lives when the scripts run outside a repo checkout (the Mini runs
 # copies in ~/hazeydata/scripts). Default: this repo's operations/tweet_v2.
 BUILD_DAY = Path(os.environ.get("TPCR_TWEET_V2_DIR") or ROOT / "operations" / "tweet_v2") / "build_day.sh"
-SSH_HOST = "wilma@192.168.2.75"
-CONTENT_DIR = "/home/wilma/hazeydata/pipeline/content"
-WTI_PARQUET = "/home/wilma/hazeydata/pipeline/wti/wti.parquet"
+# Data host and paths come from the environment only (no machine-specific defaults in source).
+# TPCR_SSH_HOST (ssh target), TPCR_CONTENT_DIR (Step 14 content dir on that host), TPCR_WTI_PARQUET (wti.parquet path there).
+def env_required(name):
+    v = os.environ.get(name, "").strip()
+    if not v:
+        raise RuntimeError(f"{name} is not set; export it (see operations/tweet_v2/README.md) or pass --content-dir/--history")
+    return v
+
 TWITTER_METADATA_API = "https://upload.twitter.com/1.1/media/metadata/create.json"
 ALT_MAX = 1000
 # Closed-row R3: the hand-filled closures file, the only closure source. Runs outside a checkout set TPCR_CLOSURES.
@@ -41,8 +46,8 @@ def parse_args(kind, argv=None):
     ap.add_argument("--dry-run", action="store_true",
                     help="build everything, post nothing: no X/Discord HTTP calls, no state writes, no credentials needed")
     ap.add_argument("--date", help="reference day D (default: tomorrow for predicted, yesterday for observed)")
-    ap.add_argument("--content-dir", help="read predicted_D.json/observed_D.json from this local dir instead of wilma over ssh")
-    ap.add_argument("--history", help="local wti.parquet instead of scp from wilma")
+    ap.add_argument("--content-dir", help="read predicted_D.json/observed_D.json from this local dir instead of the data host over ssh")
+    ap.add_argument("--history", help="local wti.parquet instead of scp from the data host")
     ap.add_argument("--state-file", help="tweet_state.json to read (default: the live one)")
     ap.add_argument("--park-hours", default=os.environ.get("TPCR_PARK_HOURS"),
                     help="dimparkhours.csv for open/unknown (default $TPCR_PARK_HOURS; unset = non-closed parks open). Never closure")
@@ -74,14 +79,14 @@ def read_content(name, content_dir=None, ssh_read=None):
     if content_dir:
         p = Path(content_dir) / name
         return p.read_text() if p.exists() else None
-    return ssh_read(f"{CONTENT_DIR}/{name}")
+    return ssh_read(f"{env_required('TPCR_CONTENT_DIR')}/{name}")
 
 
 def fetch_history(work, local=None):
     if local:
         return Path(local)
     dst = Path(work) / "wti.parquet"
-    r = subprocess.run(["scp", "-q", f"{SSH_HOST}:{WTI_PARQUET}", str(dst)], capture_output=True, text=True, timeout=120)
+    r = subprocess.run(["scp", "-q", f"{env_required('TPCR_SSH_HOST')}:{env_required('TPCR_WTI_PARQUET')}", str(dst)], capture_output=True, text=True, timeout=120)
     if r.returncode != 0 or not dst.exists():
         raise RuntimeError(f"scp wti.parquet failed: {r.stderr.strip()}")
     return dst

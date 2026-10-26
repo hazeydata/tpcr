@@ -22,6 +22,8 @@ For park day D:
 | `headline_copy.py` | Every fallback headline ("All open parks normal", "<Park> normal", "All open parks within 2 of forecast", and the all-four lines). Final copy from Lindsay; `cards.py` takes them only from here. |
 
 Scripts find `build_day.sh` via `TPCR_TWEET_V2_DIR` (default: `operations/tweet_v2` in this checkout).
+Data host (no defaults; `tweet_v2.py` stops with a clear error if one is needed and unset): `TPCR_SSH_HOST` (ssh target for the data host),
+`TPCR_CONTENT_DIR` (Step 14 content dir there; not needed with `--content-dir`), `TPCR_WTI_PARQUET` (wti.parquet path there; not needed with `--history`).
 Env for `build_day.sh`: `PY` (python with pandas + pyarrow), `PYIMG` (python with Pillow, default `PY`), `CHROME`, `FFMPEG`.
 
 ## Posting

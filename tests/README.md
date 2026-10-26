@@ -57,3 +57,11 @@ PASS: Min Age Hours Filter
 Results: 7 passed, 0 failed
 ======================================================================
 ```
+
+## X approved-reply poster tests
+
+**File**: `tests/test_x_approved_reply_poster.py` — stdlib unittest with a mocked X client (no network, no secrets).
+Run: `unshare -rn python3 tests/test_x_approved_reply_poster.py`. Covers hash binding, validation, mention pre-check,
+dry run, duplicate/crash recovery, 500/429/media failures, the 5-per-run cap and 30 s spacing, non-object approvals (AC 2),
+403 scope (POST only -> manual), fsync per ledger line (patched `os.fsync`), queue-dir permission refusal (AC 3a) and the
+ledger's queue commit SHA (AC 3b, local `git init` in a temp dir). 42 tests. Test fixtures use synthetic handles and post ids only.

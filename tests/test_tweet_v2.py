@@ -735,3 +735,23 @@ class Cards(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SourceHygieneTest(unittest.TestCase):
+    """Weatherman HOLD (b): tweet_v2.py carries no machine-specific host, IP or home path."""
+
+    def test_tweet_v2_source_has_no_ip_home_or_user_at_host(self):
+        import re as _re
+        src = (Path(__file__).resolve().parents[1] / "operations" / "scripts" / "tweet_v2.py").read_text()
+        self.assertIsNone(_re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", src), "IPv4 literal in tweet_v2.py")
+        self.assertNotIn("/home/", src)
+        self.assertIsNone(_re.search(r"\b[A-Za-z0-9_.-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\b", src), "user@host in tweet_v2.py")
+
+    def test_unset_data_host_env_fails_clearly(self):
+        import os as _os
+        from unittest import mock as _mock
+        with _mock.patch.dict(_os.environ, {}, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "TPCR_CONTENT_DIR is not set"):
+                tweet_v2.read_content("predicted_2026-10-27.json", ssh_read=lambda p: "x")
+            with self.assertRaisesRegex(RuntimeError, "TPCR_SSH_HOST is not set"):
+                tweet_v2.fetch_history("/nonexistent-work")
