@@ -546,5 +546,49 @@ class SignHelper(Base):
             S.sign_entry(e, self.q, self.sk)
 
 
+class KeyPlacementGuard(unittest.TestCase):
+    """AC 3c: the signing key never lives in the repo, the queue dir, or the poster's env."""
+    REPO = Path(__file__).resolve().parents[1]
+    PEM_PRIV = "-----BEGIN " + "PRIVATE KEY-----"
+
+    def test_no_private_key_tracked_in_repo(self):
+        r = subprocess.run(["git", "ls-files", "-z"], cwd=self.REPO, capture_output=True)
+        if r.returncode != 0:
+            self.skipTest("not a git checkout")
+        hits = []
+        for f in filter(None, r.stdout.decode().split("\0")):
+            fp = self.REPO / f
+            if fp.is_file() and fp.stat().st_size < 2_000_000 and self.PEM_PRIV.encode() in fp.read_bytes():
+                hits.append(f)
+        self.assertEqual(hits, [])
+
+    def test_default_queue_dir_has_no_private_key(self):
+        q = self.REPO / "operations" / "x_reply_queue"
+        for fp in (q.rglob("*") if q.exists() else []):
+            if fp.is_file():
+                self.assertNotIn(self.PEM_PRIV.encode(), fp.read_bytes(), fp.name)
+
+    def test_poster_env_reads_are_twitter_creds_and_public_verifier_only(self):
+        import re
+        src = Path(P.__file__).read_text()
+        names = set(re.findall(r'os\.environ(?:\.get)?[\[(]"([A-Z0-9_]+)"', src))
+        self.assertEqual(names, {"TWITTER_CONSUMER_KEY", "TWITTER_CONSUMER_SECRET", "TWITTER_ACCESS_TOKEN",
+                                 "TWITTER_ACCESS_TOKEN_SECRET", "X_REPLY_VERIFY_KEY"})
+        self.assertNotIn("getenv", src)
+
+    def test_helper_never_reads_key_from_env(self):
+        src = Path(S.__file__).read_text()
+        self.assertNotIn("os.environ", src); self.assertNotIn("getenv", src)
+
+    def test_private_key_in_verifier_env_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            priv = Path(d) / "k.pem"
+            priv.write_bytes(Ed25519PrivateKey.generate().private_bytes(
+                serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()))
+            os.chmod(priv, 0o600)
+            with self.assertRaises(SystemExit):
+                P.load_verify_key(str(priv), None)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
