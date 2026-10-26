@@ -738,14 +738,36 @@ if __name__ == "__main__":
 
 
 class SourceHygieneTest(unittest.TestCase):
-    """Weatherman HOLD (b): tweet_v2.py carries no machine-specific host, IP or home path."""
+    """Weatherman HOLD (b): tweet_v2.py and the two WTI tweet scripts carry no machine-specific host, IP or home path."""
+
+    SCRIPTS = ("tweet_v2.py", "wti_observed_tweet.py", "wti_predicted_tweet.py")
 
     def test_tweet_v2_source_has_no_ip_home_or_user_at_host(self):
         import re as _re
-        src = (Path(__file__).resolve().parents[1] / "operations" / "scripts" / "tweet_v2.py").read_text()
-        self.assertIsNone(_re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", src), "IPv4 literal in tweet_v2.py")
-        self.assertNotIn("/home/", src)
-        self.assertIsNone(_re.search(r"\b[A-Za-z0-9_.-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\b", src), "user@host in tweet_v2.py")
+        for name in self.SCRIPTS:
+            with self.subTest(script=name):
+                src = (Path(__file__).resolve().parents[1] / "operations" / "scripts" / name).read_text()
+                self.assertIsNone(_re.search(r"\b\d{1,3}(?:\.\d{1,3}){3}\b", src), f"IPv4 literal in {name}")
+                self.assertNotIn("/home/", src, name)
+                self.assertIsNone(_re.search(r"\b[A-Za-z0-9_.-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\b", src), f"user@host in {name}")
+
+    def test_wti_scripts_unset_ssh_host_fails_clearly(self):
+        import os as _os
+        from unittest import mock as _mock
+        for mod in (wot, wpt):
+            with self.subTest(script=mod.__name__), _mock.patch.dict(_os.environ, {}, clear=True), \
+                    _mock.patch.object(mod.subprocess, "run", side_effect=AssertionError("ssh ran")):
+                with self.assertRaisesRegex(RuntimeError, "TPCR_SSH_HOST is not set"):
+                    mod.ssh_read_file("/x/predicted_2026-10-27.json")
+
+    def test_wti_scripts_read_ssh_host_from_env(self):
+        import os as _os
+        from unittest import mock as _mock
+        for mod in (wot, wpt):
+            with self.subTest(script=mod.__name__), _mock.patch.dict(_os.environ, {"TPCR_SSH_HOST": "datahost"}, clear=True), \
+                    _mock.patch.object(mod.subprocess, "run", return_value=_mock.Mock(returncode=0, stdout="ok\n")) as run:
+                self.assertEqual(mod.ssh_read_file("/c/f.json"), "ok")
+                self.assertEqual(run.call_args[0][0][:2], ["ssh", "datahost"])
 
     def test_unset_data_host_env_fails_clearly(self):
         import os as _os

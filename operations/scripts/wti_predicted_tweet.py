@@ -30,8 +30,8 @@ import tweet_v2
 from tweet_guard import enforce, preflight_legacy, status as guard_status
 
 # --- Configuration ---
-SSH_HOST = "wilma@192.168.2.75"
-CONTENT_DIR = "/home/wilma/hazeydata/pipeline/content"
+# Data host from env, no defaults: TPCR_SSH_HOST (ssh target), TPCR_CONTENT_DIR (Step 14 content dir there).
+# tweet_v2.env_required raises '<NAME> is not set' when one is needed (see operations/tweet_v2/README.md).
 STATE_FILE = Path.home() / "hazeydata" / "reports" / "wti_daily" / "tweet_state.json"
 DISCORD_CHANNEL_ID = "1479351574177513576"
 DISCORD_API = "https://discord.com/api/v10"
@@ -63,7 +63,7 @@ def get_twitter_auth():
 def ssh_read_file(path):
     """Read a file from wilma-server via SSH."""
     result = subprocess.run(
-        ["ssh", SSH_HOST, f"cat '{path}'"],
+        ["ssh", tweet_v2.env_required("TPCR_SSH_HOST"), f"cat '{path}'"],
         capture_output=True, text=True, timeout=15
     )
     if result.returncode != 0:
