@@ -74,3 +74,4 @@
 - `ssh fred@wilma-server` → `sudo su - wilma`
 - Pipeline output: `/home/wilma/hazeydata/pipeline` on wilma-server
 - Mac Mini: runs canonical `wti_observed_tweet.py` 08:30 ET cron
+- `operations/scripts/x_approved_reply_poster.py`: posts Fred-approved, hash-bound X replies; dry run by default, `--apply` needs Fred's go via chief. Not yet scheduled on the Mini. See `operations/scripts/x_approved_reply_poster.md`.
