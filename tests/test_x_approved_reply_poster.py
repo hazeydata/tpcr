@@ -1,5 +1,6 @@
 """Mocked-HTTP tests for operations/scripts/x_approved_reply_poster.py (stdlib unittest, no network)."""
-import hashlib, io, json, os, sys, tempfile, unittest
+import hashlib, io, json, os, subprocess, sys, tempfile, unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "operations" / "scripts"))
@@ -8,7 +9,7 @@ import x_approved_reply_poster as P  # noqa: E402
 FAKE_SECRET = "FAKE-SECRET-VALUE-zzz"
 
 
-def entry(eid="e1", text="Thanks for the mention!", rid="2114457103184039992", **kw):
+def entry(eid="e1", text="Thanks for the mention!", rid="1000000000000000001", **kw):
     h = hashlib.sha256(text.encode("utf-8")).hexdigest()
     e = {"entry_id": eid, "reply_to_id": rid, "text": text, "text_sha256": h,
          "approval": {"quote": "yes post that", "approved_at": "2026-10-26T09:30:00-04:00",
@@ -18,9 +19,9 @@ def entry(eid="e1", text="Thanks for the mention!", rid="2114457103184039992", *
 
 
 MENTIONED = {"data": {"id": "1", "author_id": "9", "entities": {"mentions": [{"username": "HazeyDataFred"}]}}}
-NOT_MENTIONED = {"data": {"id": "2", "author_id": "9", "entities": {"mentions": [{"username": "stretchcloud"}]},
+NOT_MENTIONED = {"data": {"id": "2", "author_id": "9", "entities": {"mentions": [{"username": "synthetic_other_user"}]},
                           "referenced_tweets": [{"type": "replied_to", "id": "50"}]},
-                 "includes": {"tweets": [{"id": "50", "author_id": "77"}], "users": [{"id": "77", "username": "stretchcloud"}]}}
+                 "includes": {"tweets": [{"id": "50", "author_id": "77"}], "users": [{"id": "77", "username": "synthetic_other_user"}]}}
 QUOTES_FRED = {"data": {"id": "3", "author_id": "9", "referenced_tweets": [{"type": "quoted", "id": "60"}]},
                "includes": {"tweets": [{"id": "60", "author_id": "42"}], "users": [{"id": "42", "username": "HazeyDataFred"}]}}
 
@@ -128,7 +129,7 @@ class P2(Base):
     def test_not_mentioned_goes_manual(self):
         self.put(entry()); c = Mock(tweet=NOT_MENTIONED); r = self.go(c)
         self.assertEqual(r[0].outcome, "manual_not_mentioned"); self.assertEqual(c.calls, ["get_tweet"])
-        self.assertEqual(r[0].manual_url, "https://x.com/i/status/2114457103184039992")
+        self.assertEqual(r[0].manual_url, "https://x.com/i/status/1000000000000000001")
         self.assertEqual(P.effective_status(entry(), self.lines()), "manual")
         self.assertEqual(self.go(Mock()), [])  # manual entries are not retried
 
@@ -153,7 +154,7 @@ class P3(Base):
         img = self.q / "i.png"; img.write_bytes(b"x")
         self.put(entry(image_path="i.png", alt_text="chart")); c = Mock(); r = self.go(c, apply=False)
         self.assertEqual(r[0].outcome, "dry_run"); self.assertEqual(c.calls, ["get_tweet"])
-        self.assertEqual(r[0].payload["reply"]["in_reply_to_tweet_id"], "2114457103184039992")
+        self.assertEqual(r[0].payload["reply"]["in_reply_to_tweet_id"], "1000000000000000001")
 
     def test_offline_dry_run_zero_calls(self):
         self.put(entry()); r = self.go(None, apply=False, offline=True)
@@ -163,7 +164,7 @@ class P3(Base):
         img = self.q / "i.png"; img.write_bytes(b"x")
         self.put(entry(image_path="i.png", alt_text="chart")); c = Mock(); r = self.go(c)
         self.assertEqual(c.calls, ["get_tweet", "recent_replies", "upload_media", "media_metadata", "post_reply"])
-        self.assertEqual(c.last_payload, {"text": entry()["text"], "reply": {"in_reply_to_tweet_id": "2114457103184039992"},
+        self.assertEqual(c.last_payload, {"text": entry()["text"], "reply": {"in_reply_to_tweet_id": "1000000000000000001"},
                                           "media": {"media_ids": ["m1"]}})
         self.assertEqual(r[0].post_url, "https://x.com/HazeyDataFred/status/101")
 
@@ -199,7 +200,7 @@ class P3(Base):
         c = Mock(fail={"post_reply": 403}); r = self.go(c)
         self.assertEqual([(o.outcome, o.http_status) for o in r], [("api_error", 403), ("api_error", 403)])
         self.assertEqual(c.calls.count("post_reply"), 2)  # one attempt each, no probing retries
-        self.assertEqual(r[0].manual_url, "https://x.com/i/status/2114457103184039992")
+        self.assertEqual(r[0].manual_url, "https://x.com/i/status/1000000000000000001")
         self.assertEqual(P.effective_status(entry("a"), self.lines()), "manual")
         c2 = Mock(); self.assertEqual(self.go(c2), []); self.assertEqual(c2.calls, [])
 
@@ -239,6 +240,98 @@ class P4(Base):
     def test_xclient_reads_env_only(self):
         src = Path(P.__file__).read_text()
         self.assertNotIn("load_env", src); self.assertNotIn("Path.home()", src)
+
+
+class Review1(Base):
+    """Fixes for the T1 review: AC 2 crash, AC 6a/16 403 scope, AC 15 fsync, AC 3a, AC 3b."""
+
+    def test_non_object_approval_rejected_and_run_continues(self):  # AC 2
+        bad = entry("a"); bad["approval"] = "yes"; self.put(bad)
+        lst = entry("b"); lst["approval"] = ["Fred"]; self.put(lst)
+        self.put(entry("c", rid="5"))
+        c = Mock(); r = self.go(c)
+        self.assertEqual([(o.entry_id, o.outcome) for o in r],
+                         [("a", "rejected_invalid"), ("b", "rejected_invalid"), ("c", "posted")])
+        self.assertEqual([l["outcome"] for l in self.lines()], ["rejected_invalid", "rejected_invalid", "posted"])
+
+    def test_non_object_queue_file_rejected(self):  # AC 2: top-level JSON that is not an object
+        (self.q / "a.json").write_text('"yes"'); self.put(entry("b"))
+        r = self.go(Mock())
+        self.assertEqual([o.outcome for o in r], ["rejected_invalid", "posted"])
+
+    def test_403_on_media_is_failed_not_manual(self):  # AC 6a: only a 403 on the POST goes manual
+        img = self.q / "i.png"; img.write_bytes(b"x")
+        self.put(entry(image_path="i.png", alt_text="chart"))
+        c = Mock(fail={"upload_media": 403}); r = self.go(c)
+        self.assertEqual((r[0].outcome, r[0].http_status, r[0].manual_url), ("api_error", 403, None))
+        self.assertNotIn("post_reply", c.calls)
+        self.assertEqual(P.effective_status(entry(), self.lines()), "failed")
+
+    def test_403_on_recent_replies_is_failed(self):
+        self.put(entry()); r = self.go(Mock(fail={"recent_replies": 403}))
+        self.assertEqual(r[0].http_status, 403)
+        self.assertEqual(P.effective_status(entry(), self.lines()), "failed")
+
+    def test_403_on_mention_get_is_failed(self):
+        self.put(entry()); r = self.go(Mock(fail={"get_tweet": 403}))
+        self.assertEqual(r[0].http_status, 403)
+        self.assertEqual(P.effective_status(entry(), self.lines()), "failed")
+
+    def test_fsync_called_per_ledger_line(self):  # AC 15: kills the fsync-removal mutant
+        self.put(entry("a")); self.put(entry("b", rid="5"))
+        with mock.patch.object(P.os, "fsync", wraps=os.fsync) as fs:
+            self.go(Mock())
+        self.assertEqual(fs.call_count, len(self.lines()))
+        self.assertEqual(fs.call_count, 2)
+
+    def _mode_refused(self, mode):
+        self.put(entry()); os.chmod(self.q, mode)
+        try:
+            c = Mock()
+            with self.assertRaises(SystemExit):
+                self.go(c)
+            with self.assertRaises(SystemExit):
+                self.go(None, apply=False, offline=True)
+            self.assertEqual(c.calls, []); self.assertFalse(self.ledger.exists() and self.ledger.read_text())
+        finally:
+            os.chmod(self.q, 0o700)
+
+    def test_group_writable_queue_refused(self): self._mode_refused(0o770)  # AC 3a
+    def test_world_writable_queue_refused(self): self._mode_refused(0o707)  # AC 3a
+
+    def test_private_queue_allowed(self):  # AC 3a
+        os.chmod(self.q, 0o700); self.put(entry())
+        self.assertEqual(self.go(Mock())[0].outcome, "posted")
+
+    def _git(self, *a):
+        env = dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
+                   GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid",
+                   GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@example.invalid")
+        return subprocess.run(["git", *a], cwd=self.q, env=env, check=True, capture_output=True, text=True).stdout.strip()
+
+    def test_ledger_records_queue_commit_sha(self):  # AC 3b
+        self._git("init", "-q"); self.put(entry("a")); self.put(entry("b", rid="5"))
+        self._git("add", "a.json"); self._git("commit", "-q", "-m", "queue a")
+        sha = self._git("rev-parse", "HEAD")
+        os.chmod(self.q, 0o700)
+        r = self.go(Mock())
+        by = {l["entry_id"]: l for l in self.lines()}
+        self.assertEqual(by["a"]["outcome"], "posted"); self.assertEqual(by["a"]["queue_commit"], sha)
+        self.assertEqual(by["b"]["queue_commit"], "uncommitted")
+        self.assertEqual(len(sha), 40)
+
+    def test_queue_commit_flags_dirty_and_on_post_403(self):  # AC 3b
+        self._git("init", "-q"); self.put(entry("a"))
+        self._git("add", "a.json"); self._git("commit", "-q", "-m", "q")
+        sha = self._git("rev-parse", "HEAD")
+        (self.q / "a.json").write_text((self.q / "a.json").read_text() + "\n")
+        os.chmod(self.q, 0o700)
+        self.go(Mock(fail={"post_reply": 403}))
+        self.assertEqual(self.lines()[0]["queue_commit"], sha + "+dirty")
+
+    def test_dry_run_has_no_queue_commit(self):
+        self.put(entry()); self.go(Mock(), apply=False)
+        self.assertNotIn("queue_commit", self.lines()[0])
 
 
 if __name__ == "__main__":

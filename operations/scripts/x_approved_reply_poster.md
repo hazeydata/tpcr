@@ -18,25 +18,30 @@ the caller (cron/launchd) must export them. `requests` and `requests_oauthlib` a
 One file per entry: `operations/x_reply_queue/<entry_id>.json`
 `{entry_id, reply_to_id, text, text_sha256, image_path?, alt_text?, approval:{quote, approved_at, approved_by:"Fred", text_sha256}, status}`.
 The poster opens these files read-only and never writes them. `image_path` may be relative to the queue dir.
+AC 3a: the queue dir must be writable only by the approval-flow user (e.g. mode 0700). If it is group- or world-writable the
+poster refuses to run at all (exits before touching the ledger or X), in dry run too.
 
 ## Ledger and status (OQ-2: status lives in the ledger)
 `operations/x_reply_ledger.jsonl`, append-only, fsync'd per line, flock'd per run. Line:
-`{entry_id, text_sha256, outcome, post_url?, http_status?, detail?, payload?, manual_url?, at}`.
+`{entry_id, text_sha256, outcome, post_url?, http_status?, step?, detail?, payload?, manual_url?, queue_commit?, at}`.
+`step` is the X call that failed (`GET tweet`, `GET me`, `GET recent replies`, `media upload`, `media metadata`, `POST tweet`).
+AC 3b: every live (`--apply`) line — `posted`, recovered `posted`, and POST-stage `api_error` — carries `queue_commit`: the SHA of the last
+local git commit touching that queue file (`git log -1 -- <file>`, no network), with `+dirty` if the file differs from it, or `uncommitted`.
 Effective status = latest status-bearing line for (entry_id, text_sha256), else the queue's `status`:
-`posted`/`skipped_duplicate` -> posted, `manual_not_mentioned` -> manual, `api_error` -> failed, except `api_error` with http_status 403 on the POST -> manual (AC 6a). `dry_run` and `rejected_*` don't change it.
+`posted`/`skipped_duplicate` -> posted, `manual_not_mentioned` -> manual, `api_error` -> failed, except `api_error` with http_status 403 and `step` `POST tweet` -> manual (AC 6a). A 403 from any other step (mention GET, recent-replies GET, media) -> failed. `dry_run` and `rejected_*` don't change it.
 Only entries whose effective status is `approved` are processed. Re-queueing a failed/manual entry needs new text (new hash) or a human
 edit to the ledger. A torn last ledger line (crash mid-write) is ignored on read.
 
 ## Per-entry flow
 1. Ledger already has `posted` for (entry_id, text_sha256) -> `skipped_duplicate`, 0 calls.
 2. sha256 of the stored UTF-8 text (no trimming) must equal `text_sha256` and `approval.text_sha256`, else `rejected_hash_mismatch`.
-3. Validation (quote non-empty, approved_by Fred, approved_at ISO-8601 with offset, digits-only reply_to_id, <=280 weighted chars,
+3. Validation (approval is a JSON object — e.g. `"approval": "yes"` is `rejected_invalid` and the run continues with the next entry; quote non-empty, approved_by Fred, approved_at ISO-8601 with offset, digits-only reply_to_id, <=280 weighted chars,
    alt_text <=1000 and required with an image, image file exists), else `rejected_invalid`. 0 calls.
 4. One GET of the target (skipped with `--offline`). Passes only if it mentions @HazeyDataFred or quotes a @HazeyDataFred post.
    Fail -> `manual_not_mentioned`, prints `https://x.com/i/status/<reply_to_id>` + text for Fred (chief relays it). GET error -> `api_error`, run stops.
 5. Dry run -> `dry_run` with the exact payload.
 6. `--apply`: GET the account's recent replies to the target; an identical text means a previous run crashed after posting, so it records `posted` without re-posting.
    Otherwise: image -> media upload -> `media/metadata/create` (alt text) -> `POST /2/tweets {text, reply:{in_reply_to_tweet_id}, media?}`.
-   A 403 on the POST -> `api_error` (http_status 403), entry becomes manual and the manual URL + text are printed; no probing retries (AC 6a). Any other 4xx/5xx -> `api_error` (status only, no retry, entry becomes failed). 429 stops the run. Media failure means no POST.
+   A 403 on the POST (only) -> `api_error` (http_status 403), entry becomes manual and the manual URL + text are printed; no probing retries (AC 6a). Any other 4xx/5xx -> `api_error` (status only, no retry, entry becomes failed). 429 stops the run. Media failure means no POST.
 
 Tests: `tests/test_x_approved_reply_poster.py` (stdlib unittest, mocked client): `unshare -rn python3 tests/test_x_approved_reply_poster.py`.

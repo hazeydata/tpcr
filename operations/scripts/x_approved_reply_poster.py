@@ -16,6 +16,8 @@ import hashlib
 import json
 import os
 import re
+import stat
+import subprocess
 import sys
 import time
 import unicodedata
@@ -54,6 +56,8 @@ class Outcome:
     payload: dict = None
     manual_url: str = None
     manual_text: str = None
+    step: str = None
+    queue_commit: str = None
     calls: list = field(default_factory=list)
 
     def ledger_line(self):
@@ -92,7 +96,9 @@ def check_hash(entry):
     if not isinstance(text, str):
         return False
     h = sha256_text(text)
-    appr = entry.get("approval") or {}
+    appr = entry.get("approval")
+    if not isinstance(appr, dict):
+        return False  # run() rejects a non-object approval as rejected_invalid first (AC 2)
     return h == entry.get("text_sha256") and h == appr.get("text_sha256")
 
 
@@ -163,8 +169,9 @@ def effective_status(entry, ledger):
     for rec in ledger:
         if rec.get("entry_id") == entry.get("entry_id") and rec.get("text_sha256") == entry.get("text_sha256"):
             st = STATUS_FROM_OUTCOME.get(rec.get("outcome"), st)
-            if rec.get("outcome") == "api_error" and rec.get("http_status") == 403:
-                st = "manual"  # AC 6a: X refused the reply; Fred posts by hand
+            if (rec.get("outcome") == "api_error" and rec.get("http_status") == 403
+                    and rec.get("step") == "POST tweet"):
+                st = "manual"  # AC 6a: X refused the POST; Fred posts by hand. 403 elsewhere -> failed
     return st
 
 
@@ -185,6 +192,30 @@ def mention_ok(tweet_resp):
 
 # ---------------- run ----------------
 
+def check_queue_dir(queue_dir):
+    """AC 3a: refuse to run if the queue folder is group- or world-writable."""
+    mode = os.stat(queue_dir).st_mode
+    if mode & (stat.S_IWGRP | stat.S_IWOTH):
+        raise SystemExit(f"refusing to run: queue dir {queue_dir} is group/world-writable (mode {stat.S_IMODE(mode):o})")
+
+
+def queue_commit_sha(path):
+    """AC 3b: git commit SHA of the last commit touching the queue file, or "uncommitted".
+    Local git only (no network). Uncommitted or dirty files are reported, not hidden."""
+    p = Path(path)
+    try:
+        r = subprocess.run(["git", "log", "-1", "--format=%H", "--", p.name], cwd=p.parent,
+                           capture_output=True, text=True, timeout=10)
+        sha = r.stdout.strip() if r.returncode == 0 else ""
+        if not sha:
+            return "uncommitted"
+        d = subprocess.run(["git", "status", "--porcelain", "--", p.name], cwd=p.parent,
+                           capture_output=True, text=True, timeout=10)
+        return sha + ("+dirty" if d.stdout.strip() else "")
+    except (OSError, subprocess.SubprocessError):
+        return "uncommitted"
+
+
 def load_queue(queue_dir):
     entries = []
     for p in sorted(Path(queue_dir).glob("*.json")):
@@ -194,6 +225,9 @@ def load_queue(queue_dir):
             e = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
             e = {"entry_id": p.stem, "_unparseable": True}
+        if not isinstance(e, dict):
+            e = {"entry_id": p.stem, "_unparseable": True}
+        e["_path"] = str(p)
         entries.append(e)
     return entries
 
@@ -203,6 +237,7 @@ def run(queue_dir, ledger_path, apply, client, offline=False, max_posts=MAX_PER_
     if apply and offline:
         raise ValueError("--apply and --offline are exclusive")
     max_posts = min(int(max_posts), MAX_PER_RUN)
+    check_queue_dir(queue_dir)
     results = []
     Path(ledger_path).parent.mkdir(parents=True, exist_ok=True)
     with open(ledger_path, "a", encoding="utf-8") as lfh:
@@ -237,6 +272,10 @@ def run(queue_dir, ledger_path, apply, client, offline=False, max_posts=MAX_PER_
             st = effective_status(entry, ledger)
             if st != "approved":
                 continue  # manual / failed / posted entries wait for a human
+            # AC 2: a non-object approval (e.g. "yes") is invalid, not a crash
+            if not isinstance(entry.get("approval"), dict):
+                emit(Outcome(eid, sha, "rejected_invalid", detail="approval is not an object"))
+                continue
             # AC 1
             if not check_hash(entry):
                 emit(Outcome(eid, sha, "rejected_hash_mismatch"))
@@ -255,7 +294,8 @@ def run(queue_dir, ledger_path, apply, client, offline=False, max_posts=MAX_PER_
                 try:
                     tw = client.get_tweet(rid)
                 except ApiError as e:
-                    emit(Outcome(eid, sha, "api_error", http_status=e.status, detail="mention pre-check GET failed; run stopped"))
+                    emit(Outcome(eid, sha, "api_error", http_status=e.status, step=e.where,
+                             detail="mention pre-check GET failed; run stopped"))
                     break
                 if not mention_ok(tw):
                     murl = f"https://x.com/i/status/{rid}"
@@ -279,12 +319,13 @@ def run(queue_dir, ledger_path, apply, client, offline=False, max_posts=MAX_PER_
                 for r in client.recent_replies(rid) or []:
                     if r.get("text") == text:
                         emit(Outcome(eid, sha, "posted", post_url=f"https://x.com/{ACCOUNT}/status/{r['id']}",
-                                     detail="recovered: found existing identical reply"))
+                                     detail="recovered: found existing identical reply",
+                                     queue_commit=queue_commit_sha(entry["_path"])))
                         break
                 else:
                     r = None
             except ApiError as e:
-                emit(Outcome(eid, sha, "api_error", http_status=e.status, detail="recent-replies GET failed"))
+                emit(Outcome(eid, sha, "api_error", http_status=e.status, step=e.where, detail="recent-replies GET failed"))
                 if e.status == 429:
                     break
                 continue
@@ -295,6 +336,7 @@ def run(queue_dir, ledger_path, apply, client, offline=False, max_posts=MAX_PER_
                 gap = time.monotonic() - last_post
                 if gap < MIN_GAP_SECONDS:
                     sleep(MIN_GAP_SECONDS - gap)
+            qc = queue_commit_sha(entry["_path"])
             try:
                 if img:
                     p = Path(img) if Path(img).is_absolute() else Path(queue_dir) / img
@@ -306,16 +348,16 @@ def run(queue_dir, ledger_path, apply, client, offline=False, max_posts=MAX_PER_
                 if e.status == 403 and e.where == "POST tweet":  # AC 6a: no probing, hand to Fred
                     murl = f"https://x.com/i/status/{rid}"
                     emit(Outcome(eid, sha, "api_error", http_status=403, detail="POST 403: marked manual",
-                                 manual_url=murl, manual_text=text))
+                                 step=e.where, queue_commit=qc, manual_url=murl, manual_text=text))
                     print(f"MANUAL {eid}: {murl}\n{text}", file=out)
                     continue
-                emit(Outcome(eid, sha, "api_error", http_status=e.status, detail=e.where))
+                emit(Outcome(eid, sha, "api_error", http_status=e.status, detail=e.where, step=e.where, queue_commit=qc))
                 if e.status == 429:
                     break
                 continue
             last_post = time.monotonic()
             posted += 1
-            emit(Outcome(eid, sha, "posted", post_url=f"https://x.com/{ACCOUNT}/status/{tid}"))
+            emit(Outcome(eid, sha, "posted", post_url=f"https://x.com/{ACCOUNT}/status/{tid}", queue_commit=qc))
     return results
 
 
