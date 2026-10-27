@@ -349,10 +349,44 @@ class Scripts(Base):
         with mock.patch.object(tf, "CONFIG_ERROR", "FileNotFoundError: x"), \
              mock.patch.object(tf, "FIRST_NEW_RUN", datetime.min.replace(tzinfo=timezone.utc)), \
              mock.patch.object(wpt, "load_env"), mock.patch.object(wpt, "enforce"), mock.patch.dict("os.environ", ENV), \
-             mock.patch.object(requests, "post", post), mock.patch.object(wpt, "post_discord"):
+             mock.patch.object(requests, "post", post), mock.patch.object(wpt, "post_discord") as discord:
             rc, out, err = self.run_main(wpt, ["--date", "2026-10-29", "--content-dir", str(self.cdir), "--history", "h",
                                              "--state-file", str(self.state)])
+        self.discord = discord
         return rc, out, err, post
+
+    def test_bad_config_skip_sends_one_discord_alert_naming_config(self):
+        rc, out, err, post = self.bad_config_predicted(et(2026, 10, 28, 16, 0))
+        self.assertEqual(rc, 0); self.assertIn("skipped_bad_config", out); post.assert_not_called()
+        self.assertEqual(self.discord.call_count, 1)
+        msg = self.discord.call_args[0][0]
+        self.assertIn(str(tf.CONFIG), msg); self.assertIn("forecast original was skipped", msg)
+
+    def test_bad_config_skip_without_discord_token_is_stderr_only(self):
+        self.at(et(2026, 10, 28, 16, 0))
+        post = mock.Mock(side_effect=AssertionError("network call"))
+        with mock.patch.object(tf, "CONFIG_ERROR", "FileNotFoundError: x"), \
+             mock.patch.object(tf, "FIRST_NEW_RUN", datetime.min.replace(tzinfo=timezone.utc)), \
+             mock.patch.object(wpt, "load_env"), mock.patch.object(wpt, "enforce"), mock.patch.dict("os.environ", ENV), \
+             mock.patch.object(requests, "post", post):
+            os.environ.pop("DISCORD_BOT_TOKEN", None)
+            rc, out, err = self.run_main(wpt, ["--date", "2026-10-29", "--content-dir", str(self.cdir), "--history", "h",
+                                             "--state-file", str(self.state)])
+        self.assertEqual(rc, 0); self.assertIn("skipped_bad_config", out); self.assertIn("ERROR", err)
+        post.assert_not_called()
+
+    def test_bad_config_unblocks_on_state_only_new_original(self):  # m30
+        with mock.patch.object(tf, "CONFIG_ERROR", "ValueError: x"):
+            self.state.write_text(json.dumps({"predicted": {D: {"tweet_id": NEW_ID, "posted_at": AFTER, "format": "new"}}}))
+            self.assertFalse(tf.store_path(self.state).exists())
+            self.assertIsNone(tf.original_run_blocked(self.state))
+
+    def test_bad_config_new_observed_or_reply_tag_does_not_unblock(self):  # m32
+        with mock.patch.object(tf, "CONFIG_ERROR", "ValueError: x"):
+            tf.record(self.state, "OBS-NEW", "new", "observed", D, AFTER)
+            self.assertIn("config missing/invalid", tf.original_run_blocked(self.state))
+            tf.record(self.state, "REPLY-NEW", "new", "reply", D, AFTER)
+            self.assertIn("config missing/invalid", tf.original_run_blocked(self.state))
 
     def test_bad_config_before_first_new_run_skips_original(self):
         self.state.write_text(json.dumps({"predicted": {D: {"tweet_id": OLD_ID, "posted_at": BEFORE}}}))
@@ -384,6 +418,25 @@ class Scripts(Base):
         self.assertTrue(any(u == wpt.TWITTER_API for u, _ in calls))
         self.assertEqual(json.loads(self.state.read_text())["predicted"][D2]["format"], "new")
         self.assertEqual(json.loads(tf.store_path(self.state).read_text())["PRED-NEW"]["format"], "new")
+
+    def test_fixing_config_resumes_next_4pm_original(self):
+        rc, out, _, post = self.bad_config_predicted(et(2026, 10, 28, 16, 0))
+        self.assertIn("skipped_bad_config", out); post.assert_not_called()
+        rc, out, _, post = self.bad_config_predicted(et(2026, 10, 29, 16, 0))
+        self.assertIn("skipped_bad_config", out)  # still skipped while the config is broken
+        # config fixed (real tweet_format values, no CONFIG_ERROR): the next 4 PM run, Oct 30, posts a new original
+        D3 = "2026-10-31"
+        from tests.test_tweet_v2 import content
+        (self.cdir / f"predicted_{D3}.json").write_text(content(D3, [20.1, 21.0, 26.0, 33.3], generated_at="2026-10-30T10:00:00-04:00"))
+        self.at(et(2026, 10, 30, 16, 0, 0))
+        calls = []
+        with mock.patch.object(wpt, "load_env"), mock.patch.object(wpt, "enforce"), mock.patch.dict("os.environ", ENV), \
+             mock.patch.object(requests, "post", self.post_fake(calls, "PRED-RESUMED")), mock.patch.object(wpt, "post_discord"), \
+             mock.patch.object(tweet_v2, "parquet_last_date", return_value=D3), \
+             mock.patch.object(tweet_v2, "build", self.fake_build), mock.patch.object(wpt, "STATE_FILE", self.state):
+            self.run_main(wpt, ["--date", D3, "--content-dir", str(self.cdir), "--history", "h", "--state-file", str(self.state)])
+        self.assertTrue(any(u == wpt.TWITTER_API for u, _ in calls))
+        self.assertEqual(json.loads(tf.store_path(self.state).read_text())["PRED-RESUMED"]["format"], "new")
 
 
 if __name__ == "__main__":
