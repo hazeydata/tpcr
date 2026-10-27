@@ -29,6 +29,7 @@ def format_tweet(content):
 
 def alt_text(content):
     parks = "; ".join(f"{p.get('park_name') or N.get(p.get('park_code'), p.get('park_code'))} {p['wti']:.1f}"
+                      + (f" ({p['wti_label']})" if p.get("wti_label") else "")
                       for p in sorted(content["parks"], key=lambda p: p["wti"]))
     return (f"Animated TPCR observed Wait Time Index (WTI) for Walt Disney World, {content['target_date']}: "
             f"each park's observed WTI with its crowd label. {parks}.")[:1000]

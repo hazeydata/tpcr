@@ -7,6 +7,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
@@ -107,6 +108,31 @@ class ReplyFormat(unittest.TestCase):
         self.assertEqual(self.fmt(OLD_ID, et(2026, 10, 31, 0, 0, 0)), "new")
         self.assertEqual(self.fmt(OLD_ID, datetime(2026, 10, 31, 4, 0, tzinfo=timezone.utc)), "new")
 
+    # kt1 mutants m02 / m04
+    def test_reply_to_original_posted_exactly_at_first_new_run_is_new(self):
+        at = "2026-10-28T20:00:00Z"  # exactly 16:00:00 ET Oct 28
+        self.state.write_text(json.dumps({"predicted": {"2026-10-29": {"tweet_id": "777", "posted_at": at}}}))
+        self.assertEqual(self.fmt("777", et(2026, 10, 30, 8, 30)), "new")  # untagged, by posted_at
+        self.tag("777", "new", at)
+        self.assertEqual(self.fmt("777", et(2026, 10, 30, 8, 30)), "new")  # tagged
+
+    def test_tagged_old_original_without_posted_at_stays_old(self):
+        self.state.write_text(json.dumps({"predicted": {"2026-10-28": {"tweet_id": "888"}}}))
+        self.tag("888", "old", None)
+        self.assertEqual(tf.reply_format("888", self.state, et(2026, 10, 30, 8, 30), log=self.log.append),
+                         ("old", "tagged"))
+
+    # naive clock: taken as ET, never raises
+    def test_naive_now_is_treated_as_et(self):
+        self.tag(OLD_ID, "old", BEFORE)
+        self.assertEqual(self.fmt(OLD_ID, datetime(2026, 10, 30, 23, 59, 59)), "old")
+        self.assertEqual(self.fmt(OLD_ID, datetime(2026, 10, 31, 0, 0, 0)), "new")
+
+    def test_unusable_now_never_raises(self):
+        f, reason = tf.reply_format(OLD_ID, self.state, "not-a-time", log=self.log.append)
+        self.assertIn(f, ("old", "new"))
+        self.assertEqual(reason, "lookup failed")
+
     # missing or corrupt store: fail safe, never raise
     def test_missing_store_falls_back_to_posted_at(self):
         self.assertEqual(self.fmt(OLD_ID, et(2026, 10, 29, 8, 30)), "old")
@@ -140,6 +166,55 @@ class ReplyFormat(unittest.TestCase):
     def test_migrate_dry_run_writes_nothing(self):
         tf.migrate(self.state, dry=True, log=self.log.append)
         self.assertFalse(tf.store_path(self.state).exists())
+
+
+class ConfigFailSafe(unittest.TestCase):
+    """A missing or corrupt config/tweet_format.json must not crash the scripts at import: ERROR on stderr,
+    CONFIG_ERROR set, and the window collapses to retired (everything new, predicted never skipped)."""
+    PROBE = (
+        "import sys, types; sys.path.insert(0, 'operations/scripts');"
+        "m = types.ModuleType('requests_oauthlib'); m.OAuth1 = object; sys.modules.setdefault('requests_oauthlib', m);"
+        "import tweet_format as tf, wti_predicted_tweet, wti_observed_tweet;"
+        "from datetime import datetime, timezone;"
+        "now = datetime(2026, 10, 29, 12, tzinfo=timezone.utc);"
+        "print(bool(tf.CONFIG_ERROR), tf.reply_format('1', '/nonexistent/s.json', now, log=lambda m: 0)[0],"
+        " now < tf.FIRST_NEW_RUN, tf.STORE_NAME)")
+
+    def probe(self, content):
+        import tempfile, shutil
+        d = Path(tempfile.mkdtemp(prefix="tweetfmt-cfg-"))
+        self.addCleanup(shutil.rmtree, d, True)
+        cfg = d / "tweet_format.json"
+        if content is not None:
+            cfg.write_text(content)
+        r = subprocess.run([sys.executable, "-c", self.PROBE], cwd=ROOT, capture_output=True, text=True,
+                           env={**os.environ, "TPCR_TWEET_FORMAT_CONFIG": str(cfg)})
+        return r
+
+    def test_missing_config(self):
+        r = self.probe(None)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.split(), ["True", "new", "False", "tweet_formats.json"])
+        self.assertIn("ERROR tweet_format: config", r.stderr)
+
+    def test_corrupt_config(self):
+        for bad in ("{{{", "[]", '{"first_new_run": "nope"}', '{"first_new_run": "2026-10-28T16:00:00", "old_retires": "2026-10-31T00:00:00"}'):
+            r = self.probe(bad)
+            self.assertEqual(r.returncode, 0, (bad, r.stderr))
+            self.assertEqual(r.stdout.split()[:3], ["True", "new", "False"], bad)
+            self.assertIn("ERROR tweet_format", r.stderr)
+
+    def test_good_config_has_no_error(self):
+        r = self.probe((ROOT / "config" / "tweet_format.json").read_text())
+        self.assertEqual(r.stdout.split()[:3], ["False", "old", "False"], r.stderr)
+
+
+class OldAltText(unittest.TestCase):
+    def test_old_video_alt_lists_crowd_labels(self):
+        a = tweet_v1_legacy.alt_text({"target_date": "2026-10-28", "parks": [
+            {"park_name": "EPCOT", "wti": 12.0, "wti_label": "Quiet"}, {"park_code": "MK", "wti": 31.0, "wti_label": "Busy"}]})
+        self.assertIn("EPCOT 12.0 (Quiet)", a)
+        self.assertIn("Magic Kingdom 31.0 (Busy)", a)
 
 
 class Scripts(Base):

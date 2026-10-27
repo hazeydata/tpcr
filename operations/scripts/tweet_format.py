@@ -16,14 +16,29 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 # Runs outside a checkout (the Mini copies in ~/hazeydata/scripts) set TPCR_TWEET_FORMAT_CONFIG.
 CONFIG = Path(os.environ.get("TPCR_TWEET_FORMAT_CONFIG") or Path(__file__).resolve().parents[2] / "config" / "tweet_format.json")
-_cfg = json.loads(CONFIG.read_text())
-FIRST_NEW_RUN = datetime.fromisoformat(_cfg["first_new_run"])
-OLD_RETIRES = datetime.fromisoformat(_cfg["old_retires"])
-STORE_NAME = _cfg["store_name"]
 OLD, NEW = "old", "new"
+ET = ZoneInfo("America/Toronto")
+# A missing or corrupt config must not crash the 4 PM / 8:30 AM scripts at import. Defined behavior: CONFIG_ERROR is
+# set, an ERROR is logged to stderr, and the window collapses to "already retired" (FIRST_NEW_RUN = OLD_RETIRES =
+# datetime.min UTC): every original and every reply is NEW, the predicted run is never skipped as pre-cutover.
+CONFIG_ERROR = None
+try:
+    _cfg = json.loads(CONFIG.read_text())
+    FIRST_NEW_RUN = datetime.fromisoformat(_cfg["first_new_run"])
+    OLD_RETIRES = datetime.fromisoformat(_cfg["old_retires"])
+    if FIRST_NEW_RUN.tzinfo is None or OLD_RETIRES.tzinfo is None:
+        raise ValueError("first_new_run/old_retires need a UTC offset")
+    STORE_NAME = str(_cfg.get("store_name") or "tweet_formats.json")
+except Exception as _e:  # noqa: BLE001 - fail safe, see above
+    CONFIG_ERROR = f"{type(_e).__name__}: {_e}"
+    print(f"ERROR tweet_format: config {CONFIG} unusable ({CONFIG_ERROR}); "
+          "treating the old format as retired: everything is new", file=sys.stderr)
+    FIRST_NEW_RUN = OLD_RETIRES = datetime.min.replace(tzinfo=timezone.utc)
+    STORE_NAME = "tweet_formats.json"
 
 
 def store_path(state_file):
@@ -91,8 +106,13 @@ def _posted_at_from_state(state_file, tweet_id):
 
 
 def reply_format(tweet_id, state_file, now, log=print):
-    """(format, reason) for a reply to original tweet_id at run time now (aware). Never raises."""
+    """(format, reason) for a reply to original tweet_id at run time now. A naive now is taken as ET
+    (America/Toronto). Never raises."""
     try:
+        if not isinstance(now, datetime):
+            raise TypeError(f"now is {type(now).__name__}, not datetime")
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=ET)
         tag = load_store(state_file, log).get(str(tweet_id))
         tag = tag.get("format") if isinstance(tag, dict) else None
         posted = _posted_at_from_state(state_file, tweet_id)
@@ -110,8 +130,12 @@ def reply_format(tweet_id, state_file, now, log=print):
             return original_format(posted), "untagged, by posted_at"
         return OLD, "untagged, no posted_at: old inside the window"
     except Exception as e:  # noqa: BLE001 - never crash the reply
-        log(f"tweet_format: lookup failed ({e}); using old inside the window")
-        return (NEW if now >= OLD_RETIRES else OLD), "lookup failed"
+        try:
+            retired = now >= OLD_RETIRES
+        except Exception:  # noqa: BLE001 - now itself unusable: old inside the window per the wall clock
+            retired = datetime.now(timezone.utc) >= OLD_RETIRES
+        log(f"tweet_format: lookup failed ({e}); using {'new' if retired else 'old'}")
+        return (NEW if retired else OLD), "lookup failed"
 
 
 def migrate(state_file, dry=False, log=print):

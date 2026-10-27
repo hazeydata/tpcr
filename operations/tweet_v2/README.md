@@ -36,9 +36,13 @@ A parallel transition. The window lives only in `config/tweet_format.json` (read
 - **Replies:** `wti_observed_tweet.py` reads the original's format (`tweet_format.reply_format`). Before `old_retires`: an original
   posted before `first_new_run` is old; otherwise its tag; untagged = by its `posted_at`; nothing known = old. From `old_retires` on:
   always new, with a `NOTE untagged original` log line when the original had no tag. A missing or corrupt store (or state file)
-  never raises; it falls back as above.
+  never raises; it falls back as above. A naive `now` is taken as ET (America/Toronto).
+- **Config failure:** a missing or corrupt `config/tweet_format.json` (unreadable, bad JSON, missing key, or a date without a UTC
+  offset) does not crash either script at import. `tweet_format` logs `ERROR tweet_format: config ... unusable` to stderr, sets
+  `CONFIG_ERROR`, and treats the old format as already retired: every original and reply is new, and the predicted run is never
+  skipped as pre-cutover.
 - **Old reply:** `operations/scripts/tweet_v1_legacy.py`: the pre-v2 Remotion `DailyWTIAll` video rendered on the data host
-  (`TPCR_SSH_HOST`, `TPCR_REMOTION_DIR`; no defaults) and the pre-v2 reply text, now with alt text. A dry run renders nothing and
+  (`TPCR_SSH_HOST`, `TPCR_REMOTION_DIR`; no defaults) and the pre-v2 reply text, now with alt text (each park's WTI and crowd label). A dry run renders nothing and
   writes `dry_run.json` with `"format": "old"`. Delete it (and this section's old branch) after Oct 31 2026.
 - **Migration:** `python3 operations/scripts/tweet_format.py --migrate <tweet_state.json> [--dry-run]` tags every untagged tweet in
   the state file by `posted_at` (idempotent). Runs outside a checkout set `TPCR_TWEET_FORMAT_CONFIG` to the config path.
@@ -90,7 +94,7 @@ Optional: `--content-dir DIR` (local `predicted_D.json`/`observed_D.json` instea
 ## Tests
 `python3 -m unittest -v tests.test_tweet_v2 tests.test_tweet_guard tests.test_scorecard tests.test_tweet_format tests.test_tweet_v2_samples`
 (stubs `requests_oauthlib`; no network; use a python with pandas + pyarrow or the sample tests skip).
-- `test_tweet_format`: the transition window, boundaries, untagged originals, corrupt store, old/new reply through the scripts.
+- `test_tweet_format`: the transition window, boundaries (incl. an original posted exactly at 16:00:00), tagged/untagged originals, naive clock, corrupt store, missing/corrupt config, old/new reply through the scripts.
 - `test_tweet_v2_samples`: dry-renders every tpcr-meta#12 sample (forecast Sep 2-6, reply C Sep 2-6) from the same real data
   (`tests/fixtures/tweet_v2_samples/`) and compares: replies byte-identical; forecasts identical after Fred's three Oct 26 edits.
 - The three older suites run with the window moved to the past (`setUpModule`), so they test the new-format path.

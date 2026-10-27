@@ -4,6 +4,10 @@ from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "operations" / "scripts"))
+try:  # environment gap: venvs without `cryptography` skip this module instead of erroring at collection
+    import cryptography  # noqa: F401
+except ImportError:  # pragma: no cover
+    raise unittest.SkipTest("cryptography not installed; x_approved_reply_poster tests need it")
 import x_approved_reply_poster as P  # noqa: E402
 import x_reply_sign_approval as S  # noqa: E402
 from cryptography.hazmat.primitives import serialization  # noqa: E402

@@ -30,8 +30,16 @@ import scorecard as sc
 import tweet_note
 import weekly
 
-sys.modules.setdefault("requests_oauthlib", type(sys)("requests_oauthlib")).OAuth1 = object
-import wti_predicted_tweet as wpt
+# Stub requests_oauthlib only for this import, inside patch.dict, so the stub (and a wti_predicted_tweet bound to it)
+# never leaks into other test modules' sys.modules (was: a module-level OAuth1 = object that broke later live tests).
+import requests  # noqa: E402,F401 - wti_predicted_tweet's other deps are imported normally (shared, not dropped)
+import tweet_format  # noqa: E402,F401
+import tweet_guard  # noqa: E402,F401
+import tweet_v2  # noqa: E402,F401
+_oauth_stub = type(sys)("requests_oauthlib")
+_oauth_stub.OAuth1 = lambda *a, **k: "auth"
+with mock.patch.dict(sys.modules, {"requests_oauthlib": sys.modules.get("requests_oauthlib", _oauth_stub)}):
+    import wti_predicted_tweet as wpt
 
 AS_OF = date(2026, 10, 12)
 
