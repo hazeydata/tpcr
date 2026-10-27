@@ -39,10 +39,13 @@ A parallel transition. The window lives only in `config/tweet_format.json` (read
   never raises; it falls back as above. A naive `now` is taken as ET (America/Toronto).
 - **Config failure:** a missing or corrupt `config/tweet_format.json` (unreadable, bad JSON, missing key, or a date without a UTC
   offset) does not crash either script at import. `tweet_format` logs `ERROR tweet_format: config ... unusable` to stderr, sets
-  `CONFIG_ERROR`, and treats the old format as already retired: every original and reply is new, and the predicted run is never
-  skipped as pre-cutover.
+  `CONFIG_ERROR`, and treats the old format as already retired: **every reply is new** (reason `config missing/invalid:
+  everything new`), the one exception to "a reply uses its original's format". Because `first_new_run` is then unknown, the
+  4 PM new-format original run is **skipped** (stdout `skipped_bad_config`, `ERROR ...` on stderr, nothing posted) until the
+  tag store or `tweet_state.json` already records a new-format predicted original. So a broken config never posts a new
+  original before Oct 28 16:00 ET; after the first new run it does not stop the forecast. Fix the config to resume early.
 - **Old reply:** `operations/scripts/tweet_v1_legacy.py`: the pre-v2 Remotion `DailyWTIAll` video rendered on the data host
-  (`TPCR_SSH_HOST`, `TPCR_REMOTION_DIR`; no defaults) and the pre-v2 reply text, now with alt text (each park's WTI and crowd label). A dry run renders nothing and
+  (`TPCR_SSH_HOST`, `TPCR_REMOTION_DIR`; no defaults) and the pre-v2 reply text, now with alt text (each park's WTI and crowd label; the opening line mentions labels only for parks that have one). A dry run renders nothing and
   writes `dry_run.json` with `"format": "old"`. Delete it (and this section's old branch) after Oct 31 2026.
 - **Migration:** `python3 operations/scripts/tweet_format.py --migrate <tweet_state.json> [--dry-run]` tags every untagged tweet in
   the state file by `posted_at` (idempotent). Runs outside a checkout set `TPCR_TWEET_FORMAT_CONFIG` to the config path.

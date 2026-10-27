@@ -170,7 +170,7 @@ class ReplyFormat(unittest.TestCase):
 
 class ConfigFailSafe(unittest.TestCase):
     """A missing or corrupt config/tweet_format.json must not crash the scripts at import: ERROR on stderr,
-    CONFIG_ERROR set, and the window collapses to retired (everything new, predicted never skipped)."""
+    CONFIG_ERROR set, every reply is new, and the 4 PM original run is skipped until a new original exists (D7)."""
     PROBE = (
         "import sys, types; sys.path.insert(0, 'operations/scripts');"
         "m = types.ModuleType('requests_oauthlib'); m.OAuth1 = object; sys.modules.setdefault('requests_oauthlib', m);"
@@ -204,6 +204,25 @@ class ConfigFailSafe(unittest.TestCase):
             self.assertEqual(r.stdout.split()[:3], ["True", "new", "False"], bad)
             self.assertIn("ERROR tweet_format", r.stderr)
 
+    def test_custom_store_name_is_used(self):
+        cfg = json.loads((ROOT / "config" / "tweet_format.json").read_text())
+        cfg["store_name"] = "custom_formats.json"
+        r = self.probe(json.dumps(cfg))
+        self.assertEqual(r.stdout.split(), ["False", "old", "False", "custom_formats.json"], r.stderr)
+
+    def test_bad_config_reason_names_the_config(self):
+        probe = ("import sys; sys.path.insert(0, 'operations/scripts'); import tweet_format as tf;"
+                 "from datetime import datetime, timezone;"
+                 "print(tf.reply_format('1', '/nonexistent/s.json', datetime(2026, 10, 29, 12, tzinfo=timezone.utc),"
+                 " log=lambda m: 0)[1])")
+        import tempfile, shutil
+        d = Path(tempfile.mkdtemp(prefix="tweetfmt-cfg-"))
+        self.addCleanup(shutil.rmtree, d, True)
+        r = subprocess.run([sys.executable, "-c", probe], cwd=ROOT, capture_output=True, text=True,
+                           env={**os.environ, "TPCR_TWEET_FORMAT_CONFIG": str(d / "missing.json")})
+        self.assertIn("config missing/invalid", r.stdout, r.stderr)
+        self.assertNotIn("after retirement", r.stdout)
+
     def test_good_config_has_no_error(self):
         r = self.probe((ROOT / "config" / "tweet_format.json").read_text())
         self.assertEqual(r.stdout.split()[:3], ["False", "old", "False"], r.stderr)
@@ -215,6 +234,38 @@ class OldAltText(unittest.TestCase):
             {"park_name": "EPCOT", "wti": 12.0, "wti_label": "Quiet"}, {"park_code": "MK", "wti": 31.0, "wti_label": "Busy"}]})
         self.assertIn("EPCOT 12.0 (Quiet)", a)
         self.assertIn("Magic Kingdom 31.0 (Busy)", a)
+
+
+    def test_old_video_alt_does_not_promise_missing_labels(self):
+        some = tweet_v1_legacy.alt_text({"target_date": "2026-10-28", "parks": [
+            {"park_name": "EPCOT", "wti": 12.0, "wti_label": "Quiet"}, {"park_code": "MK", "wti": 31.0}]})
+        none = tweet_v1_legacy.alt_text({"target_date": "2026-10-28", "parks": [
+            {"park_name": "EPCOT", "wti": 12.0}, {"park_code": "MK", "wti": 31.0, "wti_label": ""}]})
+        for a in (some, none):
+            self.assertNotIn("with its crowd label", a)
+        self.assertIn("where one is available", some)
+        self.assertIn("EPCOT 12.0 (Quiet); Magic Kingdom 31.0.", some)
+        self.assertNotIn("label", none)
+        self.assertIn("each park's observed WTI. EPCOT 12.0; Magic Kingdom 31.0.", none)
+
+
+class LookupFailure(unittest.TestCase):
+    """reply_format's except branch: a lookup failure uses the run clock (old inside the window, new after)."""
+
+    def run_at(self, now):
+        log = []
+        with mock.patch.object(tf, "load_store", side_effect=RuntimeError("boom")):
+            return tf.reply_format(OLD_ID, "/nonexistent/tweet_state.json", now, log=log.append), log
+
+    def test_lookup_failure_inside_window_is_old(self):
+        for now in (et(2026, 10, 28, 16), et(2026, 10, 29, 8, 30), et(2026, 10, 30, 23, 59, 59)):
+            (fmt, why), log = self.run_at(now)
+            self.assertEqual((fmt, why), ("old", "lookup failed"), now)
+            self.assertIn("using old", log[-1])
+
+    def test_lookup_failure_after_retirement_is_new(self):
+        (fmt, why), _ = self.run_at(et(2026, 10, 31, 0))
+        self.assertEqual((fmt, why), ("new", "lookup failed"))
 
 
 class Scripts(Base):
@@ -291,6 +342,33 @@ class Scripts(Base):
             rc, out, _ = self.run_main(wpt, ["--date", "2026-10-29", "--content-dir", str(self.cdir), "--history", "h",
                                              "--state-file", str(self.state)])
         self.assertEqual(rc, 0); self.assertIn("skipped_before_cutover", out)
+
+    def bad_config_predicted(self, when, extra=()):
+        self.at(when)
+        post = mock.Mock(side_effect=AssertionError("posted with a bad config before any new original"))
+        with mock.patch.object(tf, "CONFIG_ERROR", "FileNotFoundError: x"), \
+             mock.patch.object(tf, "FIRST_NEW_RUN", datetime.min.replace(tzinfo=timezone.utc)), \
+             mock.patch.object(wpt, "load_env"), mock.patch.object(wpt, "enforce"), mock.patch.dict("os.environ", ENV), \
+             mock.patch.object(requests, "post", post), mock.patch.object(wpt, "post_discord"):
+            rc, out, err = self.run_main(wpt, ["--date", "2026-10-29", "--content-dir", str(self.cdir), "--history", "h",
+                                             "--state-file", str(self.state)])
+        return rc, out, err, post
+
+    def test_bad_config_before_first_new_run_skips_original(self):
+        self.state.write_text(json.dumps({"predicted": {D: {"tweet_id": OLD_ID, "posted_at": BEFORE}}}))
+        tf.record(self.state, OLD_ID, "old", "predicted", D, BEFORE)
+        rc, out, err, post = self.bad_config_predicted(et(2026, 10, 28, 15, 0))
+        self.assertEqual(rc, 0)
+        self.assertIn("skipped_bad_config", out)
+        self.assertIn("config missing/invalid", err)
+        post.assert_not_called()
+
+    def test_bad_config_blocks_only_until_a_new_original_exists(self):
+        self.assertIsNone(tf.original_run_blocked(self.state))  # good config: never blocked
+        with mock.patch.object(tf, "CONFIG_ERROR", "ValueError: x"):
+            self.assertIn("config missing/invalid", tf.original_run_blocked(self.tmp / "missing" / "s.json"))
+            tf.record(self.state, NEW_ID, "new", "predicted", D, AFTER)
+            self.assertIsNone(tf.original_run_blocked(self.state))
 
     def test_predicted_live_at_first_new_run_posts_and_tags_new(self):
         D2 = "2026-10-29"

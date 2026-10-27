@@ -293,6 +293,12 @@ def main(argv=None):
               f"{tweet_format.FIRST_NEW_RUN.isoformat()}; nothing posted")
         return 0
 
+    blocked = None if dry else tweet_format.original_run_blocked(state_file)
+    if blocked:
+        print(f"ERROR skipped_bad_config ref={reference_date}: {blocked}; nothing posted", file=sys.stderr)
+        print(f"skipped_bad_config ref={reference_date}: nothing posted")
+        return 0
+
     if not tweet_v2.check_closures("predicted", reference_date, args.closures, print if dry else post_discord):
         sys.exit(1)  # R3: bad or missing closures.csv fails the run before any post
 

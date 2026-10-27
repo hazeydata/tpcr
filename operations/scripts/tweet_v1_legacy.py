@@ -32,7 +32,17 @@ def alt_text(content):
                       + (f" ({p['wti_label']})" if p.get("wti_label") else "")
                       for p in sorted(content["parks"], key=lambda p: p["wti"]))
     return (f"Animated TPCR observed Wait Time Index (WTI) for Walt Disney World, {content['target_date']}: "
-            f"each park's observed WTI with its crowd label. {parks}.")[:1000]
+            + _labels_phrase(content["parks"]) + f". {parks}.")[:1000]
+
+
+def _labels_phrase(parks):
+    """Opening line promises crowd labels only for the parks that actually have one."""
+    n = sum(1 for p in parks if p.get("wti_label"))
+    if n and n == len(parks):
+        return "each park's observed WTI with its crowd label"
+    if n:
+        return "each park's observed WTI, with a crowd label where one is available"
+    return "each park's observed WTI"
 
 
 def render_video(target_date, content):

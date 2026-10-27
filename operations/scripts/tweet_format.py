@@ -24,7 +24,7 @@ OLD, NEW = "old", "new"
 ET = ZoneInfo("America/Toronto")
 # A missing or corrupt config must not crash the 4 PM / 8:30 AM scripts at import. Defined behavior: CONFIG_ERROR is
 # set, an ERROR is logged to stderr, and the window collapses to "already retired" (FIRST_NEW_RUN = OLD_RETIRES =
-# datetime.min UTC): every original and every reply is NEW, the predicted run is never skipped as pre-cutover.
+# datetime.min UTC): every reply is NEW; the 4 PM original run is SKIPPED until a new original exists (D7).
 CONFIG_ERROR = None
 try:
     _cfg = json.loads(CONFIG.read_text())
@@ -36,9 +36,31 @@ try:
 except Exception as _e:  # noqa: BLE001 - fail safe, see above
     CONFIG_ERROR = f"{type(_e).__name__}: {_e}"
     print(f"ERROR tweet_format: config {CONFIG} unusable ({CONFIG_ERROR}); "
-          "treating the old format as retired: everything is new", file=sys.stderr)
+          "every reply is new; the 4 PM original run is skipped until a new-format original exists", file=sys.stderr)
     FIRST_NEW_RUN = OLD_RETIRES = datetime.min.replace(tzinfo=timezone.utc)
     STORE_NAME = "tweet_formats.json"
+
+
+CONFIG_REASON = "config missing/invalid: everything new"
+
+
+def original_run_blocked(state_file, log=print):
+    """None if the 4 PM new-format original run may post; else the reason it must post nothing.
+    Only a bad config blocks it: FIRST_NEW_RUN is then unknown, so the run posts only once the tag store or
+    tweet_state already records a new-format original (i.e. the first new run has happened). Never raises."""
+    if not CONFIG_ERROR:
+        return None
+    try:
+        if any(isinstance(e, dict) and e.get("format") == NEW and e.get("kind") == "predicted"
+               for e in load_store(state_file, log).values()):
+            return None
+        s = json.loads(Path(state_file).read_text())
+        if any(isinstance(e, dict) and e.get("format") == NEW for e in (s.get("predicted") or {}).values()):
+            return None
+    except Exception:  # noqa: BLE001 - unknown history: fail closed
+        pass
+    return (f"config missing/invalid ({CONFIG_ERROR}) and no new-format original recorded yet; "
+            "skipping the new-format original run so nothing posts before the cutover")
 
 
 def store_path(state_file):
@@ -117,10 +139,12 @@ def reply_format(tweet_id, state_file, now, log=print):
         tag = tag.get("format") if isinstance(tag, dict) else None
         posted = _posted_at_from_state(state_file, tweet_id)
         if now >= OLD_RETIRES:
-            if tag not in (OLD, NEW):
+            if tag not in (OLD, NEW) and not CONFIG_ERROR:
                 log(f"tweet_format: NOTE untagged original {tweet_id} after the old format retired "
                     f"({OLD_RETIRES.isoformat()}); using new")
                 return NEW, "untagged, after retirement"
+            if CONFIG_ERROR:
+                return NEW, f"{CONFIG_REASON} (original tagged {tag})"
             return NEW, f"after retirement (original tagged {tag})"
         if posted is not None and posted < FIRST_NEW_RUN:
             return OLD, "original posted before the cutover"
