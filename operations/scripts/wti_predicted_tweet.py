@@ -255,12 +255,25 @@ def post_discord(message):
     token = os.environ.get("DISCORD_BOT_TOKEN", "")
     if not token:
         return
-    requests.post(
+    resp = requests.post(
         f"{DISCORD_API}/channels/{DISCORD_CHANNEL_ID}/messages",
         json={"content": message},
         headers={"Authorization": f"Bot {token}", "Content-Type": "application/json"},
         timeout=15,
     )
+    if not resp.ok:  # non-2xx is a failed alert; status code only, never the token or response body
+        raise requests.exceptions.HTTPError(f"Discord alert HTTP {resp.status_code}")
+
+
+def safe_alert(message):
+    """post_discord for paths where an alert failure must not change the run's outcome: logs the exception type
+    only (no secrets) and returns False."""
+    try:
+        post_discord(message)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        print(f"ERROR: Discord alert failed ({type(exc).__name__}); run outcome unchanged", file=sys.stderr)
+        return False
 
 
 def main(argv=None):
@@ -299,7 +312,7 @@ def main(argv=None):
         print(f"skipped_bad_config ref={reference_date}: nothing posted")
         # One Discord alert per skipped run (post_discord is a no-op without DISCORD_BOT_TOKEN: stderr only).
         # Skips repeat every 4 PM until the config is fixed; a fixed config resumes the next run.
-        # An alert failure (timeout, ConnectionError, anything) is logged and the skip still exits 0.
+        # An alert failure (timeout, ConnectionError, HTTP non-2xx, anything) is logged and the skip still exits 0.
         try:
             post_discord(f":warning: **WTI Predicted Tweet** \u2014 ref={reference_date}: config {tweet_format.CONFIG} "
                          "missing/invalid; the forecast original was skipped, nothing posted. Every 4 PM original is "
@@ -309,15 +322,15 @@ def main(argv=None):
                   "run still skipped, exit 0", file=sys.stderr)
         return 0
 
-    if not tweet_v2.check_closures("predicted", reference_date, args.closures, print if dry else post_discord):
+    if not tweet_v2.check_closures("predicted", reference_date, args.closures, print if dry else safe_alert):
         sys.exit(1)  # R3: bad or missing closures.csv fails the run before any post
 
     raw, content = load_content(reference_date, args.content_dir)
     if not content:
         # AC 5a (closed-row R2): missing data is a skip, not a failure -> exit 0; alert after 2 days in a row
-        tweet_v2.record_no_data("predicted", reference_date, state_file, post_discord if not dry else print, dry)
+        tweet_v2.record_no_data("predicted", reference_date, state_file, safe_alert if not dry else print, dry)
         return 0
-    alert = print if dry else post_discord
+    alert = print if dry else safe_alert
     stale = tweet_v2.forecast_staleness(raw, reference_date)
     if stale:  # AC 16: old content never posts
         tweet_v2.record_stale("predicted", reference_date, stale, alert, state_file, dry)
@@ -368,17 +381,17 @@ def main(argv=None):
         # Fred, Oct 26 2026: "Stay silent on missing-data days". No card = no tweet (edge copy v2 E1/E6/E7).
         if not f:
             print(f"SILENT: no forecast card for {reference_date} ({build_error}); nothing posted")
-            post_discord(f":mute: **WTI Predicted Tweet** \u2014 ref={reference_date}: card not built, staying silent ({build_error})"[:1900])
+            safe_alert(f":mute: **WTI Predicted Tweet** \u2014 ref={reference_date}: card not built, staying silent ({build_error})"[:1900])
             return None
         media_id = upload_media(f["mp4"], f["alt"])
         if not media_id:
             print("SILENT: video upload failed; nothing posted", file=sys.stderr)
-            post_discord(f":x: **WTI Predicted Tweet** \u2014 ref={reference_date}: video upload failed, nothing posted")
+            safe_alert(f":x: **WTI Predicted Tweet** \u2014 ref={reference_date}: video upload failed, nothing posted")
             sys.exit(1)
 
         tweet_id = post_tweet(tweet_text, media_id=media_id)
         if not tweet_id:
-            post_discord(":x: **WTI Predicted Tweet** \u2014 Twitter API error, tweet failed")
+            safe_alert(":x: **WTI Predicted Tweet** \u2014 Twitter API error, tweet failed")
             sys.exit(1)
 
         save_state(tweet_id, reference_date)
@@ -386,7 +399,7 @@ def main(argv=None):
         if note:
             tweet_note.save_draft(STATE_FILE, reference_date, tweet_id, note)
 
-        post_discord(
+        safe_alert(
             f":white_check_mark: **WTI Predicted Tweet posted** \u2014 ref={reference_date}"
             "\n"
             f"https://x.com/DisneyStatsWhiz/status/{tweet_id}"

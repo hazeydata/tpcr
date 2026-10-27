@@ -25,6 +25,7 @@ ET = timezone(timedelta(hours=-4))  # EDT on Oct 26-31 2026
 OLD_ID, NEW_ID = "1850000000000000001", "1850000000000000002"
 BEFORE = "2026-10-27T20:00:01Z"  # Oct 27 4 PM ET (old run)
 AFTER = "2026-10-28T20:00:05Z"   # Oct 28 4 PM ET (first new run)
+SENTINEL = "SENTINEL-discord-token-0xD15C"
 ENV = {k: "x" for k in ("TWITTER_CONSUMER_KEY", "TWITTER_CONSUMER_SECRET", "TWITTER_ACCESS_TOKEN", "TWITTER_ACCESS_TOKEN_SECRET")}
 
 
@@ -375,6 +376,94 @@ class Scripts(Base):
             self.assertEqual(rc, 0); self.assertIn("skipped_bad_config", out); post.assert_not_called()
             self.assertEqual(d.call_count, 1)
             self.assertIn(f"Discord alert failed ({type(exc).__name__})", err)
+        # Real HTTP failures through the real post_discord: a 500 and a 4xx must be logged too, never silent.
+        for code in (500, 403):
+            self.at(et(2026, 10, 28, 16, 0))
+            calls = []
+            post = self.discord_status_post(calls, code)
+            with mock.patch.object(tf, "CONFIG_ERROR", "FileNotFoundError: x"), \
+                 mock.patch.object(tf, "FIRST_NEW_RUN", datetime.min.replace(tzinfo=timezone.utc)), \
+                 mock.patch.object(wpt, "load_env"), mock.patch.object(wpt, "enforce"), \
+                 mock.patch.dict("os.environ", dict(ENV, DISCORD_BOT_TOKEN=SENTINEL)), \
+                 mock.patch.object(requests, "post", post):
+                rc, out, err = self.run_main(wpt, ["--date", "2026-10-29", "--content-dir", str(self.cdir), "--history", "h",
+                                                 "--state-file", str(self.state)])
+            self.assertEqual(rc, 0); self.assertIn("skipped_bad_config", out)
+            self.assertEqual(len(calls), 1); self.assertTrue(calls[0].startswith(wpt.DISCORD_API))
+            self.assertIn("Discord alert failed (HTTPError)", err)
+            self.assertNotIn(SENTINEL, out + err); self.assertNotIn("discord-error-body", out + err)
+
+    def discord_status_post(self, calls, code):
+        def post(url, **kw):
+            calls.append(url)
+            if not url.startswith(wpt.DISCORD_API):
+                raise AssertionError(f"unexpected non-Discord post: {url}")
+            r = requests.models.Response(); r.status_code = code; r._content = b"discord-error-body"; r.url = url
+            return r
+        return post
+
+    def test_post_discord_raises_on_non_2xx_without_token_or_body(self):
+        for code in (500, 502, 400, 401, 404, 429):
+            with mock.patch.dict("os.environ", {"DISCORD_BOT_TOKEN": SENTINEL}), \
+                 mock.patch.object(requests, "post", self.discord_status_post([], code)):
+                with self.assertRaises(requests.exceptions.HTTPError) as cm:
+                    wpt.post_discord("m")
+            self.assertIn(str(code), str(cm.exception))
+            self.assertNotIn(SENTINEL, str(cm.exception)); self.assertNotIn("discord-error-body", str(cm.exception))
+        for code in (200, 204):
+            calls = []
+            with mock.patch.dict("os.environ", {"DISCORD_BOT_TOKEN": SENTINEL}), \
+                 mock.patch.object(requests, "post", self.discord_status_post(calls, code)):
+                self.assertIsNone(wpt.post_discord("m"))
+            self.assertEqual(len(calls), 1)
+        with mock.patch.dict("os.environ", {}, clear=False), mock.patch.object(requests, "post") as p:
+            os.environ.pop("DISCORD_BOT_TOKEN", None)
+            wpt.post_discord("m"); p.assert_not_called()
+
+    def test_safe_alert_logs_type_only_and_returns_false(self):
+        for exc in (requests.exceptions.HTTPError("Discord alert HTTP 500"), requests.exceptions.Timeout(SENTINEL)):
+            err = io.StringIO()
+            with mock.patch.object(wpt, "post_discord", side_effect=exc), redirect_stderr(err):
+                self.assertFalse(wpt.safe_alert("m"))
+            self.assertIn(f"Discord alert failed ({type(exc).__name__})", err.getvalue())
+            self.assertNotIn(SENTINEL, err.getvalue())
+        with mock.patch.object(wpt, "post_discord") as d:
+            self.assertTrue(wpt.safe_alert("m")); d.assert_called_once_with("m")
+
+    def test_predicted_success_alert_failure_keeps_tweet_and_state(self):
+        # The posted-confirmation alert fails (Discord 500) after the tweet is out: no crash, state saved, rc None.
+        D2 = "2026-10-29"
+        from tests.test_tweet_v2 import content
+        (self.cdir / f"predicted_{D2}.json").write_text(content(D2, [20.1, 21.0, 26.0, 33.3], generated_at="2026-10-28T10:00:00-04:00"))
+        self.at(et(2026, 10, 28, 16, 0, 0))
+        calls = []
+        with mock.patch.object(wpt, "load_env"), mock.patch.object(wpt, "enforce"), mock.patch.dict("os.environ", ENV), \
+             mock.patch.object(requests, "post", self.post_fake(calls, "PRED-ALERTFAIL")), \
+             mock.patch.object(wpt, "post_discord", side_effect=requests.exceptions.HTTPError("Discord alert HTTP 500")) as d, \
+             mock.patch.object(tweet_v2, "parquet_last_date", return_value=D2), \
+             mock.patch.object(tweet_v2, "build", self.fake_build), mock.patch.object(wpt, "STATE_FILE", self.state):
+            rc, out, err = self.run_main(wpt, ["--date", D2, "--content-dir", str(self.cdir), "--history", "h",
+                                             "--state-file", str(self.state)])
+        self.assertIn(rc, (None, 0)); self.assertTrue(any(u == wpt.TWITTER_API for u, _ in calls))
+        self.assertEqual(json.loads(self.state.read_text())["predicted"][D2]["tweet_id"], "PRED-ALERTFAIL")
+        self.assertGreaterEqual(d.call_count, 1); self.assertIn("Discord alert failed (HTTPError)", err)
+
+    def test_predicted_park_hours_alert_failure_still_posts(self):
+        D2 = "2026-10-29"
+        from tests.test_tweet_v2 import content
+        (self.cdir / f"predicted_{D2}.json").write_text(content(D2, [20.1, 21.0, 26.0, 33.3], generated_at="2026-10-28T10:00:00-04:00"))
+        self.at(et(2026, 10, 28, 16, 0, 0))
+        calls = []
+        with mock.patch.object(wpt, "load_env"), mock.patch.object(wpt, "enforce"), mock.patch.dict("os.environ", ENV), \
+             mock.patch.object(requests, "post", self.post_fake(calls, "PRED-PH")), \
+             mock.patch.object(wpt, "post_discord", side_effect=requests.exceptions.HTTPError("Discord alert HTTP 500")), \
+             mock.patch.object(tweet_v2, "parquet_last_date", return_value=D2), \
+             mock.patch.object(tweet_v2, "build", self.fake_build), mock.patch.object(wpt, "STATE_FILE", self.state):
+            rc, out, err = self.run_main(wpt, ["--date", D2, "--content-dir", str(self.cdir), "--history", "h",
+                                             "--state-file", str(self.state), "--park-hours", str(self.tmp / "no-such-hours.csv")])
+        self.assertIn("park_hours_unreadable", err); self.assertIn("Discord alert failed (HTTPError)", err)
+        self.assertTrue(any(u == wpt.TWITTER_API for u, _ in calls))
+        self.assertEqual(json.loads(self.state.read_text())["predicted"][D2]["tweet_id"], "PRED-PH")
 
     def test_bad_config_skip_without_discord_token_is_stderr_only(self):
         self.at(et(2026, 10, 28, 16, 0))
