@@ -46,7 +46,9 @@ A parallel transition. The window lives only in `config/tweet_format.json` (read
   original before Oct 28 16:00 ET. **Worst case:** if the config is already broken at Oct 28 16:00, that first new original
   and every later 4 PM original are skipped (a skip records nothing, so it never recovers by itself); skips continue until
   the config is fixed, and fixing the config resumes the next 4 PM run. Each skip sends one Discord #wti-pipeline alert naming
-  the config path and that the forecast original was skipped (stderr only if `DISCORD_BOT_TOKEN` is unset). Once a new
+  the config path and that the forecast original was skipped (stderr only if `DISCORD_BOT_TOKEN` is unset). If the alert itself
+  fails (timeout, connection error, any exception), the failure is logged to stderr (exception type only) and the run still
+  prints `skipped_bad_config` and exits 0. Once a new
   original is recorded, a later broken config does not stop the forecast.
 - **Old reply:** `operations/scripts/tweet_v1_legacy.py`: the pre-v2 Remotion `DailyWTIAll` video rendered on the data host
   (`TPCR_SSH_HOST`, `TPCR_REMOTION_DIR`; no defaults) and the pre-v2 reply text, now with alt text (each park's WTI and crowd label; the opening line mentions labels only for parks that have one). A dry run renders nothing and
@@ -101,7 +103,7 @@ Optional: `--content-dir DIR` (local `predicted_D.json`/`observed_D.json` instea
 ## Tests
 `python3 -m unittest -v tests.test_tweet_v2 tests.test_tweet_guard tests.test_scorecard tests.test_tweet_format tests.test_tweet_v2_samples`
 (stubs `requests_oauthlib`; no network; use a python with pandas + pyarrow or the sample tests skip).
-- `test_tweet_format`: the transition window, boundaries (incl. an original posted exactly at 16:00:00), tagged/untagged originals, naive clock, corrupt store, missing/corrupt config, custom `store_name`, a lookup failure inside and after the window, bad config skipping the 4 PM original (Discord alert, stderr-only without a token, state-only unblock, observed/reply tags don't unblock, fixed config resumes the next run), old-video alt text with missing labels, old/new reply through the scripts.
+- `test_tweet_format`: the transition window, boundaries (incl. an original posted exactly at 16:00:00), tagged/untagged originals, naive clock, corrupt store, missing/corrupt config, custom `store_name`, a lookup failure inside and after the window, bad config skipping the 4 PM original (Discord alert, alert failure logged with exit 0, stderr-only without a token, state-only unblock, observed/reply tags don't unblock, fixed config resumes the next run), old-video alt text with missing labels, old/new reply through the scripts.
 - `test_tweet_v2_samples`: dry-renders every tpcr-meta#12 sample (forecast Sep 2-6, reply C Sep 2-6) from the same real data
   (`tests/fixtures/tweet_v2_samples/`) and compares: replies byte-identical; forecasts identical after Fred's three Oct 26 edits.
 - The three older suites run with the window moved to the past (`setUpModule`), so they test the new-format path.

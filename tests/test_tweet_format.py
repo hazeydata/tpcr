@@ -362,6 +362,20 @@ class Scripts(Base):
         msg = self.discord.call_args[0][0]
         self.assertIn(str(tf.CONFIG), msg); self.assertIn("forecast original was skipped", msg)
 
+    def test_bad_config_skip_alert_failure_is_logged_and_exits_0(self):  # m37
+        for exc in (requests.exceptions.Timeout("t"), requests.exceptions.ConnectionError("c"), RuntimeError("r")):
+            self.at(et(2026, 10, 28, 16, 0))
+            post = mock.Mock(side_effect=AssertionError("posted with a bad config"))
+            with mock.patch.object(tf, "CONFIG_ERROR", "FileNotFoundError: x"), \
+                 mock.patch.object(tf, "FIRST_NEW_RUN", datetime.min.replace(tzinfo=timezone.utc)), \
+                 mock.patch.object(wpt, "load_env"), mock.patch.object(wpt, "enforce"), mock.patch.dict("os.environ", ENV), \
+                 mock.patch.object(requests, "post", post), mock.patch.object(wpt, "post_discord", side_effect=exc) as d:
+                rc, out, err = self.run_main(wpt, ["--date", "2026-10-29", "--content-dir", str(self.cdir), "--history", "h",
+                                                 "--state-file", str(self.state)])
+            self.assertEqual(rc, 0); self.assertIn("skipped_bad_config", out); post.assert_not_called()
+            self.assertEqual(d.call_count, 1)
+            self.assertIn(f"Discord alert failed ({type(exc).__name__})", err)
+
     def test_bad_config_skip_without_discord_token_is_stderr_only(self):
         self.at(et(2026, 10, 28, 16, 0))
         post = mock.Mock(side_effect=AssertionError("network call"))

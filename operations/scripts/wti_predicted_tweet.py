@@ -299,9 +299,14 @@ def main(argv=None):
         print(f"skipped_bad_config ref={reference_date}: nothing posted")
         # One Discord alert per skipped run (post_discord is a no-op without DISCORD_BOT_TOKEN: stderr only).
         # Skips repeat every 4 PM until the config is fixed; a fixed config resumes the next run.
-        post_discord(f":warning: **WTI Predicted Tweet** \u2014 ref={reference_date}: config {tweet_format.CONFIG} "
-                     "missing/invalid; the forecast original was skipped, nothing posted. Every 4 PM original is "
-                     "skipped until the config is fixed."[:1900])
+        # An alert failure (timeout, ConnectionError, anything) is logged and the skip still exits 0.
+        try:
+            post_discord(f":warning: **WTI Predicted Tweet** \u2014 ref={reference_date}: config {tweet_format.CONFIG} "
+                         "missing/invalid; the forecast original was skipped, nothing posted. Every 4 PM original is "
+                         "skipped until the config is fixed."[:1900])
+        except Exception as exc:  # no secrets: exception type only
+            print(f"ERROR skipped_bad_config ref={reference_date}: Discord alert failed ({type(exc).__name__}); "
+                  "run still skipped, exit 0", file=sys.stderr)
         return 0
 
     if not tweet_v2.check_closures("predicted", reference_date, args.closures, print if dry else post_discord):
