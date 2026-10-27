@@ -129,3 +129,20 @@ class LegacyScriptsGuarded(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# TPCR-TWEET-RESTYLE-CUTOVER: the suites above test the new-format path, so they run as if the old format had
+# already retired (config/tweet_format.json window moved to the past). The window itself is tested in
+# tests/test_tweet_format.py.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "operations" / "scripts"))
+import tweet_format as _tf  # noqa: E402
+from datetime import datetime as _dtm, timezone as _tzu  # noqa: E402
+_PAST_WINDOW = mock.patch.multiple(_tf, FIRST_NEW_RUN=_dtm(2000, 1, 1, tzinfo=_tzu.utc), OLD_RETIRES=_dtm(2000, 1, 2, tzinfo=_tzu.utc))
+
+
+def setUpModule():
+    _PAST_WINDOW.start()
+
+
+def tearDownModule():
+    _PAST_WINDOW.stop()

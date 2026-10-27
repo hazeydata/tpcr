@@ -1,0 +1,237 @@
+"""TPCR-TWEET-RESTYLE-CUTOVER: parallel transition (Fred, Oct 27 2026, 4:41 PM ET).
+
+New originals from the Oct 28 4 PM ET run; a reply uses its original's format; the old format retires at
+00:00 ET Oct 31. No network: requests.post is a local fake, builds and renders are mocked."""
+import io
+import json
+import os
+import re
+import subprocess
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest import mock
+
+from tests.test_tweet_v2 import Base, D, ROOT, requests  # noqa: F401 - Base sets up content, state, fake build
+import tweet_format as tf
+import tweet_v1_legacy
+import tweet_v2
+import wti_observed_tweet as wot
+import wti_predicted_tweet as wpt
+
+ET = timezone(timedelta(hours=-4))  # EDT on Oct 26-31 2026
+OLD_ID, NEW_ID = "1850000000000000001", "1850000000000000002"
+BEFORE = "2026-10-27T20:00:01Z"  # Oct 27 4 PM ET (old run)
+AFTER = "2026-10-28T20:00:05Z"   # Oct 28 4 PM ET (first new run)
+ENV = {k: "x" for k in ("TWITTER_CONSUMER_KEY", "TWITTER_CONSUMER_SECRET", "TWITTER_ACCESS_TOKEN", "TWITTER_ACCESS_TOKEN_SECRET")}
+
+
+def et(*a):
+    return datetime(*a, tzinfo=ET)
+
+
+class Window(unittest.TestCase):
+    def test_constants_come_from_one_config(self):
+        cfg = json.loads((ROOT / "config" / "tweet_format.json").read_text())
+        self.assertEqual(tf.FIRST_NEW_RUN, datetime.fromisoformat(cfg["first_new_run"]))
+        self.assertEqual(tf.OLD_RETIRES, datetime.fromisoformat(cfg["old_retires"]))
+        self.assertEqual(tf.FIRST_NEW_RUN, et(2026, 10, 28, 16))
+        self.assertEqual(tf.OLD_RETIRES, et(2026, 10, 31, 0))
+        # the dates appear nowhere else in code (single constant)
+        code = subprocess.run(["git", "grep", "-l", "-E", r"2026-10-31T|2026, 10, 31|2026-10-28T16", "--", "*.py", "*.sh", "*.js"],
+                              cwd=ROOT, capture_output=True, text=True).stdout.split()
+        self.assertEqual([c for c in code if not c.startswith("tests/")], [])
+
+
+class ReplyFormat(unittest.TestCase):
+    def setUp(self):
+        import tempfile, shutil
+        self.tmp = Path(tempfile.mkdtemp(prefix="tweetfmt-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.state = self.tmp / "tweet_state.json"
+        self.state.write_text(json.dumps({"predicted": {
+            "2026-10-28": {"tweet_id": OLD_ID, "posted_at": BEFORE},
+            "2026-10-29": {"tweet_id": NEW_ID, "posted_at": AFTER, "format": "new"}}}))
+        self.log = []
+
+    def fmt(self, tid, now):
+        return tf.reply_format(tid, self.state, now, log=self.log.append)[0]
+
+    def tag(self, tid, f, posted):
+        tf.record(self.state, tid, f, "predicted", "x", posted, log=self.log.append)
+
+    # inside the window
+    def test_old_original_gets_old_reply_inside_window(self):
+        self.tag(OLD_ID, "old", BEFORE)
+        self.assertEqual(self.fmt(OLD_ID, et(2026, 10, 29, 8, 30)), "old")
+
+    def test_new_original_gets_new_reply_inside_window(self):
+        self.tag(NEW_ID, "new", AFTER)
+        self.assertEqual(self.fmt(NEW_ID, et(2026, 10, 30, 8, 30)), "new")
+
+    # untagged originals
+    def test_untagged_before_cutover_is_old(self):
+        self.assertFalse(tf.store_path(self.state).exists())
+        self.assertEqual(self.fmt(OLD_ID, et(2026, 10, 29, 8, 30)), "old")
+
+    def test_untagged_without_posted_at_is_old_inside_window(self):
+        self.assertEqual(self.fmt("999", et(2026, 10, 30, 8, 30)), "old")
+
+    def test_untagged_posted_after_cutover_is_new_inside_window(self):
+        self.assertEqual(self.fmt(NEW_ID, et(2026, 10, 30, 8, 30)), "new")
+
+    def test_tag_new_but_posted_before_cutover_is_old(self):
+        self.tag(OLD_ID, "new", BEFORE)
+        self.assertEqual(self.fmt(OLD_ID, et(2026, 10, 29, 8, 30)), "old")
+
+    def test_untagged_after_retirement_is_new_and_logged(self):
+        self.assertEqual(self.fmt(OLD_ID, et(2026, 11, 1, 8, 30)), "new")
+        self.assertTrue(any("NOTE untagged original" in m for m in self.log), self.log)
+
+    def test_tagged_old_after_retirement_is_new(self):
+        self.tag(OLD_ID, "old", BEFORE)
+        self.assertEqual(self.fmt(OLD_ID, et(2026, 11, 1, 8, 30)), "new")
+        self.assertFalse(any("NOTE untagged" in m for m in self.log))
+
+    # exact boundaries
+    def test_first_new_run_boundary(self):
+        self.assertEqual(tf.original_format(et(2026, 10, 28, 15, 59, 59)), "old")
+        self.assertEqual(tf.original_format(et(2026, 10, 28, 16, 0, 0)), "new")
+        self.assertEqual(tf.original_format(datetime(2026, 10, 28, 20, 0, tzinfo=timezone.utc)), "new")
+        self.assertEqual(tf.original_format(datetime(2026, 10, 28, 19, 59, 59, 999999, tzinfo=timezone.utc)), "old")
+
+    def test_retirement_boundary(self):
+        self.tag(OLD_ID, "old", BEFORE)
+        self.assertEqual(self.fmt(OLD_ID, et(2026, 10, 30, 23, 59, 59)), "old")
+        self.assertEqual(self.fmt(OLD_ID, et(2026, 10, 31, 0, 0, 0)), "new")
+        self.assertEqual(self.fmt(OLD_ID, datetime(2026, 10, 31, 4, 0, tzinfo=timezone.utc)), "new")
+
+    # missing or corrupt store: fail safe, never raise
+    def test_missing_store_falls_back_to_posted_at(self):
+        self.assertEqual(self.fmt(OLD_ID, et(2026, 10, 29, 8, 30)), "old")
+        self.assertEqual(self.fmt(NEW_ID, et(2026, 10, 30, 8, 30)), "new")
+
+    def test_corrupt_store_falls_back_and_never_raises(self):
+        for junk in ("{not json", "[1, 2]", "", "\x00\xff"):
+            with self.subTest(junk=junk):
+                tf.store_path(self.state).write_text(junk)
+                self.assertEqual(self.fmt(OLD_ID, et(2026, 10, 29, 8, 30)), "old")
+                self.assertEqual(self.fmt(NEW_ID, et(2026, 10, 30, 8, 30)), "new")
+        self.assertTrue(any("unreadable" in m for m in self.log))
+
+    def test_corrupt_store_entry_and_state_never_raise(self):
+        tf.store_path(self.state).write_text(json.dumps({OLD_ID: "new", NEW_ID: None}))
+        self.state.write_text("{broken")
+        self.assertEqual(self.fmt(OLD_ID, et(2026, 10, 29, 8, 30)), "old")
+        self.assertEqual(self.fmt(OLD_ID, et(2026, 10, 31, 0, 0)), "new")
+
+    def test_store_is_a_directory_never_raises(self):
+        tf.store_path(self.state).mkdir()
+        self.assertEqual(self.fmt(OLD_ID, et(2026, 10, 29, 8, 30)), "old")
+        self.assertFalse(tf.record(self.state, "1", "new", "predicted", D, AFTER, log=self.log.append))
+
+    def test_migrate_tags_by_posted_at_and_is_idempotent(self):
+        added = tf.migrate(self.state, log=self.log.append)
+        self.assertEqual({k: v["format"] for k, v in added.items()}, {OLD_ID: "old", NEW_ID: "new"})
+        self.assertEqual(tf.migrate(self.state, log=self.log.append), {})
+        self.assertEqual(json.loads(tf.store_path(self.state).read_text())[OLD_ID]["format"], "old")
+
+    def test_migrate_dry_run_writes_nothing(self):
+        tf.migrate(self.state, dry=True, log=self.log.append)
+        self.assertFalse(tf.store_path(self.state).exists())
+
+
+class Scripts(Base):
+    """Through the real scripts (build, render and X calls faked locally)."""
+
+    def at(self, when):
+        p = mock.patch.object(tweet_v2, "now", return_value=when); p.start(); self.addCleanup(p.stop)
+
+    def dry_observed(self):
+        with mock.patch.object(tweet_v2, "build", self.fake_build), \
+             mock.patch.object(tweet_v1_legacy, "render_video", side_effect=AssertionError("dry run rendered")):
+            rc, out, _ = self.run_main(wot, ["--dry-run", "--date", D, "--content-dir", str(self.cdir), "--history", "h",
+                                             "--state-file", str(self.state), "--out", str(self.tmp / "o")])
+        return rc, out, json.loads((self.tmp / "o" / "dry_run.json").read_text())
+
+    def test_old_original_dry_run_builds_old_reply_with_alt_text(self):
+        self.state.write_text(json.dumps({"predicted": {D: {"tweet_id": OLD_ID, "posted_at": BEFORE}}}))
+        self.at(et(2026, 10, 29, 8, 30))
+        rc, out, m = self.dry_observed()
+        self.assertEqual((rc, m["format"], m["reply_to_tweet_id"]), (0, "old", OLD_ID))
+        self.assertTrue(m["tweet_text"].startswith(f"How it actually went \u2014 {D}:"))
+        self.assertIn("Animal Kingdom 27.0", m["alt_text"])
+        self.assertIn("Reply format for ref=2026-10-28: old", out)
+
+    def test_new_original_dry_run_builds_new_reply(self):
+        self.state.write_text(json.dumps({"predicted": {D: {"tweet_id": NEW_ID, "posted_at": AFTER, "format": "new"}}}))
+        tf.record(self.state, NEW_ID, "new", "predicted", D, AFTER)
+        self.at(et(2026, 10, 30, 8, 30))
+        rc, out, m = self.dry_observed()
+        self.assertEqual((rc, m["alt_text"], m["reply_to_tweet_id"]), (0, "R alt", NEW_ID))
+        self.assertNotIn("format", m)
+
+    def test_corrupt_store_never_crashes_the_reply(self):
+        self.state.write_text(json.dumps({"predicted": {D: {"tweet_id": OLD_ID, "posted_at": BEFORE}}}))
+        tf.store_path(self.state).write_text("{{{")
+        self.at(et(2026, 10, 29, 8, 30))
+        rc, _, m = self.dry_observed()
+        self.assertEqual((rc, m["format"]), (0, "old"))
+
+    def post_fake(self, calls, tid):
+        def post(url, **kw):
+            calls.append((url, kw))
+            if url == wot.TWITTER_UPLOAD_API:
+                return self.resp(200, {"media_id_string": "M1"})
+            if url == tweet_v2.TWITTER_METADATA_API:
+                return self.resp(200, {})
+            return self.resp(201, {"data": {"id": tid}})
+        return post
+
+    def resp(self, code, body):
+        r = mock.Mock(status_code=code, text=json.dumps(body)); r.json.return_value = body; return r
+
+    def test_live_old_reply_posts_old_video_with_alt_text_and_tags_it(self):
+        self.state.write_text(json.dumps({"predicted": {D: {"tweet_id": OLD_ID, "posted_at": BEFORE}}}))
+        self.at(et(2026, 10, 29, 8, 30))
+        mp4 = self.tmp / "old.mp4"; mp4.write_bytes(b"mp4")
+        calls = []
+        with mock.patch.object(wot, "load_env"), mock.patch.object(wot, "enforce"), mock.patch.dict("os.environ", ENV), \
+             mock.patch.object(requests, "post", self.post_fake(calls, "OBS-OLD")), mock.patch.object(wot, "post_discord"), \
+             mock.patch.object(tweet_v2, "build", side_effect=AssertionError("v2 build for an old original")), \
+             mock.patch.object(tweet_v1_legacy, "render_video", return_value=mp4):
+            self.run_main(wot, ["--date", D, "--content-dir", str(self.cdir), "--history", "h", "--state-file", str(self.state)])
+        meta = [kw["json"] for u, kw in calls if u == tweet_v2.TWITTER_METADATA_API]
+        self.assertEqual(len(meta), 1); self.assertIn("Walt Disney World", meta[0]["alt_text"]["text"])
+        tweet = [kw["json"] for u, kw in calls if u == wot.TWITTER_API][0]
+        self.assertEqual(tweet["reply"], {"in_reply_to_tweet_id": OLD_ID})
+        self.assertEqual(json.loads(tf.store_path(self.state).read_text())["OBS-OLD"]["format"], "old")
+
+    def test_predicted_live_before_first_new_run_posts_nothing(self):
+        self.at(et(2026, 10, 28, 15, 59, 59))
+        post = mock.Mock(side_effect=AssertionError("posted before cutover"))
+        with mock.patch.object(wpt, "load_env"), mock.patch.object(wpt, "enforce"), mock.patch.dict("os.environ", ENV), \
+             mock.patch.object(requests, "post", post):
+            rc, out, _ = self.run_main(wpt, ["--date", "2026-10-29", "--content-dir", str(self.cdir), "--history", "h",
+                                             "--state-file", str(self.state)])
+        self.assertEqual(rc, 0); self.assertIn("skipped_before_cutover", out)
+
+    def test_predicted_live_at_first_new_run_posts_and_tags_new(self):
+        D2 = "2026-10-29"
+        from tests.test_tweet_v2 import content
+        (self.cdir / f"predicted_{D2}.json").write_text(content(D2, [20.1, 21.0, 26.0, 33.3], generated_at="2026-10-28T10:00:00-04:00"))
+        self.at(et(2026, 10, 28, 16, 0, 0))
+        calls = []
+        with mock.patch.object(wpt, "load_env"), mock.patch.object(wpt, "enforce"), mock.patch.dict("os.environ", ENV), \
+             mock.patch.object(requests, "post", self.post_fake(calls, "PRED-NEW")), mock.patch.object(wpt, "post_discord"), \
+             mock.patch.object(tweet_v2, "parquet_last_date", return_value=D2), \
+             mock.patch.object(tweet_v2, "build", self.fake_build), mock.patch.object(wpt, "STATE_FILE", self.state):
+            self.run_main(wpt, ["--date", D2, "--content-dir", str(self.cdir), "--history", "h", "--state-file", str(self.state)])
+        self.assertTrue(any(u == wpt.TWITTER_API for u, _ in calls))
+        self.assertEqual(json.loads(self.state.read_text())["predicted"][D2]["format"], "new")
+        self.assertEqual(json.loads(tf.store_path(self.state).read_text())["PRED-NEW"]["format"], "new")
+
+
+if __name__ == "__main__":
+    unittest.main()

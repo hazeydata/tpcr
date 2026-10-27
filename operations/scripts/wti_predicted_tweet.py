@@ -25,6 +25,7 @@ from pathlib import Path
 import requests
 from requests_oauthlib import OAuth1
 
+import tweet_format
 import tweet_note
 import tweet_v2
 from tweet_guard import enforce, preflight_legacy, status as guard_status
@@ -230,6 +231,7 @@ def save_state(tweet_id, reference_date):
         state["predicted"][reference_date] = {
             "tweet_id": tweet_id,
             "posted_at": posted_at,
+            "format": tweet_format.NEW,  # TPCR-TWEET-RESTYLE-CUTOVER: this script only posts the new format
         }
 
         # Keep last_predicted for backwards compat
@@ -245,6 +247,7 @@ def save_state(tweet_id, reference_date):
         state["predicted"] = {k: v for k, v in state["predicted"].items() if k >= cutoff}
 
         tweet_note._save(STATE_FILE, state)
+    tweet_format.record(STATE_FILE, tweet_id, tweet_format.NEW, "predicted", reference_date, posted_at)
     print(f"State saved: reference_date={reference_date}, tweet_id={tweet_id}")
 
 
@@ -283,6 +286,12 @@ def main(argv=None):
             if not os.environ.get(key):
                 print(f"ERROR: {key} not set", file=sys.stderr)
                 sys.exit(1)
+
+    if not dry and tweet_v2.now() < tweet_format.FIRST_NEW_RUN:
+        # TPCR-TWEET-RESTYLE-CUTOVER: new-format originals start at FIRST_NEW_RUN (config/tweet_format.json).
+        print(f"skipped_before_cutover ref={reference_date}: new-format originals start "
+              f"{tweet_format.FIRST_NEW_RUN.isoformat()}; nothing posted")
+        return 0
 
     if not tweet_v2.check_closures("predicted", reference_date, args.closures, print if dry else post_discord):
         sys.exit(1)  # R3: bad or missing closures.csv fails the run before any post
