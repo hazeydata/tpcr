@@ -97,7 +97,7 @@ Optional: `--content-dir DIR` (local `predicted_D.json`/`observed_D.json` instea
 ## Tests
 `python3 -m unittest -v tests.test_tweet_v2 tests.test_tweet_guard tests.test_scorecard tests.test_tweet_format tests.test_tweet_v2_samples`
 (stubs `requests_oauthlib`; no network; use a python with pandas + pyarrow or the sample tests skip).
-- `test_tweet_format`: the transition window, boundaries (incl. an original posted exactly at 16:00:00), tagged/untagged originals, naive clock, corrupt store, missing/corrupt config, old/new reply through the scripts.
+- `test_tweet_format`: the transition window, boundaries (incl. an original posted exactly at 16:00:00), tagged/untagged originals, naive clock, corrupt store, missing/corrupt config, custom `store_name`, a lookup failure inside and after the window, bad config skipping the 4 PM original, old-video alt text with missing labels, old/new reply through the scripts.
 - `test_tweet_v2_samples`: dry-renders every tpcr-meta#12 sample (forecast Sep 2-6, reply C Sep 2-6) from the same real data
   (`tests/fixtures/tweet_v2_samples/`) and compares: replies byte-identical; forecasts identical after Fred's three Oct 26 edits.
 - The three older suites run with the window moved to the past (`setUpModule`), so they test the new-format path.
