@@ -29,7 +29,9 @@ from pathlib import Path
 import requests
 from requests_oauthlib import OAuth1
 
+import tweet_format
 import tweet_note
+import tweet_v1_legacy
 import tweet_v2
 from tweet_guard import enforce, preflight_legacy, status as guard_status
 
@@ -251,6 +253,45 @@ def post_discord(message):
     )
 
 
+def reply_old_format(reference_date, content, reply_to, how, fmt_why, dry, args, state_file, guard):
+    """Old-format reply (pre-v2 video + text, now with alt text) to an old-format original. Overlap window only."""
+    print(f"OLD FORMAT reply for ref={reference_date} to {reply_to} ({fmt_why})")
+    work, tmp = tweet_v2.new_workdir(args.out)
+    try:
+        r = tweet_v1_legacy.build_reply(reference_date, content, dry=dry)
+        print(f"\nTweet ({len(r['text'])} chars, ref={reference_date}, reply_to={reply_to}, format=old):\n{r['text']}\n")
+        if dry:
+            tweet_v2.write_manifest(work, {
+                "would_post": True, "mode": "dry-run", "kind": "observed", "format": "old", "format_reason": fmt_why,
+                "reference_date": reference_date,
+                "posts_at": f"{(date.fromisoformat(reference_date) + timedelta(days=1)).isoformat()} 08:30 America/New_York",
+                "reply_to_tweet_id": reply_to, "reply_to_lookup": how, "state_file": str(state_file),
+                "tweet_text": r["text"], "media": "old Remotion DailyWTIAll video (rendered on the data host; skipped in dry run)",
+                "alt_text": r["alt"], "guard_status": guard,
+            })
+            return 0
+        if not r["mp4"]:
+            print("SILENT: old-format video render failed; nothing posted", file=sys.stderr)
+            post_discord(f":x: **WTI Observed Tweet** \u2014 ref={reference_date}: old-format video render failed, nothing posted")
+            sys.exit(1)
+        media_id = upload_media(r["mp4"], r["alt"])
+        if not media_id:
+            post_discord(f":x: **WTI Observed Tweet** \u2014 ref={reference_date}: video upload failed, nothing posted")
+            sys.exit(1)
+        tweet_id = post_tweet(r["text"], reply_to=reply_to, media_id=media_id)
+        if not tweet_id:
+            post_discord(":x: **WTI Observed Tweet** \u2014 Twitter API error, tweet failed")
+            sys.exit(1)
+        save_state(tweet_id, reference_date, reply_to)
+        tweet_format.record(state_file, tweet_id, tweet_format.OLD, "observed", reference_date,
+                            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        post_discord(f":white_check_mark: **WTI Observed Tweet posted** (reply, old format) \u2014 ref={reference_date}\n"
+                     f"Replied to predicted tweet: {reply_to}\nhttps://x.com/DisneyStatsWhiz/status/{tweet_id}")
+        print("Done.")
+    finally:
+        tweet_v2.cleanup(tmp)
+
+
 def main(argv=None):
     global STATE_FILE
     args = tweet_v2.parse_args("observed", argv)
@@ -299,6 +340,14 @@ def main(argv=None):
     # Reply target: D's forecast tweet (posted 4 PM ET on D-1)
     reply_to, how = tweet_v2.lookup_predicted_tweet(state_file, reference_date)
     print(f"Reply target for ref={reference_date}: {reply_to or 'none, staying silent'} ({how})")
+
+    # TPCR-TWEET-RESTYLE-CUTOVER: a reply uses its original's format (config/tweet_format.json window).
+    fmt, fmt_why = tweet_format.NEW, "no reply target"
+    if reply_to:
+        fmt, fmt_why = tweet_format.reply_format(reply_to, state_file, tweet_v2.now())
+    print(f"Reply format for ref={reference_date}: {fmt} ({fmt_why})")
+    if reply_to and fmt == tweet_format.OLD:
+        return reply_old_format(reference_date, content, reply_to, how, fmt_why, dry, args, state_file, guard)
 
     work, tmp = tweet_v2.new_workdir(args.out)
     try:
@@ -358,6 +407,8 @@ def main(argv=None):
             post_discord(":x: **WTI Observed Tweet** \u2014 Twitter API error, tweet failed")
             sys.exit(1)
         save_state(tweet_id, reference_date, reply_to)
+        tweet_format.record(state_file, tweet_id, tweet_format.NEW, "observed", reference_date,
+                            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
 
         post_discord(
             f":white_check_mark: **WTI Observed Tweet posted** (reply) \u2014 ref={reference_date}"

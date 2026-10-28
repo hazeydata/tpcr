@@ -30,8 +30,16 @@ import scorecard as sc
 import tweet_note
 import weekly
 
-sys.modules.setdefault("requests_oauthlib", type(sys)("requests_oauthlib")).OAuth1 = object
-import wti_predicted_tweet as wpt
+# Stub requests_oauthlib only for this import, inside patch.dict, so the stub (and a wti_predicted_tweet bound to it)
+# never leaks into other test modules' sys.modules (was: a module-level OAuth1 = object that broke later live tests).
+import requests  # noqa: E402,F401 - wti_predicted_tweet's other deps are imported normally (shared, not dropped)
+import tweet_format  # noqa: E402,F401
+import tweet_guard  # noqa: E402,F401
+import tweet_v2  # noqa: E402,F401
+_oauth_stub = type(sys)("requests_oauthlib")
+_oauth_stub.OAuth1 = lambda *a, **k: "auth"
+with mock.patch.dict(sys.modules, {"requests_oauthlib": sys.modules.get("requests_oauthlib", _oauth_stub)}):
+    import wti_predicted_tweet as wpt
 
 AS_OF = date(2026, 10, 12)
 
@@ -707,3 +715,20 @@ class WindowsTestOnly(Env):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# TPCR-TWEET-RESTYLE-CUTOVER: the suites above test the new-format path, so they run as if the old format had
+# already retired (config/tweet_format.json window moved to the past). The window itself is tested in
+# tests/test_tweet_format.py.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "operations" / "scripts"))
+import tweet_format as _tf  # noqa: E402
+from datetime import datetime as _dtm, timezone as _tzu  # noqa: E402
+_PAST_WINDOW = mock.patch.multiple(_tf, FIRST_NEW_RUN=_dtm(2000, 1, 1, tzinfo=_tzu.utc), OLD_RETIRES=_dtm(2000, 1, 2, tzinfo=_tzu.utc))
+
+
+def setUpModule():
+    _PAST_WINDOW.start()
+
+
+def tearDownModule():
+    _PAST_WINDOW.stop()

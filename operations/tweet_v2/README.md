@@ -26,6 +26,39 @@ Data host (no defaults; `tweet_v2.py`, `wti_observed_tweet.py` and `wti_predicte
 `TPCR_CONTENT_DIR` (Step 14 content dir there; not needed with `--content-dir`), `TPCR_WTI_PARQUET` (wti.parquet path there; not needed with `--history`).
 Env for `build_day.sh`: `PY` (python with pandas + pyarrow), `PYIMG` (python with Pillow, default `PY`), `CHROME`, `FFMPEG`.
 
+## Format transition (TPCR-TWEET-RESTYLE-CUTOVER, Fred Oct 27 2026)
+A parallel transition. The window lives only in `config/tweet_format.json` (read by `operations/scripts/tweet_format.py`):
+`first_new_run` 2026-10-28 16:00 ET, `old_retires` 2026-10-31 00:00 ET. Overlap: Oct 28, 29, 30.
+- **Originals:** `wti_predicted_tweet.py` posts only the new format. A live run before `first_new_run` logs
+  `skipped_before_cutover` and posts nothing (exit 0). Each post is tagged `new` in `predicted[D].format` and in the store.
+- **Store:** `tweet_formats.json` next to `tweet_state.json` (`{tweet_id: {format, kind, reference_date, posted_at}}`), written
+  atomically by both scripts after each post (replies too). A failed write is logged, never fatal.
+- **Replies:** `wti_observed_tweet.py` reads the original's format (`tweet_format.reply_format`). Before `old_retires`: an original
+  posted before `first_new_run` is old; otherwise its tag; untagged = by its `posted_at`; nothing known = old. From `old_retires` on:
+  always new, with a `NOTE untagged original` log line when the original had no tag. A missing or corrupt store (or state file)
+  never raises; it falls back as above. A naive `now` is taken as ET (America/Toronto).
+- **Config failure:** a missing or corrupt `config/tweet_format.json` (unreadable, bad JSON, missing key, or a date without a UTC
+  offset) does not crash either script at import. `tweet_format` logs `ERROR tweet_format: config ... unusable` to stderr, sets
+  `CONFIG_ERROR`, and treats the old format as already retired: **every reply is new** (reason `config missing/invalid:
+  everything new`), the one exception to "a reply uses its original's format". Because `first_new_run` is then unknown, the
+  4 PM new-format original run is **skipped** (stdout `skipped_bad_config`, `ERROR ...` on stderr, nothing posted) until the
+  tag store or `tweet_state.json` already records a new-format predicted original. So a broken config never posts a new
+  original before Oct 28 16:00 ET. **Worst case:** if the config is already broken at Oct 28 16:00, that first new original
+  and every later 4 PM original are skipped (a skip records nothing, so it never recovers by itself); skips continue until
+  the config is fixed, and fixing the config resumes the next 4 PM run. Each skip sends one Discord #wti-pipeline alert naming
+  the config path and that the forecast original was skipped (stderr only if `DISCORD_BOT_TOKEN` is unset). If the alert itself
+  fails (timeout, connection error, HTTP non-2xx such as a Discord 500 or 403, any exception), the failure is logged to stderr
+  (exception type only, e.g. `HTTPError`; never the token or response body) and the run still prints `skipped_bad_config`
+  and exits 0. `post_discord` in `wti_predicted_tweet.py` raises on any non-2xx; every other predicted-script alert goes
+  through `safe_alert`, which logs `ERROR: Discord alert failed (<type>); run outcome unchanged` and never changes the
+  run's exit code or stops a post. Once a new
+  original is recorded, a later broken config does not stop the forecast.
+- **Old reply:** `operations/scripts/tweet_v1_legacy.py`: the pre-v2 Remotion `DailyWTIAll` video rendered on the data host
+  (`TPCR_SSH_HOST`, `TPCR_REMOTION_DIR`; no defaults) and the pre-v2 reply text, now with alt text (each park's WTI and crowd label; the opening line mentions labels only for parks that have one). A dry run renders nothing and
+  writes `dry_run.json` with `"format": "old"`. Delete it (and this section's old branch) after Oct 31 2026.
+- **Migration:** `python3 operations/scripts/tweet_format.py --migrate <tweet_state.json> [--dry-run]` tags every untagged tweet in
+  the state file by `posted_at` (idempotent). Runs outside a checkout set `TPCR_TWEET_FORMAT_CONFIG` to the config path.
+
 ## Posting
 1. #494 guard (`tweet_guard.enforce`) runs first on every live run; blocked = exit 3, nothing built or posted.
 2. Validate `data/closures.csv` (or `--closures` / `TPCR_CLOSURES`). Missing file, wrong header, unknown park, bad date or a
@@ -71,4 +104,9 @@ Optional: `--content-dir DIR` (local `predicted_D.json`/`observed_D.json` instea
 `--state-file`, `--park-hours dimparkhours.csv`, `--closures closures.csv`.
 
 ## Tests
-`python3 -m unittest -v tests.test_tweet_v2 tests.test_tweet_guard tests.test_scorecard` (stubs `requests_oauthlib`; no network).
+`python3 -m unittest -v tests.test_tweet_v2 tests.test_tweet_guard tests.test_scorecard tests.test_tweet_format tests.test_tweet_v2_samples`
+(stubs `requests_oauthlib`; no network; use a python with pandas + pyarrow or the sample tests skip).
+- `test_tweet_format`: the transition window, boundaries (incl. an original posted exactly at 16:00:00), tagged/untagged originals, naive clock, corrupt store, missing/corrupt config, custom `store_name`, a lookup failure inside and after the window, bad config skipping the 4 PM original (Discord alert, alert failure incl. HTTP 500/4xx logged with exit 0, stderr-only without a token, state-only unblock, observed/reply tags don't unblock, fixed config resumes the next run), old-video alt text with missing labels, old/new reply through the scripts, `post_discord` raising on non-2xx without leaking the token or body, and `safe_alert` keeping the post and state when the success or park-hours alert fails.
+- `test_tweet_v2_samples`: dry-renders every tpcr-meta#12 sample (forecast Sep 2-6, reply C Sep 2-6) from the same real data
+  (`tests/fixtures/tweet_v2_samples/`) and compares: replies byte-identical; forecasts identical after Fred's three Oct 26 edits.
+- The three older suites run with the window moved to the past (`setUpModule`), so they test the new-format path.
