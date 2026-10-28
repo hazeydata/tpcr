@@ -287,7 +287,7 @@ class Scripts(Base):
         self.state.write_text(json.dumps({"predicted": {D: {"tweet_id": OLD_ID, "posted_at": BEFORE}}}))
         self.at(et(2026, 10, 29, 8, 30))
         rc, out, m = self.dry_observed()
-        self.assertEqual((rc, m["format"], m["reply_to_tweet_id"]), (0, "old", OLD_ID))
+        self.assertEqual((rc, m.get("format"), m["reply_to_tweet_id"]), (0, "old", OLD_ID))
         self.assertTrue(m["tweet_text"].startswith(f"How it actually went \u2014 {D}:"))
         self.assertIn("Animal Kingdom 27.0", m["alt_text"])
         self.assertIn("Reply format for ref=2026-10-28: old", out)
@@ -305,7 +305,7 @@ class Scripts(Base):
         tf.store_path(self.state).write_text("{{{")
         self.at(et(2026, 10, 29, 8, 30))
         rc, _, m = self.dry_observed()
-        self.assertEqual((rc, m["format"]), (0, "old"))
+        self.assertEqual((rc, m.get("format")), (0, "old"))
 
     def post_fake(self, calls, tid):
         def post(url, **kw):
@@ -709,6 +709,19 @@ class ReplyTiers(Base):
             rc, out, _ = self.run_main(wot, ["--dry-run", "--date", D, "--content-dir", str(self.cdir), "--history", "h",
                                              "--state-file", str(self.state), "--out", str(self.tmp / "o")])
         m = json.loads((self.tmp / "o" / "dry_run.json").read_text())
-        self.assertEqual((rc, m["format"]), (0, "old"))
+        self.assertEqual((rc, m.get("format")), (0, "old"))
         self.assertTrue(m["tweet_text"].startswith(f"How it actually went \u2014 {D}:"))
         self.assertNotIn("skipped_bad_config", out)
+
+    def test_module_reads_tiers_from_config(self):
+        import shutil
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="tweetfmt-tiers-"))
+        self.addCleanup(shutil.rmtree, d, True)
+        probe = "import sys; sys.path.insert(0, 'operations/scripts'); import tweet_format as tf; print(tf.REPLY_TIERS, bool(tf.TIERS_ERROR))"
+        cfg = json.loads((ROOT / "config" / "tweet_format.json").read_text())
+        for a, b, want in ((None, None, "None True"), (1.5, 4, "(1.5, 4.0) False")):
+            (d / "c.json").write_text(json.dumps({**cfg, "reply_tier_a": a, "reply_tier_b": b}))
+            r = subprocess.run([sys.executable, "-c", probe], cwd=ROOT, capture_output=True, text=True,
+                               env={**os.environ, "TPCR_TWEET_FORMAT_CONFIG": str(d / "c.json")})
+            self.assertEqual(r.stdout.strip(), want, r.stderr)
