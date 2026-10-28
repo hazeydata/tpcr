@@ -112,11 +112,11 @@ Three parks close to forecast. Animal Kingdom 6.7 quieter.
 Lower WTI = shorter waits.
 ```
 Each park line has a tier by |observed − forecast| (gap rounded to 0.1): ✅ if <= A; ⬇️ quieter / ⬆️ busier if A < miss <= B;
-⏬ / ⏫ if > B. A and B are `reply_tier_a` / `reply_tier_b` in `config/tweet_format.json`, chosen by Fred; while unset or invalid
+⏬ / ⏫ if > B. A and B are `reply_tier_a` / `reply_tier_b` in `config/tweet_format.json`, set by Fred on Oct 28 2026 to A = 3.0, B = 6.0; while unset or invalid
 (need 0 < A < B) a new-format reply run logs `skipped_bad_config`, sends one Discord alert, posts nothing and exits 0 (old-format
-replies are unaffected). The example above uses A = 2, B = 5. Line 2 counts the open parks within A (`One park` / `Two parks` /
+replies are unaffected). The example above uses A = 2, B = 5 (with the shipped A = 3, B = 6, Animal Kingdom's 6.7 miss is still ⏬). Line 2 counts the open parks within A (`One park` / `Two parks` /
 `Three parks close to forecast.`, `No park close to forecast.`, `All four` or `All open parks close to forecast.`) and names the
-largest miss. The card headline still uses its own `cards.ON_TARGET` (2.0 WTI); the text and card agree only when A = 2.
+largest miss. The card headline still uses its own `cards.ON_TARGET` (2.0 WTI); the text and card agree only when A = 2, so with the shipped A = 3 a park missing by 2.1 to 3.0 is ✅ in the text but off target on the card headline.
 A closed park's row is `<Park>: closed`. No colour-coded circles. Every text is under 280 by X's weighted count (emoji 2, non-Latin 2; no URL = 23 rule, as the texts carry no URLs);
 `tests/test_tweet_text.py` checks every label, tier and closure combination. A reply to an old-format original keeps the old text
 (`operations/scripts/tweet_v1_legacy.py`).

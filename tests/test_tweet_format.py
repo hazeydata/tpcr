@@ -673,9 +673,13 @@ class ReplyTiers(Base):
             self.assertIn("reply_tier_a/reply_tier_b", err)
         self.assertIsNone(tf._tiers({})[0])
 
-    def test_shipped_config_leaves_tiers_pending_fred(self):
+    def test_shipped_config_has_freds_tiers(self):
+        """Fred, Oct 28 2026 2:48 PM ET: A = 3, B = 6. The shipped config loads with 0 < A < B and no error."""
         cfg = json.loads((ROOT / "config" / "tweet_format.json").read_text())
-        self.assertEqual((cfg["reply_tier_a"], cfg["reply_tier_b"]), (None, None))
+        self.assertEqual((cfg["reply_tier_a"], cfg["reply_tier_b"]), (3.0, 6.0))
+        self.assertEqual(tf._tiers(cfg), ((3.0, 6.0), None))
+        a, b = tf._tiers(cfg)[0]
+        self.assertLess(a, b)
 
     def live_observed(self):
         self.state.write_text(json.dumps({"predicted": {D: {"tweet_id": NEW_ID, "posted_at": AFTER, "format": "new"}}}))
