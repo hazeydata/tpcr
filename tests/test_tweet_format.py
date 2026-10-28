@@ -2,6 +2,7 @@
 
 New originals from the Oct 28 4 PM ET run; a reply uses its original's format; the old format retires at
 00:00 ET Oct 31. No network: requests.post is a local fake, builds and renders are mocked."""
+import contextlib
 import io
 import json
 import os
@@ -319,6 +320,19 @@ class Scripts(Base):
     def resp(self, code, body):
         r = mock.Mock(status_code=code, text=json.dumps(body)); r.json.return_value = body; return r
 
+    def run_main_caught(self, mod, argv):
+        """run_main, but the run's outcome is the return value: sys.exit(n) -> ("exit", n) and an exception that
+        escapes main -> ("escaped", type name). So a broken alert wrapper fails an assertion, not the test harness."""
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            try:
+                rc = mod.main(argv)
+            except SystemExit as e:
+                rc = ("exit", e.code)
+            except Exception as e:  # noqa: BLE001
+                rc = ("escaped", type(e).__name__)
+        return rc, out.getvalue(), err.getvalue()
+
     def test_live_old_reply_posts_old_video_with_alt_text_and_tags_it(self):
         self.state.write_text(json.dumps({"predicted": {D: {"tweet_id": OLD_ID, "posted_at": BEFORE}}}))
         self.at(et(2026, 10, 29, 8, 30))
@@ -371,7 +385,7 @@ class Scripts(Base):
                  mock.patch.object(tf, "FIRST_NEW_RUN", datetime.min.replace(tzinfo=timezone.utc)), \
                  mock.patch.object(wpt, "load_env"), mock.patch.object(wpt, "enforce"), mock.patch.dict("os.environ", ENV), \
                  mock.patch.object(requests, "post", post), mock.patch.object(wpt, "post_discord", side_effect=exc) as d:
-                rc, out, err = self.run_main(wpt, ["--date", "2026-10-29", "--content-dir", str(self.cdir), "--history", "h",
+                rc, out, err = self.run_main_caught(wpt, ["--date", "2026-10-29", "--content-dir", str(self.cdir), "--history", "h",
                                                  "--state-file", str(self.state)])
             self.assertEqual(rc, 0); self.assertIn("skipped_bad_config", out); post.assert_not_called()
             self.assertEqual(d.call_count, 1)
@@ -424,7 +438,11 @@ class Scripts(Base):
         for exc in (requests.exceptions.HTTPError("Discord alert HTTP 500"), requests.exceptions.Timeout(SENTINEL)):
             err = io.StringIO()
             with mock.patch.object(wpt, "post_discord", side_effect=exc), redirect_stderr(err):
-                self.assertFalse(wpt.safe_alert("m"))
+                try:
+                    result = wpt.safe_alert("m")
+                except Exception as e:  # noqa: BLE001 - a re-raise is a wrong result, not a harness crash
+                    result = ("raised", type(e).__name__)
+            self.assertIs(result, False)
             self.assertIn(f"Discord alert failed ({type(exc).__name__})", err.getvalue())
             self.assertNotIn(SENTINEL, err.getvalue())
         with mock.patch.object(wpt, "post_discord") as d:
@@ -442,7 +460,7 @@ class Scripts(Base):
              mock.patch.object(wpt, "post_discord", side_effect=requests.exceptions.HTTPError("Discord alert HTTP 500")) as d, \
              mock.patch.object(tweet_v2, "parquet_last_date", return_value=D2), \
              mock.patch.object(tweet_v2, "build", self.fake_build), mock.patch.object(wpt, "STATE_FILE", self.state):
-            rc, out, err = self.run_main(wpt, ["--date", D2, "--content-dir", str(self.cdir), "--history", "h",
+            rc, out, err = self.run_main_caught(wpt, ["--date", D2, "--content-dir", str(self.cdir), "--history", "h",
                                              "--state-file", str(self.state)])
         self.assertIn(rc, (None, 0)); self.assertTrue(any(u == wpt.TWITTER_API for u, _ in calls))
         self.assertEqual(json.loads(self.state.read_text())["predicted"][D2]["tweet_id"], "PRED-ALERTFAIL")
@@ -459,8 +477,9 @@ class Scripts(Base):
              mock.patch.object(wpt, "post_discord", side_effect=requests.exceptions.HTTPError("Discord alert HTTP 500")), \
              mock.patch.object(tweet_v2, "parquet_last_date", return_value=D2), \
              mock.patch.object(tweet_v2, "build", self.fake_build), mock.patch.object(wpt, "STATE_FILE", self.state):
-            rc, out, err = self.run_main(wpt, ["--date", D2, "--content-dir", str(self.cdir), "--history", "h",
+            rc, out, err = self.run_main_caught(wpt, ["--date", D2, "--content-dir", str(self.cdir), "--history", "h",
                                              "--state-file", str(self.state), "--park-hours", str(self.tmp / "no-such-hours.csv")])
+        self.assertIn(rc, (None, 0))
         self.assertIn("park_hours_unreadable", err); self.assertIn("Discord alert failed (HTTPError)", err)
         self.assertTrue(any(u == wpt.TWITTER_API for u, _ in calls))
         self.assertEqual(json.loads(self.state.read_text())["predicted"][D2]["tweet_id"], "PRED-PH")
@@ -540,6 +559,103 @@ class Scripts(Base):
             self.run_main(wpt, ["--date", D3, "--content-dir", str(self.cdir), "--history", "h", "--state-file", str(self.state)])
         self.assertTrue(any(u == wpt.TWITTER_API for u, _ in calls))
         self.assertEqual(json.loads(tf.store_path(self.state).read_text())["PRED-RESUMED"]["format"], "new")
+
+
+class AlertFailureLeavesOutcome(Base):
+    """Every safe_alert site in wti_predicted_tweet.main (:325 closures, :331 no_data, :336 stale, :339 park hours,
+    :384 silent, :389 upload failed, :394 tweet failed, :402 success): an alert that raises, network error or not,
+    leaves the run outcome (exit code, saved state, no-data streak, X calls, skip markers) equal to a run whose
+    alert succeeds. post_discord is mocked; no X or Discord traffic leaves the process."""
+
+    D2 = "2026-10-29"
+    FAILS = (requests.exceptions.HTTPError("Discord alert HTTP 500"), requests.exceptions.ConnectionError("c"),
+             RuntimeError("r"), ValueError("v"), KeyError("k"))
+    MARK = re.compile(r"skipped_\w+|closures_error|park_hours_unreadable|SILENT: [^\n(]*|State saved: [^\n]*|Done\.")
+
+    at = Scripts.at
+    post_fake = Scripts.post_fake
+    resp = Scripts.resp
+
+    def outcome(self, n, effect, generated_at="2026-10-28T10:00:00-04:00", content=True, nodata=None, extra=(),
+                patches=()):
+        from tests.test_tweet_v2 import content as mk
+        d = self.tmp / f"run{n}"; cdir = d / "content"; cdir.mkdir(parents=True)
+        state = d / "tweet_state.json"; state.write_text(self.state.read_text())
+        if content:
+            (cdir / f"predicted_{self.D2}.json").write_text(mk(self.D2, [20.1, 21.0, 26.0, 33.3], generated_at=generated_at))
+        if nodata is not None:
+            tweet_v2.no_data_state_path(state).write_text(json.dumps(nodata))
+        self.at(et(2026, 10, 28, 16, 0, 0))
+        calls = []
+        with contextlib.ExitStack() as st:
+            for cm in (mock.patch.object(wpt, "load_env"), mock.patch.object(wpt, "enforce"),
+                       mock.patch.dict("os.environ", ENV), mock.patch.object(wpt, "STATE_FILE", state),
+                       mock.patch.object(requests, "post", self.post_fake(calls, "PRED-OUT")),
+                       mock.patch.object(tweet_v2, "parquet_last_date", return_value=self.D2),
+                       mock.patch.object(tweet_v2, "build", self.fake_build)) + tuple(f() for f in patches):
+                st.enter_context(cm)
+            disc = st.enter_context(mock.patch.object(wpt, "post_discord", side_effect=effect))
+            rc, out, err = Scripts.run_main_caught(self, wpt, ["--date", self.D2, "--content-dir", str(cdir),
+                                                              "--history", "h", "--state-file", str(state), *extra])
+        nd = tweet_v2.no_data_state_path(state)
+        def wallclock_free(v):  # posted_at is the real clock at save time; everything else must match exactly
+            if isinstance(v, dict):
+                return {k: ("<time>" if k.endswith("_at") else wallclock_free(x)) for k, x in v.items()}
+            return v
+        res = {"rc": rc, "markers": self.MARK.findall(out + err), "state": wallclock_free(json.loads(state.read_text())),
+               "no_data": json.loads(nd.read_text()) if nd.exists() else None,
+               "x_calls": [u for u, _ in calls], "alerts": disc.call_count}
+        return res, err
+
+    def check(self, **kw):
+        base, base_err = self.outcome("base", None, **kw)
+        self.assertGreaterEqual(base["alerts"], 1, "scenario never reaches its alert site")
+        self.assertNotIn("Discord alert failed", base_err)
+        for i, exc in enumerate(self.FAILS):
+            got, err = self.outcome(i, exc, **kw)
+            self.assertEqual(got, base, f"alert raising {type(exc).__name__} changed the run outcome")
+            self.assertIn(f"Discord alert failed ({type(exc).__name__})", err)
+        return base
+
+    def test_closures_alert_failure_keeps_exit_1(self):  # :325
+        base = self.check(extra=("--closures", str(self.tmp / "no-such-closures.csv")))
+        self.assertEqual(base["rc"], ("exit", 1)); self.assertIn("closures_error", base["markers"])
+        self.assertEqual(base["x_calls"], [])
+
+    def test_no_data_alert_failure_keeps_skip_and_streak(self):  # :331
+        nodata = {"predicted": {"last_skipped": "2026-10-28", "streak": 1, "alerted": False}}
+        base = self.check(content=False, nodata=nodata)
+        self.assertEqual(base["rc"], 0); self.assertIn("skipped_no_data", base["markers"])
+        self.assertEqual(base["no_data"]["predicted"]["streak"], 2); self.assertEqual(base["x_calls"], [])
+
+    def test_stale_alert_failure_keeps_skip(self):  # :336
+        base = self.check(generated_at="2026-10-20T10:00:00-04:00")
+        self.assertEqual(base["rc"], 0); self.assertIn("skipped_stale", base["markers"]); self.assertEqual(base["x_calls"], [])
+
+    def test_park_hours_alert_failure_still_posts(self):  # :339
+        base = self.check(extra=("--park-hours", str(self.tmp / "no-such-hours.csv")))
+        self.assertIn(base["rc"], (None, 0)); self.assertIn("park_hours_unreadable", base["markers"])
+        self.assertEqual(base["state"]["predicted"][self.D2]["tweet_id"], "PRED-OUT")
+
+    def test_silent_alert_failure_keeps_silence(self):  # :384
+        base = self.check(patches=(lambda: mock.patch.object(tweet_v2, "build", side_effect=RuntimeError("no card")),))
+        self.assertIsNone(base["rc"]); self.assertIn("SILENT: no forecast card for 2026-10-29 ", base["markers"])
+        self.assertEqual(base["x_calls"], []); self.assertNotIn(self.D2, base["state"]["predicted"])
+
+    def test_upload_failed_alert_failure_keeps_exit_1(self):  # :389
+        base = self.check(patches=(lambda: mock.patch.object(wpt, "upload_media", return_value=None),))
+        self.assertEqual(base["rc"], ("exit", 1)); self.assertIn("SILENT: video upload failed; nothing posted", base["markers"])
+        self.assertNotIn(self.D2, base["state"]["predicted"])
+
+    def test_tweet_failed_alert_failure_keeps_exit_1(self):  # :394
+        base = self.check(patches=(lambda: mock.patch.object(wpt, "upload_media", return_value="M1"),
+                                   lambda: mock.patch.object(wpt, "post_tweet", return_value=None)))
+        self.assertEqual(base["rc"], ("exit", 1)); self.assertNotIn(self.D2, base["state"]["predicted"])
+
+    def test_success_alert_failure_keeps_tweet_and_state(self):  # :402
+        base = self.check()
+        self.assertIsNone(base["rc"]); self.assertIn("Done.", base["markers"])
+        self.assertEqual(base["state"]["predicted"][self.D2]["tweet_id"], "PRED-OUT")
 
 
 if __name__ == "__main__":
