@@ -21,7 +21,19 @@ FCSS = CSS + """
 .r{display:grid;grid-template-columns:420px 230px 380px 1fr;align-items:center;height:118px;border-top:1px solid #22324A}
 .strip{position:absolute;left:96px;right:96px;bottom:30px;border-top:1px solid #2A3A52;padding-top:12px;font-size:27px;color:#8A9AB0;white-space:nowrap}</style>"""
 RCSS = CSS + ".lab{font-size:22px;color:#7C8CA3}</style>"
-ON_TARGET = 2.0   # |observed - forecast| <= 2 WTI counts as on target
+# |observed - forecast| <= ON_TARGET WTI counts as on target in the card headline. Fred, Oct 28 2026 2:57 PM ET: it is the
+# reply text's A, read from the one source, config/tweet_format.json reply_tier_a (TPCR_TWEET_FORMAT_CONFIG outside a
+# checkout, as tweet_format.py). Unusable config: ON_TARGET = None and only a reply build refuses (forecasts are unaffected).
+def _on_target():
+    try:
+        p = os.environ.get("TPCR_TWEET_FORMAT_CONFIG") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "config", "tweet_format.json")
+        a = json.load(open(p))["reply_tier_a"]
+        return float(a) if isinstance(a, (int, float)) and not isinstance(a, bool) and a > 0 else None
+    except Exception:  # noqa: BLE001 - reply_headline refuses
+        return None
+
+
+ON_TARGET = _on_target()
 LIM = 20          # fixed scorecard scale, -20..+20
 WORD = {1: "One", 2: "Two", 3: "Three", 4: "Four"}
 
@@ -120,8 +132,9 @@ def gap(fc, ob, p): return round(ob[p] - fc[p] + 1e-9, 1)
 
 
 def reply_headline(fc, ob, status=None):
-    """Error-based: within 2 WTI = on target. Name the largest miss; count on-target parks.
+    """Error-based: within ON_TARGET (config reply_tier_a, 3.0) WTI = on target. Name the largest miss; count on-target parks.
     Only open parks are graded (closed/unknown left out of the pick, AC 8). Unchanged when all four are open."""
+    if ON_TARGET is None: die("config/tweet_format.json reply_tier_a unset or invalid: no on-target rule for the reply headline")
     status = status or {}
     Q = [p for p in P if status.get(p, "open") == "open" and ob.get(p) is not None and fc.get(p) is not None]
     if not Q: return None

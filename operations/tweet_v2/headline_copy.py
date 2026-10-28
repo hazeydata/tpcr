@@ -8,6 +8,6 @@ Status: FINAL. Lindsay made the three closed-row fallbacks final, exactly as wri
 ALL_FOUR_NORMAL = "All four parks normal"          # locked (edge copy v2, E3)
 ALL_OPEN_NORMAL = "All open parks normal"          # FINAL (Lindsay): every open park in its normal range
 ONE_PARK_NORMAL = "{park} normal"                  # FINAL (Lindsay): only one park open, in its normal range
-# Scorecard reply, every graded park within 2 WTI of forecast
-ALL_FOUR_ON_TARGET = "All four parks within 2 of forecast"      # locked (edge copy v2, scorecard headlines)
-ALL_OPEN_ON_TARGET = "All open parks within 2 of forecast"      # FINAL (Lindsay)
+# Scorecard reply, every graded park within 3 WTI of forecast (= config reply_tier_a; test_tweet_v2 checks the number)
+ALL_FOUR_ON_TARGET = "All four parks within 3 of forecast"      # locked (edge copy v2, scorecard headlines)
+ALL_OPEN_ON_TARGET = "All open parks within 3 of forecast"      # FINAL (Lindsay)

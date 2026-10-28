@@ -142,5 +142,43 @@ class TweetText(unittest.TestCase):
         self.assertIn(self.fc_text({"MK": 15.0, "EP": 15.0, "HS": 15.0, "AK": 25.0}), readme)
 
 
+class ShippedTiers(unittest.TestCase):
+    """Fred's A = 3, B = 6 (config/tweet_format.json, read via tweet_format.REPLY_TIERS), at every boundary, both signs.
+    The miss is cards.gap: round(observed - forecast, 1)."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import pandas  # noqa: F401
+        except ImportError:
+            raise unittest.SkipTest("pandas not installed")
+        import cards
+        sys.path.insert(0, str(ROOT / "operations" / "scripts"))
+        import tweet_format
+        cls.c, cls.tiers = cards, tweet_format.REPLY_TIERS
+
+    def test_tiers_loaded(self):
+        self.assertEqual(self.tiers, (3.0, 6.0))
+
+    def test_boundaries_both_signs(self):
+        fc = {p: 16.9 for p in S}
+        want = {2.9: "✅", 3.0: "✅", 3.1: "⬆️", 5.9: "⬆️", 6.0: "⬆️", 6.1: "⏫",
+                -2.9: "✅", -3.0: "✅", -3.1: "⬇️", -5.9: "⬇️", -6.0: "⬇️", -6.1: "⏬"}
+        for d, mark in want.items():
+            ob = {**fc, "MK": round(16.9 + d, 1)}
+            m = self.c.reply_meta(D, fc, ob, {}, "x")
+            self.assertEqual(m["parks"]["Magic Kingdom"]["gap"], d)
+            t = tc.reply_text(m, self.tiers)
+            self.assertIsNotNone(t, d)
+            self.assertIn(f"{mark} Magic Kingdom: {ob['MK']:.1f} (forecast 16.9)\n", t, d)
+            self.assertIsNone(CIRCLES.search(t))
+
+    def test_example_format(self):
+        fc = {p: 16.9 for p in S}
+        t = tc.reply_text(self.c.reply_meta(D, fc, {**fc, "MK": 15.6}, {}, "x"), self.tiers)
+        self.assertIsNotNone(t)
+        self.assertIn("\n✅ Magic Kingdom: 15.6 (forecast 16.9)\n", t)
+
+
 if __name__ == "__main__":
     unittest.main()
