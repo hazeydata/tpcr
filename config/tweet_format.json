@@ -1,6 +1,6 @@
 {
-  "_doc": "TPCR-TWEET-RESTYLE-CUTOVER: the ONLY place the format window is set. Read by operations/scripts/tweet_format.py. Times are America/New_York (EDT, UTC-4, on both dates).",
-  "first_new_run": "2026-10-28T16:00:00-04:00",
-  "old_retires": "2026-10-31T00:00:00-04:00",
+  "_doc": "TPCR-TWEET-RESTYLE-CUTOVER: the ONLY place the format window is set. Read by operations/scripts/tweet_format.py. Times are America/New_York (EDT, UTC-4, on both dates; DST ends 02:00 Nov 1, after old_retires).",
+  "first_new_run": "2026-10-29T16:00:00-04:00",
+  "old_retires": "2026-11-01T00:00:00-04:00",
   "store_name": "tweet_formats.json"
 }

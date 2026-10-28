@@ -28,7 +28,7 @@ Env for `build_day.sh`: `PY` (python with pandas + pyarrow), `PYIMG` (python wit
 
 ## Format transition (TPCR-TWEET-RESTYLE-CUTOVER, Fred Oct 27 2026)
 A parallel transition. The window lives only in `config/tweet_format.json` (read by `operations/scripts/tweet_format.py`):
-`first_new_run` 2026-10-28 16:00 ET, `old_retires` 2026-10-31 00:00 ET. Overlap: Oct 28, 29, 30.
+`first_new_run` 2026-10-29 16:00 ET, `old_retires` 2026-11-01 00:00 ET (both moved +24h from Oct 28 16:00 / Oct 31 00:00). First new-format reply: Oct 31 08:30 ET. Overlap: Oct 29, 30, 31.
 - **Originals:** `wti_predicted_tweet.py` posts only the new format. A live run before `first_new_run` logs
   `skipped_before_cutover` and posts nothing (exit 0). Each post is tagged `new` in `predicted[D].format` and in the store.
 - **Store:** `tweet_formats.json` next to `tweet_state.json` (`{tweet_id: {format, kind, reference_date, posted_at}}`), written
@@ -43,7 +43,7 @@ A parallel transition. The window lives only in `config/tweet_format.json` (read
   everything new`), the one exception to "a reply uses its original's format". Because `first_new_run` is then unknown, the
   4 PM new-format original run is **skipped** (stdout `skipped_bad_config`, `ERROR ...` on stderr, nothing posted) until the
   tag store or `tweet_state.json` already records a new-format predicted original. So a broken config never posts a new
-  original before Oct 28 16:00 ET. **Worst case:** if the config is already broken at Oct 28 16:00, that first new original
+  original before Oct 29 16:00 ET. **Worst case:** if the config is already broken at Oct 29 16:00, that first new original
   and every later 4 PM original are skipped (a skip records nothing, so it never recovers by itself); skips continue until
   the config is fixed, and fixing the config resumes the next 4 PM run. Each skip sends one Discord #wti-pipeline alert naming
   the config path and that the forecast original was skipped (stderr only if `DISCORD_BOT_TOKEN` is unset). If the alert itself
@@ -55,7 +55,7 @@ A parallel transition. The window lives only in `config/tweet_format.json` (read
   original is recorded, a later broken config does not stop the forecast.
 - **Old reply:** `operations/scripts/tweet_v1_legacy.py`: the pre-v2 Remotion `DailyWTIAll` video rendered on the data host
   (`TPCR_SSH_HOST`, `TPCR_REMOTION_DIR`; no defaults) and the pre-v2 reply text, now with alt text (each park's WTI and crowd label; the opening line mentions labels only for parks that have one). A dry run renders nothing and
-  writes `dry_run.json` with `"format": "old"`. Delete it (and this section's old branch) after Oct 31 2026.
+  writes `dry_run.json` with `"format": "old"`. Delete it (and this section's old branch) after Nov 1 2026 00:00 ET.
 - **Migration:** `python3 operations/scripts/tweet_format.py --migrate <tweet_state.json> [--dry-run]` tags every untagged tweet in
   the state file by `posted_at` (idempotent). Runs outside a checkout set `TPCR_TWEET_FORMAT_CONFIG` to the config path.
 
@@ -97,8 +97,8 @@ closed). Runs that stop before the build write no `dry_run.json`; they only prin
 `closures.csv` (exit 1).
 
 ```
-python3 operations/scripts/wti_predicted_tweet.py --dry-run --date 2026-10-28 --out /tmp/f28
-python3 operations/scripts/wti_observed_tweet.py  --dry-run --date 2026-10-28 --out /tmp/o28
+python3 operations/scripts/wti_predicted_tweet.py --dry-run --date 2026-10-29 --out /tmp/f29
+python3 operations/scripts/wti_observed_tweet.py  --dry-run --date 2026-10-29 --out /tmp/o29
 ```
 Optional: `--content-dir DIR` (local `predicted_D.json`/`observed_D.json` instead of wilma over ssh), `--history wti.parquet`,
 `--state-file`, `--park-hours dimparkhours.csv`, `--closures closures.csv`.
