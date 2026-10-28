@@ -17,7 +17,7 @@ For park day D:
 | `cards.py` | Static card HTML + alt text + `*.meta.json` from Step 14 content (`predicted_D.json`, `observed_D.json`) and `wti.parquet` history (each park's own p25–p75 since Jan 2022). Refuses on wrong date, non-ready status or a missing park. |
 | `build_day.sh` | Runs `cards.py`, screenshots PNGs (headless Chrome), renders the MP4s, checks the last frame equals the static PNG. No network. |
 | `render_anim.sh`, `anim_forecast.js`, `anim_reply.js` | 30 fps frames -> H.264 MP4 (about 7 s). |
-| `tweet_copy.py` | Tweet text, only from Writing's edge copy v2. A case with no approved copy returns None -> silent. |
+| `tweet_copy.py` | New-format tweet text (see Tweet text below), from `F-D.meta.json` / `R-D.meta.json`. Over 280 (X weighted) returns None -> silent. |
 | `park_status.py` | `open` / `closed` / `unknown` per park. `closed` only from the hand-filled `data/closures.csv`; `open` from `dimparkhours.csv` official rows; else `unknown`. |
 | `headline_copy.py` | Every fallback headline ("All open parks normal", "<Park> normal", "All open parks within 2 of forecast", and the all-four lines). Final copy from Lindsay; `cards.py` takes them only from here. |
 
@@ -86,7 +86,40 @@ A parallel transition. The window lives only in `config/tweet_format.json` (read
   `source_url`. `dimparkhours` is never used for closure: a missing official row stays `unknown`. So in production the closed path
   normally never triggers; it is tested on fixtures. Runs outside a checkout (the Mini copies) must set `TPCR_CLOSURES`.
 - One-park-open and all-open fallback headlines: see `headline_copy.py`.
-- E4 (late reply), E8 (over 280: cut order is in `tweet_copy.py`), E9 (weekly roll-up) is not built.
+- E4 (late reply), E9 (weekly roll-up) is not built.
+
+## Tweet text (new format)
+Forecast, three lines:
+```
+WDW Crowd FORECAST: Wed, Oct 28
+Animal Kingdom busier than normal. Other parks normal.
+#WDW #DisneyWorld #WaitTimes
+```
+Line 2 uses each park's card label, in order MK, EP, HS, AK: parks `busier than normal`, then `quieter than normal`, then `closed`,
+then the rest. One normal park left is named (`Animal Kingdom normal.`), two or more are `Other parks normal.`; no busier, quieter or
+closed park gives `All four parks normal.` Every park closed: no post.
+
+Observed reply:
+```
+WDW Crowds OBSERVED: Wed, Oct 28
+Three parks close to forecast. Animal Kingdom 6.7 quieter.
+
+✅ Magic Kingdom: 21.5 (forecast 20.0)
+✅ EPCOT: 18.0 (forecast 20.0)
+✅ Hollywood Studios: 22.0 (forecast 20.0)
+⏬ Animal Kingdom: 23.3 (forecast 30.0)
+
+Lower WTI = shorter waits.
+```
+Each park line has a tier by |observed − forecast| (gap rounded to 0.1): ✅ if <= A; ⬇️ quieter / ⬆️ busier if A < miss <= B;
+⏬ / ⏫ if > B. A and B are `reply_tier_a` / `reply_tier_b` in `config/tweet_format.json`, chosen by Fred; while unset or invalid
+(need 0 < A < B) a new-format reply run logs `skipped_bad_config`, sends one Discord alert, posts nothing and exits 0 (old-format
+replies are unaffected). The example above uses A = 2, B = 5. Line 2 counts the open parks within A (`One park` / `Two parks` /
+`Three parks close to forecast.`, `No park close to forecast.`, `All four` or `All open parks close to forecast.`) and names the
+largest miss. The card headline still uses its own `cards.ON_TARGET` (2.0 WTI); the text and card agree only when A = 2.
+A closed park's row is `<Park>: closed`. No colour-coded circles. Every text is under 280 by X's weighted count (emoji 2, non-Latin 2; no URL = 23 rule, as the texts carry no URLs);
+`tests/test_tweet_text.py` checks every label, tier and closure combination. A reply to an old-format original keeps the old text
+(`operations/scripts/tweet_v1_legacy.py`).
 
 ## Dry run
 Both scripts take `--dry-run`: builds everything, blocks every HTTP call in-process, skips `~/.env` and credentials,

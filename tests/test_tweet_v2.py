@@ -54,7 +54,12 @@ def keep_requests():
 
 
 class Base(unittest.TestCase):
+    TIERS = (2.0, 5.0)
+
     def setUp(self):
+        import tweet_format
+        for k, v in (("REPLY_TIERS", self.TIERS), ("TIERS_ERROR", None)):
+            p = mock.patch.object(tweet_format, k, v); p.start(); self.addCleanup(p.stop)
         self.tmp = Path(tempfile.mkdtemp(prefix="tweetv2-test-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.addCleanup(keep_requests())
@@ -73,10 +78,13 @@ class Base(unittest.TestCase):
     def fake_build(self, d, out, history, pred, obs=None, park_hours=None, closures=None):
         out = Path(out)
         arts = {}
-        metas = {"F": {"date": d, "headline": "Animal Kingdom busy", "named": ["Animal Kingdom"], "dirs": ["busy"],
-                       "open": [n for _, n in PARKS], "closed": [],
-                       "parks": {"Animal Kingdom": {"wti": 33.3, "lo": 20.9, "hi": 27.7}}},
-                 "R": {"date": d, "headline": "Three parks on target. Animal Kingdom 6.3 low"}}
+        on = {"ob": 20.0, "fc": 20.0, "gap": 0.0}
+        metas = {"F": {"date": d, "headline": "Animal Kingdom busy",
+                       "labels": {"Magic Kingdom": "Normal", "EPCOT": "Normal", "Hollywood Studios": "Normal", "Animal Kingdom": "Busier than normal"}},
+                 "R": {"date": d, "headline": "Three parks on target. Animal Kingdom 6.3 low",
+                       "parks": {"Magic Kingdom": on, "EPCOT": on, "Hollywood Studios": on,
+                                 "Animal Kingdom": {"ob": 20.0, "fc": 26.3, "gap": -6.3}},
+                       "graded": [n for _, n in PARKS]}}
         for k in (["F"] if obs is None else ["F", "R"]):
             (out / f"{k}-{d}.mp4").write_bytes(b"mp4")
             arts[k] = {"mp4": out / f"{k}-{d}.mp4", "png": out / f"{k}-{d}.png", "alt": f"{k} alt", "meta": metas[k]}
@@ -149,7 +157,9 @@ class DryRun(Base):
         self.assertEqual(m["reply_to_tweet_id"], "1850000000000000001")
         self.assertEqual(m["posts_at"], "2026-10-29 08:30 America/New_York")
         self.assertEqual(m["alt_text"], "R alt")
-        self.assertEqual(m["tweet_text"], "Three parks on target. Animal Kingdom 6.3 low. Yesterday, Wed Oct 28, vs our forecast. Bar = observed − forecast.")
+        self.assertEqual(m["tweet_text"], "WDW Crowds OBSERVED: Wed, Oct 28\nThree parks close to forecast. Animal Kingdom 6.3 quieter.\n\n"
+                         "✅ Magic Kingdom: 20.0 (forecast 20.0)\n✅ EPCOT: 20.0 (forecast 20.0)\n✅ Hollywood Studios: 20.0 (forecast 20.0)\n"
+                         "⏬ Animal Kingdom: 20.0 (forecast 26.3)\n\nLower WTI = shorter waits.")
         self.assertNotIn("observed", json.loads(self.state.read_text()))
 
     def test_dry_run_needs_no_credentials_and_skips_env(self):
@@ -622,7 +632,7 @@ class Cards(unittest.TestCase):
         self.assertEqual(self.c.forecast_headline(fc, self.S), "Magic Kingdom busy, Animal Kingdom quiet")
         import tweet_copy
         m = self.c.meta(D, {"MK": 15.0, "EP": 5.0, "HS": 5.0, "AK": 15.0}, self.S, {}, "x")
-        self.assertTrue(tweet_copy.forecast_text(m).startswith("EPCOT and Hollywood Studios look quiet. Tomorrow, Wed Oct 28,"))
+        self.assertEqual(tweet_copy.forecast_text(m).split("\n")[1], "EPCOT and Hollywood Studios quieter than normal. Other parks normal.")
 
     def test_closed_row_and_exclusions(self):
         """AC 1-2, 8, 10, 11: Closed row with no value; closed park never picked or a tie partner; unknown never Closed."""

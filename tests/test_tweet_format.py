@@ -287,7 +287,7 @@ class Scripts(Base):
         self.state.write_text(json.dumps({"predicted": {D: {"tweet_id": OLD_ID, "posted_at": BEFORE}}}))
         self.at(et(2026, 10, 29, 8, 30))
         rc, out, m = self.dry_observed()
-        self.assertEqual((rc, m["format"], m["reply_to_tweet_id"]), (0, "old", OLD_ID))
+        self.assertEqual((rc, m.get("format"), m["reply_to_tweet_id"]), (0, "old", OLD_ID))
         self.assertTrue(m["tweet_text"].startswith(f"How it actually went \u2014 {D}:"))
         self.assertIn("Animal Kingdom 27.0", m["alt_text"])
         self.assertIn("Reply format for ref=2026-10-28: old", out)
@@ -305,7 +305,7 @@ class Scripts(Base):
         tf.store_path(self.state).write_text("{{{")
         self.at(et(2026, 10, 29, 8, 30))
         rc, _, m = self.dry_observed()
-        self.assertEqual((rc, m["format"]), (0, "old"))
+        self.assertEqual((rc, m.get("format")), (0, "old"))
 
     def post_fake(self, calls, tid):
         def post(url, **kw):
@@ -660,3 +660,68 @@ class AlertFailureLeavesOutcome(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReplyTiers(Base):
+    """New-format reply tiers A/B come only from config/tweet_format.json; unset or invalid = skipped_bad_config."""
+
+    def test_parse(self):
+        self.assertEqual(tf._tiers({"reply_tier_a": 2, "reply_tier_b": 5.5}), ((2.0, 5.5), None))
+        for a, b in ((None, None), (2, None), (5, 2), (2, 2), (0, 3), ("2", 5), (True, 5)):
+            t, err = tf._tiers({"reply_tier_a": a, "reply_tier_b": b})
+            self.assertIsNone(t, (a, b))
+            self.assertIn("reply_tier_a/reply_tier_b", err)
+        self.assertIsNone(tf._tiers({})[0])
+
+    def test_shipped_config_leaves_tiers_pending_fred(self):
+        cfg = json.loads((ROOT / "config" / "tweet_format.json").read_text())
+        self.assertEqual((cfg["reply_tier_a"], cfg["reply_tier_b"]), (None, None))
+
+    def live_observed(self):
+        self.state.write_text(json.dumps({"predicted": {D: {"tweet_id": NEW_ID, "posted_at": AFTER, "format": "new"}}}))
+        tf.record(self.state, NEW_ID, "new", "predicted", D, AFTER)
+        sent, post = [], mock.Mock(side_effect=AssertionError("posted"))
+        keys = {k: "x" for k in ("TWITTER_CONSUMER_KEY", "TWITTER_CONSUMER_SECRET", "TWITTER_ACCESS_TOKEN", "TWITTER_ACCESS_TOKEN_SECRET")}
+        with mock.patch.object(tweet_v2, "now", return_value=et(2026, 10, 30, 8, 30)), \
+             mock.patch.object(tf, "REPLY_TIERS", None), mock.patch.object(tf, "TIERS_ERROR", "reply_tier_a/reply_tier_b unset"), \
+             mock.patch.object(wot, "load_env"), mock.patch.object(wot, "enforce"), mock.patch.dict("os.environ", keys), \
+             mock.patch.object(requests, "post", post), mock.patch.object(wot, "post_discord", side_effect=sent.append), \
+             mock.patch.object(tweet_v2, "build", side_effect=AssertionError("built")):
+            rc, out, err = self.run_main(wot, ["--date", D, "--content-dir", str(self.cdir), "--history", "h",
+                                               "--state-file", str(self.state), "--out", str(self.tmp / "o")])
+        return rc, out, err, sent, post
+
+    def test_unset_tiers_skip_new_reply_with_one_alert(self):
+        rc, out, err, sent, post = self.live_observed()
+        self.assertEqual(rc, 0)
+        self.assertIn("skipped_bad_config ref=2026-10-28: nothing posted", out)
+        self.assertEqual(len(sent), 1)
+        self.assertIn("reply_tier_a/reply_tier_b", sent[0])
+        post.assert_not_called()
+        self.assertNotIn("observed", json.loads(self.state.read_text()))
+
+    def test_unset_tiers_leave_old_reply_alone(self):
+        self.state.write_text(json.dumps({"predicted": {D: {"tweet_id": OLD_ID, "posted_at": BEFORE}}}))
+        with mock.patch.object(tf, "REPLY_TIERS", None), mock.patch.object(tf, "TIERS_ERROR", "unset"), \
+             mock.patch.object(tweet_v2, "now", return_value=et(2026, 10, 29, 8, 30)), \
+             mock.patch.object(tweet_v2, "build", self.fake_build), \
+             mock.patch.object(tweet_v1_legacy, "render_video", side_effect=AssertionError("dry run rendered")):
+            rc, out, _ = self.run_main(wot, ["--dry-run", "--date", D, "--content-dir", str(self.cdir), "--history", "h",
+                                             "--state-file", str(self.state), "--out", str(self.tmp / "o")])
+        m = json.loads((self.tmp / "o" / "dry_run.json").read_text())
+        self.assertEqual((rc, m.get("format")), (0, "old"))
+        self.assertTrue(m["tweet_text"].startswith(f"How it actually went \u2014 {D}:"))
+        self.assertNotIn("skipped_bad_config", out)
+
+    def test_module_reads_tiers_from_config(self):
+        import shutil
+        import tempfile
+        d = Path(tempfile.mkdtemp(prefix="tweetfmt-tiers-"))
+        self.addCleanup(shutil.rmtree, d, True)
+        probe = "import sys; sys.path.insert(0, 'operations/scripts'); import tweet_format as tf; print(tf.REPLY_TIERS, bool(tf.TIERS_ERROR))"
+        cfg = json.loads((ROOT / "config" / "tweet_format.json").read_text())
+        for a, b, want in ((None, None, "None True"), (1.5, 4, "(1.5, 4.0) False")):
+            (d / "c.json").write_text(json.dumps({**cfg, "reply_tier_a": a, "reply_tier_b": b}))
+            r = subprocess.run([sys.executable, "-c", probe], cwd=ROOT, capture_output=True, text=True,
+                               env={**os.environ, "TPCR_TWEET_FORMAT_CONFIG": str(d / "c.json")})
+            self.assertEqual(r.stdout.strip(), want, r.stderr)
