@@ -5,7 +5,7 @@ tests/fixtures/tweet_v2_samples/expected/: forecast cards Sep 2-6 (html/2026-09-
 scorecard replies, design C, Sep 2-6 (reply/html/C-2026-09-0N.html, reply/alt-text.md). Inputs are the same real
 data: wti_forecast_vs_actual_last14.csv rows for Sep 2-6 and the WDW historical rows of wti.parquet.
 
-Replies must match byte for byte. Forecast cards must match after exactly the three edits Fred approved on
+Replies must match byte for byte after Fred's Oct 28 on-target ruling (headline only, OCT28 below). Forecast cards must match after exactly the three edits Fred approved on
 Oct 26 (recorded in #12 decisions.md, "Edge-case answers"): no "Today ·" in the kicker, no "today" in the
 headline, axis label "shared scale, 10–35". The samples predate those edits. Dry render = cards.py only: no
 Chrome, no network, nothing posted."""
@@ -29,6 +29,21 @@ HEADLINES = {  # the locked #12 reply headlines (THREAD-SUMMARY.md)
     "2026-09-05": "Three parks on target. Animal Kingdom 6.7 low",
     "2026-09-06": "All four parks within 2 of forecast",
 }
+# Fred, Oct 28 2026 2:57 PM ET: the card's on-target rule is the reply text's A (3.0, was 2.0). The only change to the
+# #12 replies is the headline on the three days where a miss of 2.1-3.0 (or the "within" number) now reads differently.
+OCT28 = {
+    "2026-09-02": "Every park came in low. Animal Kingdom by 12.2",
+    "2026-09-03": "Animal Kingdom 16.3 low. Two parks on target",
+    "2026-09-04": "Three parks on target. Animal Kingdom 6.5 low",
+    "2026-09-05": "Three parks on target. Animal Kingdom 6.7 low",
+    "2026-09-06": "All four parks within 3 of forecast",
+}
+
+
+def oct28(s, d):
+    """Apply Fred's Oct 28 on-target ruling to a #12 reply sample (html or alt text): its headline only."""
+    assert HEADLINES[d] in s
+    return s.replace(HEADLINES[d], OCT28[d])
 
 
 def oct26(s):
@@ -88,9 +103,9 @@ def _forecast(d):
 
 def _reply(d):
     def t(self):
-        self.assertEqual(self.got(f"R-{d}.html"), (EXP / f"R-{d}.html").read_text())
-        self.assertEqual(self.got(f"R-{d}.alt.txt").strip(), self.ralt[d])
-        self.assertIn(f'class="h">{HEADLINES[d]}<', self.got(f"R-{d}.html"))
+        self.assertEqual(self.got(f"R-{d}.html"), oct28((EXP / f"R-{d}.html").read_text(), d))
+        self.assertEqual(self.got(f"R-{d}.alt.txt").strip(), oct28(self.ralt[d], d))
+        self.assertIn(f'class="h">{OCT28[d]}<', self.got(f"R-{d}.html"))
     return t
 
 

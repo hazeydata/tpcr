@@ -19,7 +19,7 @@ For park day D:
 | `render_anim.sh`, `anim_forecast.js`, `anim_reply.js` | 30 fps frames -> H.264 MP4 (about 7 s). |
 | `tweet_copy.py` | New-format tweet text (see Tweet text below), from `F-D.meta.json` / `R-D.meta.json`. Over 280 (X weighted) returns None -> silent. |
 | `park_status.py` | `open` / `closed` / `unknown` per park. `closed` only from the hand-filled `data/closures.csv`; `open` from `dimparkhours.csv` official rows; else `unknown`. |
-| `headline_copy.py` | Every fallback headline ("All open parks normal", "<Park> normal", "All open parks within 2 of forecast", and the all-four lines). Final copy from Lindsay; `cards.py` takes them only from here. |
+| `headline_copy.py` | Every fallback headline ("All open parks normal", "<Park> normal", "All open parks within 3 of forecast", and the all-four lines). Final copy from Lindsay; `cards.py` takes them only from here. |
 
 Scripts find `build_day.sh` via `TPCR_TWEET_V2_DIR` (default: `operations/tweet_v2` in this checkout).
 Data host (no defaults; `tweet_v2.py`, `wti_observed_tweet.py` and `wti_predicted_tweet.py` stop with `<NAME> is not set` if one is needed and unset): `TPCR_SSH_HOST` (ssh target for the data host),
@@ -116,7 +116,7 @@ Each park line has a tier by |observed − forecast| (gap rounded to 0.1): ✅ i
 (need 0 < A < B) a new-format reply run logs `skipped_bad_config`, sends one Discord alert, posts nothing and exits 0 (old-format
 replies are unaffected). The example above uses A = 2, B = 5 (with the shipped A = 3, B = 6, Animal Kingdom's 6.7 miss is still ⏬). Line 2 counts the open parks within A (`One park` / `Two parks` /
 `Three parks close to forecast.`, `No park close to forecast.`, `All four` or `All open parks close to forecast.`) and names the
-largest miss. The card headline still uses its own `cards.ON_TARGET` (2.0 WTI); the text and card agree only when A = 2, so with the shipped A = 3 a park missing by 2.1 to 3.0 is ✅ in the text but off target on the card headline.
+largest miss. The card headline's on-target rule (`cards.ON_TARGET`) is the same A, read from `reply_tier_a` (Fred, Oct 28 2026 2:57 PM ET), so text and card always agree; with `reply_tier_a` unset or invalid a reply card refuses to build (forecast cards are unaffected).
 A closed park's row is `<Park>: closed`. No colour-coded circles. Every text is under 280 by X's weighted count (emoji 2, non-Latin 2; no URL = 23 rule, as the texts carry no URLs);
 `tests/test_tweet_text.py` checks every label, tier and closure combination. A reply to an old-format original keeps the old text
 (`operations/scripts/tweet_v1_legacy.py`).
@@ -141,5 +141,5 @@ Optional: `--content-dir DIR` (local `predicted_D.json`/`observed_D.json` instea
 (stubs `requests_oauthlib`; no network; use a python with pandas + pyarrow or the sample tests skip).
 - `test_tweet_format`: the transition window, boundaries (incl. an original posted exactly at 16:00:00), tagged/untagged originals, naive clock, corrupt store, missing/corrupt config, custom `store_name`, a lookup failure inside and after the window, bad config skipping the 4 PM original (Discord alert, alert failure incl. HTTP 500/4xx logged with exit 0, stderr-only without a token, state-only unblock, observed/reply tags don't unblock, fixed config resumes the next run), old-video alt text with missing labels, old/new reply through the scripts, `post_discord` raising on non-2xx without leaking the token or body, and `safe_alert` keeping the post and state when the success or park-hours alert fails.
 - `test_tweet_v2_samples`: dry-renders every tpcr-meta#12 sample (forecast Sep 2-6, reply C Sep 2-6) from the same real data
-  (`tests/fixtures/tweet_v2_samples/`) and compares: replies byte-identical; forecasts identical after Fred's three Oct 26 edits.
+  (`tests/fixtures/tweet_v2_samples/`) and compares: replies identical after Fred's Oct 28 on-target ruling (headline only); forecasts identical after Fred's three Oct 26 edits.
 - The three older suites run with the window moved to the past (`setUpModule`), so they test the new-format path.
