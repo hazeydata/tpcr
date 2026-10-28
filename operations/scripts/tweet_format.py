@@ -41,6 +41,18 @@ except Exception as _e:  # noqa: BLE001 - fail safe, see above
     STORE_NAME = "tweet_formats.json"
 
 
+def _tiers(cfg):
+    """(A, B) for the new-format reply park lines: |miss| <= A on target, <= B off, > B far off. Else the error."""
+    try:
+        a, b = cfg["reply_tier_a"], cfg["reply_tier_b"]
+        if not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in (a, b)) or not 0 < a < b:
+            return None, f"reply_tier_a/reply_tier_b unset or invalid ({a!r}, {b!r}); need 0 < A < B"
+        return (float(a), float(b)), None
+    except Exception as e:  # noqa: BLE001 - fail closed
+        return None, f"{type(e).__name__}: {e}"
+
+
+REPLY_TIERS, TIERS_ERROR = _tiers(_cfg) if not CONFIG_ERROR else (None, CONFIG_ERROR)
 CONFIG_REASON = "config missing/invalid: everything new"
 
 

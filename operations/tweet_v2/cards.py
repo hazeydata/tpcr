@@ -194,16 +194,19 @@ def reply_html(D, fc, ob, status=None):
 
 
 def meta(D, fc, S, status, title):
-    """Facts the tweet text needs (operations/tweet_v2/tweet_copy.py): headline, which parks it names, ranges."""
+    """Facts the forecast tweet text needs (tweet_copy.py): each park's card label, MK, EP, HS, AK order."""
     status = status or {}
-    op = [p for p in P if status.get(p, "open") == "open" and fc.get(p) is not None]
-    o = [p for p in op if dist(S, p, fc[p]) > 0]
-    top = max((dist(S, p, fc[p]) for p in o), default=0)
-    named = [p for p in o if abs(dist(S, p, fc[p]) - top) < 1e-9] if o else []
-    return {"date": D, "headline": title, "named": [N[p] for p in named],
-            "dirs": ["busy" if fc[p] > S[p][1] else "quiet" for p in named],
-            "open": [N[p] for p in op], "closed": [N[p] for p in P if status.get(p) == "closed"],
-            "parks": {N[p]: {"wti": round(fc[p], 1), "lo": round(S[p][0], 1), "hi": round(S[p][1], 1)} for p in op}}
+    return {"date": D, "headline": title,
+            "labels": {N[p]: "Closed" if status.get(p) == "closed" else qual(S, p, fc[p]) for p in P}}
+
+
+def reply_meta(D, fc, ob, status, title):
+    """Facts the reply tweet text needs (tweet_copy.py): each park's observed, forecast and gap (None = closed), and the
+    graded parks (open, the ones the card headline counts)."""
+    status = status or {}
+    parks = {N[p]: None if status.get(p) == "closed" else {"ob": round(ob[p], 1), "fc": round(fc[p], 1), "gap": gap(fc, ob, p)} for p in P}
+    return {"date": D, "headline": title, "parks": parks,
+            "graded": [N[p] for p in P if status.get(p, "open") == "open" and parks[N[p]]]}
 
 
 if __name__ == "__main__":
@@ -235,5 +238,5 @@ if __name__ == "__main__":
     if all(ob[p] is None for p in P if p not in cl): print(f"REPLY {D}: no observed yet, skipped"); sys.exit(0)
     if any(ob[p] is None for p in P if p not in cl): die(f"{D}: observed missing for {[p for p in P if ob[p] is None and p not in cl]} (partial)")
     t, h, al = reply_html(D, fc, ob, status)
-    json.dump({"date": D, "headline": t}, open(f"{a.out}/R-{D}.meta.json", "w"), indent=1)
+    json.dump(reply_meta(D, fc, ob, status, t), open(f"{a.out}/R-{D}.meta.json", "w"), indent=1)
     open(f"{a.out}/R-{D}.html", "w").write(h); open(f"{a.out}/R-{D}.alt.txt", "w").write(check_alt(al) + "\n"); print(f"REPLY {D}: {t}")

@@ -1,56 +1,85 @@
-"""Tweet text for the v2 posts, from Writing's edge copy v2 (tweet-edge-copy-v2.md, Oct 26 2026). No invented copy:
-when a case has no approved text, forecast_text/reply_text return None and the caller stays silent
-(Fred, Oct 26: default silent). Values always 1 decimal, never rounded away (E8)."""
+"""Tweet text for the new-format (v2) posts (TPCR tweet text restyle, Oct 28 2026). Old-format text lives in
+operations/scripts/tweet_v1_legacy.py and is unchanged. Values always 1 decimal. No colour-coded circles.
+A text over X's 280 weighted limit returns None and the caller stays silent."""
 import datetime as dt
 
 LIMIT = 280
-SHORT = {"Magic Kingdom": "MK", "EPCOT": "EPCOT", "Hollywood Studios": "HS", "Animal Kingdom": "AK"}
+TAGS = "#WDW #DisneyWorld #WaitTimes"
+EMOJI = ("⬇️", "⬆️", "⏬", "⏫", "✅")
+LIGHT = ((0, 4351), (8192, 8205), (8208, 8223), (8242, 8247))
+COUNT = {1: "One park", 2: "Two parks", 3: "Three parks"}
+
+
+def weighted_len(t):
+    """X weighted count (twitter-text v3): each emoji counts 2, Latin and common punctuation 1, anything else 2."""
+    n = 0
+    for e in EMOJI:
+        n += 2 * t.count(e); t = t.replace(e, "")
+    return n + sum(1 if any(a <= ord(c) <= b for a, b in LIGHT) else 2 for c in t)
 
 
 def _day(D):
-    return dt.date.fromisoformat(D).strftime("%a %b %-d")
+    return dt.date.fromisoformat(D).strftime("%a, %b %-d")
 
 
-def _fit(full, steps):
-    """E8 cut order: try each shorter form in turn; the first that fits wins. None if nothing fits."""
-    for t in [full] + steps:
-        if len(t) <= LIMIT:
-            return t
-    return None
+def _names(xs):
+    return xs[0] if len(xs) == 1 else f"{', '.join(xs[:-1])} and {xs[-1]}"
+
+
+def _fit(t):
+    return t if weighted_len(t) <= LIMIT else None
+
+
+def forecast_summary(labels):
+    """labels = {park: card label} in MK, EP, HS, AK order. Busier parks, then quieter, then closed, then the rest:
+    one normal park left is named, two or more are "Other parks normal", none normal anywhere is "All four parks normal"."""
+    parts = [f"{_names([p for p, q in labels.items() if q == lab])} {lab.lower()}."
+             for lab in ("Busier than normal", "Quieter than normal", "Closed") if lab in labels.values()]
+    normal = [p for p, q in labels.items() if q == "Normal"]
+    if not parts:
+        return "All four parks normal."
+    if len(normal) == 1:
+        parts.append(f"{normal[0]} normal.")
+    elif normal:
+        parts.append("Other parks normal.")
+    return " ".join(parts)
 
 
 def forecast_text(m):
-    """m = cards.py F-DATE.meta.json. Base pair / E2 / E3 / E6."""
-    day, named, closed = _day(m["date"]), m["named"], m["closed"]
-    if not m["open"]:
-        return None  # E7: every park closed -> no post (also skipped_all_closed upstream)
-    if not named:
-        if closed:
-            return None  # no approved copy for "all open parks normal" with a park closed
-        return f"All four parks look normal tomorrow, {day}. Each one inside its own usual range. A good day to just go. Scorecard in this thread ↓"  # E3
-    if len(named) == 2 and not closed:  # E2: tie, both the same way (copy exists for quiet only)
-        if m["dirs"] == ["quiet", "quiet"]:
-            return f"{named[0]} and {named[1]} look quiet. Tomorrow, {day}, both sit below their normal ranges. Every park vs its own normal, never each other. Scorecard in this thread ↓"
+    """m = cards.py F-DATE.meta.json."""
+    if all(q == "Closed" for q in m["labels"].values()):
         return None
-    if len(named) != 1:
-        return None
-    pk = named[0]; v = m["parks"][pk]
-    if closed:
-        if len(closed) != 1:
-            return None  # E6 copy covers one closed park
-        full = (f"{m['headline']}. Tomorrow, {day}: {pk} WTI {v['wti']:.1f} vs its normal {v['lo']:.1f}–{v['hi']:.1f}. "
-                f"{closed[0]} is closed. Every park vs its own normal. Scorecard in this thread ↓")
-        return _fit(full, [])
-    base = f"{m['headline']}. Tomorrow, {day}: {pk} WTI {v['wti']:.1f} vs its normal {v['lo']:.1f}–{v['hi']:.1f}."
-    tail = " Scorecard in this thread ↓"
-    s1 = base + tail                                          # E8 step 1: drop the "every park" line
-    s2 = s1.replace(pk, SHORT.get(pk, pk))                    # E8 step 2: short park names in text
-    s3 = f"{m['headline']}. Tomorrow, {day}: {SHORT.get(pk, pk)} WTI {v['wti']:.1f}.{tail}"  # step 3: drop range
-    return _fit(base + " Every park vs its own normal, never each other." + tail, [s1, s2, s3])
+    return _fit(f"WDW Crowd FORECAST: {_day(m['date'])}\n{forecast_summary(m['labels'])}\n{TAGS}")
 
 
-def reply_text(m):
-    """Base pair reply. m = cards.py R-DATE.meta.json."""
-    if not m.get("headline"):
+def tier(e, tiers):
+    """|e| <= A on target, <= B off, else far off (tiers = (A, B) from config/tweet_format.json)."""
+    a, b = tiers
+    return "on" if abs(e) <= a else ("low" if e < 0 else "high") + ("" if abs(e) <= b else "2")
+
+
+def reply_summary(m, tiers):
+    """Counts the graded parks within A of forecast and names the largest miss (MK, EP, HS, AK order on a tie)."""
+    g = {p: m["parks"][p]["gap"] for p in m["graded"]}
+    miss = sorted([p for p in g if tier(g[p], tiers) != "on"], key=lambda p: -abs(g[p]))
+    if not miss:
+        return "All four parks close to forecast." if len(g) == len(m["parks"]) else "All open parks close to forecast."
+    on = len(g) - len(miss)
+    lead = f"{COUNT[on]} close to forecast." if on else "No park close to forecast."
+    t = miss[0]
+    return f"{lead} {t} {abs(g[t]):.1f} {'quieter' if g[t] < 0 else 'busier'}."
+
+
+def reply_line(p, v, tiers):
+    if v is None:
+        return f"{p}: closed"
+    mark = {"on": "✅", "low": "⬇️", "high": "⬆️", "low2": "⏬", "high2": "⏫"}[tier(v["gap"], tiers)]
+    return f"{mark} {p}: {v['ob']:.1f} (forecast {v['fc']:.1f})"
+
+
+def reply_text(m, tiers):
+    """m = cards.py R-DATE.meta.json. No tiers (unset in config) -> None."""
+    if not m.get("graded") or not tiers:
         return None
-    return _fit(f"{m['headline']}. Yesterday, {_day(m['date'])}, vs our forecast. Bar = observed − forecast.", [])
+    rows = [reply_line(p, v, tiers) for p, v in m["parks"].items()]
+    return _fit(f"WDW Crowds OBSERVED: {_day(m['date'])}\n{reply_summary(m, tiers)}\n\n" + "\n".join(rows) + "\n\nLower WTI = shorter waits.")
