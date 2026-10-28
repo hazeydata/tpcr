@@ -1,7 +1,7 @@
 """TPCR-TWEET-RESTYLE-CUTOVER: per-tweet format tags (old = pre-v2 Remotion video, new = v2 card, tpcr-meta#12).
 
-Fred, Oct 27 2026: a parallel transition. Originals posted from the Oct 28 4 PM ET run on are new; a reply uses the
-format of the original it answers; the old format retires at 00:00 ET Oct 31. Both instants live only in
+Fred, Oct 27 2026: a parallel transition. Originals posted from the Oct 29 4 PM ET run on are new; a reply uses the
+format of the original it answers; the old format retires at 00:00 ET Nov 1 (moved +24h from Oct 28 / Oct 31). Both instants live only in
 config/tweet_format.json (FIRST_NEW_RUN, OLD_RETIRES below).
 
 Store: tweet_formats.json next to tweet_state.json, {"<tweet_id>": {"format": "old"|"new", "kind", "reference_date",

@@ -1,5 +1,5 @@
 """TPCR-TWEET-RESTYLE-CUTOVER: the OLD (pre-v2) observed reply, kept only for replies to old-format originals
-during the overlap window (config/tweet_format.json; retires 00:00 ET Oct 31 2026). Delete after that date.
+during the overlap window (config/tweet_format.json; retires 00:00 ET Nov 1 2026). Delete after that date.
 
 Visual and text are the pre-#532 wti_observed_tweet.py (main @ e25bd9c0e): the Remotion DailyWTIAll video rendered
 on the data host, emoji-bar text. Two changes: the host and Remotion dir come from env (TPCR_SSH_HOST,
