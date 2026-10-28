@@ -11,7 +11,8 @@ COUNT = {1: "One park", 2: "Two parks", 3: "Three parks"}
 
 
 def weighted_len(t):
-    """X weighted count (twitter-text v3): each emoji counts 2, Latin and common punctuation 1, anything else 2."""
+    """X weighted count (twitter-text v3): each emoji counts 2, Latin and common punctuation 1, anything else 2.
+    No URL = 23 rule: these texts carry no URLs."""
     n = 0
     for e in EMOJI:
         n += 2 * t.count(e); t = t.replace(e, "")

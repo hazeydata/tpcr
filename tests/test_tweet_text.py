@@ -70,7 +70,11 @@ class TweetText(unittest.TestCase):
         m = self.c.reply_meta(D, fc, {**fc, "AK": 23.0}, {}, "x")
         self.assertIn("✅ Animal Kingdom:", tc.reply_text(m, (3.0, 6.0)))
         self.assertIn("⏫ Animal Kingdom:", tc.reply_text(m, (1.0, 2.5)))
-        self.assertIsNone(tc.reply_text(m, None))
+        try:
+            unset = tc.reply_text(m, None)
+        except TypeError as e:
+            unset = f"raised {e}"
+        self.assertIsNone(unset)
 
     def test_arrow_direction_and_summary(self):
         fc = {p: 20.0 for p in S}
@@ -121,6 +125,21 @@ class TweetText(unittest.TestCase):
         self.assertEqual(tc.weighted_len("✅⬇️⬆️⏬⏫"), 10)
         self.assertEqual(tc.weighted_len("ab–"), 3)
         self.assertIsNone(tc._fit("x" * 281))
+        self.assertEqual(tc._fit("x" * 280), "x" * 280)
+        self.assertEqual(tc._fit("x" * 278 + "✅"), "x" * 278 + "✅")
+
+    def test_non_latin_weighs_two(self):
+        self.assertEqual(tc.weighted_len("中文"), 4)
+        self.assertEqual(tc.weighted_len("a−b"), 4)
+        self.assertIsNone(tc._fit("中" * 141))
+        self.assertEqual(tc._fit("中" * 140), "中" * 140)
+
+    def test_readme_examples_are_the_code_output(self):
+        fc = {"MK": 20.0, "EP": 20.0, "HS": 20.0, "AK": 30.0}
+        ob = {"MK": 21.5, "EP": 18.0, "HS": 22.0, "AK": 23.3}
+        readme = (ROOT / "operations" / "tweet_v2" / "README.md").read_text()
+        self.assertIn(self.rp_text(fc, ob), readme)
+        self.assertIn(self.fc_text({"MK": 15.0, "EP": 15.0, "HS": 15.0, "AK": 25.0}), readme)
 
 
 if __name__ == "__main__":
