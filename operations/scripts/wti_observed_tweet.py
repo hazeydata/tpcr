@@ -348,6 +348,17 @@ def main(argv=None):
     print(f"Reply format for ref={reference_date}: {fmt} ({fmt_why})")
     if reply_to and fmt == tweet_format.OLD:
         return reply_old_format(reference_date, content, reply_to, how, fmt_why, dry, args, state_file, guard)
+    if tweet_format.TIERS_ERROR:
+        print(f"ERROR skipped_bad_config ref={reference_date}: {tweet_format.TIERS_ERROR}; nothing posted", file=sys.stderr)
+        print(f"skipped_bad_config ref={reference_date}: nothing posted")
+        try:
+            (print if dry else post_discord)(
+                f":warning: **WTI Observed Tweet** \u2014 ref={reference_date}: config {tweet_format.CONFIG} reply tiers "
+                "(reply_tier_a/reply_tier_b) unset or invalid; the new-format reply was skipped, nothing posted."[:1900])
+        except Exception as exc:  # no secrets: exception type only
+            print(f"ERROR skipped_bad_config ref={reference_date}: Discord alert failed ({type(exc).__name__}); "
+                  "run still skipped, exit 0", file=sys.stderr)
+        return 0
 
     work, tmp = tweet_v2.new_workdir(args.out)
     try:

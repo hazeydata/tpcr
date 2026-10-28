@@ -1,6 +1,8 @@
 {
-  "_doc": "TPCR-TWEET-RESTYLE-CUTOVER: the ONLY place the format window is set. Read by operations/scripts/tweet_format.py. Times are America/New_York (EDT, UTC-4, on both dates; DST ends 02:00 Nov 1, after old_retires).",
+  "_doc": "TPCR-TWEET-RESTYLE-CUTOVER: the ONLY place the format window and the new-format reply tiers are set. reply_tier_a/reply_tier_b: |observed - forecast| WTI cutoffs, set by Fred Oct 28 2026 to A=3.0, B=6.0 (miss <= A ✅, A < miss <= B ⬇️/⬆️, > B ⏬/⏫; unset or invalid = new-format reply skipped_bad_config). Read by operations/scripts/tweet_format.py. Times are America/New_York (EDT, UTC-4, on both dates; DST ends 02:00 Nov 1, after old_retires).",
   "first_new_run": "2026-10-29T16:00:00-04:00",
   "old_retires": "2026-11-01T00:00:00-04:00",
-  "store_name": "tweet_formats.json"
+  "store_name": "tweet_formats.json",
+  "reply_tier_a": 3.0,
+  "reply_tier_b": 6.0
 }

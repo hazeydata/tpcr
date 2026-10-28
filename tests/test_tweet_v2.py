@@ -2,6 +2,7 @@
 silent on missing data, tie naming, and the closed row (TPCR-TWEET-V2-CLOSED-ROW-001)."""
 import io
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -54,7 +55,12 @@ def keep_requests():
 
 
 class Base(unittest.TestCase):
+    TIERS = (2.0, 5.0)
+
     def setUp(self):
+        import tweet_format
+        for k, v in (("REPLY_TIERS", self.TIERS), ("TIERS_ERROR", None)):
+            p = mock.patch.object(tweet_format, k, v); p.start(); self.addCleanup(p.stop)
         self.tmp = Path(tempfile.mkdtemp(prefix="tweetv2-test-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.addCleanup(keep_requests())
@@ -73,10 +79,13 @@ class Base(unittest.TestCase):
     def fake_build(self, d, out, history, pred, obs=None, park_hours=None, closures=None):
         out = Path(out)
         arts = {}
-        metas = {"F": {"date": d, "headline": "Animal Kingdom busy", "named": ["Animal Kingdom"], "dirs": ["busy"],
-                       "open": [n for _, n in PARKS], "closed": [],
-                       "parks": {"Animal Kingdom": {"wti": 33.3, "lo": 20.9, "hi": 27.7}}},
-                 "R": {"date": d, "headline": "Three parks on target. Animal Kingdom 6.3 low"}}
+        on = {"ob": 20.0, "fc": 20.0, "gap": 0.0}
+        metas = {"F": {"date": d, "headline": "Animal Kingdom busy",
+                       "labels": {"Magic Kingdom": "Normal", "EPCOT": "Normal", "Hollywood Studios": "Normal", "Animal Kingdom": "Busier than normal"}},
+                 "R": {"date": d, "headline": "Three parks on target. Animal Kingdom 6.3 low",
+                       "parks": {"Magic Kingdom": on, "EPCOT": on, "Hollywood Studios": on,
+                                 "Animal Kingdom": {"ob": 20.0, "fc": 26.3, "gap": -6.3}},
+                       "graded": [n for _, n in PARKS]}}
         for k in (["F"] if obs is None else ["F", "R"]):
             (out / f"{k}-{d}.mp4").write_bytes(b"mp4")
             arts[k] = {"mp4": out / f"{k}-{d}.mp4", "png": out / f"{k}-{d}.png", "alt": f"{k} alt", "meta": metas[k]}
@@ -149,7 +158,9 @@ class DryRun(Base):
         self.assertEqual(m["reply_to_tweet_id"], "1850000000000000001")
         self.assertEqual(m["posts_at"], "2026-10-29 08:30 America/New_York")
         self.assertEqual(m["alt_text"], "R alt")
-        self.assertEqual(m["tweet_text"], "Three parks on target. Animal Kingdom 6.3 low. Yesterday, Wed Oct 28, vs our forecast. Bar = observed − forecast.")
+        self.assertEqual(m["tweet_text"], "WDW Crowds OBSERVED: Wed, Oct 28\nThree parks close to forecast. Animal Kingdom 6.3 quieter.\n\n"
+                         "✅ Magic Kingdom: 20.0 (forecast 20.0)\n✅ EPCOT: 20.0 (forecast 20.0)\n✅ Hollywood Studios: 20.0 (forecast 20.0)\n"
+                         "⏬ Animal Kingdom: 20.0 (forecast 26.3)\n\nLower WTI = shorter waits.")
         self.assertNotIn("observed", json.loads(self.state.read_text()))
 
     def test_dry_run_needs_no_credentials_and_skips_env(self):
@@ -622,7 +633,7 @@ class Cards(unittest.TestCase):
         self.assertEqual(self.c.forecast_headline(fc, self.S), "Magic Kingdom busy, Animal Kingdom quiet")
         import tweet_copy
         m = self.c.meta(D, {"MK": 15.0, "EP": 5.0, "HS": 5.0, "AK": 15.0}, self.S, {}, "x")
-        self.assertTrue(tweet_copy.forecast_text(m).startswith("EPCOT and Hollywood Studios look quiet. Tomorrow, Wed Oct 28,"))
+        self.assertEqual(tweet_copy.forecast_text(m).split("\n")[1], "EPCOT and Hollywood Studios quieter than normal. Other parks normal.")
 
     def test_closed_row_and_exclusions(self):
         """AC 1-2, 8, 10, 11: Closed row with no value; closed park never picked or a tie partner; unknown never Closed."""
@@ -662,7 +673,7 @@ class Cards(unittest.TestCase):
         import headline_copy as hc
         self.assertEqual(hc.ALL_OPEN_NORMAL, "All open parks normal")
         self.assertEqual(hc.ONE_PARK_NORMAL.format(park="EPCOT"), "EPCOT normal")
-        self.assertEqual(hc.ALL_OPEN_ON_TARGET, "All open parks within 2 of forecast")
+        self.assertEqual(hc.ALL_OPEN_ON_TARGET, "All open parks within 3 of forecast")
         st = {"MK": "closed", "EP": "open", "HS": "open", "AK": "open"}
         self.assertEqual(self.c.forecast_headline({p: 15.0 for p in self.c.P}, self.S, st), hc.ALL_OPEN_NORMAL)
         self.assertEqual(self.c.forecast_headline({"EP": 15.0}, self.S, {"EP": "open", "MK": "closed",
@@ -670,6 +681,34 @@ class Cards(unittest.TestCase):
         fc = {p: 15.0 for p in self.c.P}
         self.assertEqual(self.c.reply_headline(fc, {**fc, "MK": 16.0}, {"HS": "closed"}), hc.ALL_OPEN_ON_TARGET)
         self.assertEqual(self.c.reply_headline(fc, fc), hc.ALL_FOUR_ON_TARGET)
+
+    def test_on_target_is_config_reply_tier_a(self):
+        """Fred, Oct 28 2026 2:57 PM ET: the card headline's on-target rule is A from config/tweet_format.json."""
+        import headline_copy as hc
+        cfg = json.loads((ROOT / "config" / "tweet_format.json").read_text())
+        self.assertEqual(self.c.ON_TARGET, cfg["reply_tier_a"])
+        self.assertEqual(self.c.ON_TARGET, 3.0)
+        n = f"within {self.c.ON_TARGET:g} of forecast"
+        self.assertIn(n, hc.ALL_FOUR_ON_TARGET); self.assertIn(n, hc.ALL_OPEN_ON_TARGET)
+
+    def test_on_target_headline_boundaries(self):
+        fc = {p: 20.0 for p in self.c.P}
+        for d in (2.9, 3.0, -2.9, -3.0):
+            self.assertEqual(self.c.reply_headline(fc, {**fc, "AK": round(20.0 + d, 1)}), "All four parks within 3 of forecast", d)
+        self.assertEqual(self.c.reply_headline(fc, {**fc, "AK": 23.1}), "Three parks on target. Animal Kingdom 3.1 high")
+        self.assertEqual(self.c.reply_headline(fc, {**fc, "AK": 16.9}), "Three parks on target. Animal Kingdom 3.1 low")
+
+    def test_on_target_unset_refuses_reply_only(self):
+        probe = ("import sys; sys.path.insert(0, 'operations/tweet_v2'); import cards; print(cards.ON_TARGET)\n"
+                 "try:\n    cards.reply_headline({'MK': 1.0}, {'MK': 1.0})\nexcept SystemExit as e:\n    print(e)")
+        tmp = Path(tempfile.mkdtemp(prefix="tweetv2-test-"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        cfg = json.loads((ROOT / "config" / "tweet_format.json").read_text())
+        (tmp / "c.json").write_text(json.dumps({**cfg, "reply_tier_a": None}))
+        r = subprocess.run([sys.executable, "-c", probe], cwd=ROOT, capture_output=True, text=True,
+                           env={**os.environ, "TPCR_TWEET_FORMAT_CONFIG": str(tmp / "c.json")})
+        self.assertEqual(r.stdout.splitlines()[0], "None", r.stderr)
+        self.assertIn("REFUSING TO BUILD: config/tweet_format.json reply_tier_a", r.stdout)
 
     def test_missing_official_row_is_unknown_never_closed(self):
         """R2: no official row (absent, or only an unofficial row) -> unknown, even with a closure marker set."""

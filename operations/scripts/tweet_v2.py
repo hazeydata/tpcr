@@ -127,13 +127,14 @@ def build(D, out, history, predicted_json, observed_json=None, runner=subprocess
 
 
 def post_text(kind, arts):
-    """Approved tweet text (tweet_copy.py, edge copy v2) for the built card, or None = stay silent."""
+    """New-format tweet text (tweet_copy.py) for the built card, or None = stay silent."""
     sys.path.insert(0, str(BUILD_DAY.parent))
     import tweet_copy
+    import tweet_format
     k = "F" if kind == "predicted" else "R"
     if k not in arts:
         return None
-    return tweet_copy.forecast_text(arts[k]["meta"]) if k == "F" else tweet_copy.reply_text(arts[k]["meta"])
+    return tweet_copy.forecast_text(arts[k]["meta"]) if k == "F" else tweet_copy.reply_text(arts[k]["meta"], tweet_format.REPLY_TIERS)
 
 
 def set_alt_text(media_id, alt, auth, post):

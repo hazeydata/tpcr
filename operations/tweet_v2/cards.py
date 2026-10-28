@@ -21,7 +21,19 @@ FCSS = CSS + """
 .r{display:grid;grid-template-columns:420px 230px 380px 1fr;align-items:center;height:118px;border-top:1px solid #22324A}
 .strip{position:absolute;left:96px;right:96px;bottom:30px;border-top:1px solid #2A3A52;padding-top:12px;font-size:27px;color:#8A9AB0;white-space:nowrap}</style>"""
 RCSS = CSS + ".lab{font-size:22px;color:#7C8CA3}</style>"
-ON_TARGET = 2.0   # |observed - forecast| <= 2 WTI counts as on target
+# |observed - forecast| <= ON_TARGET WTI counts as on target in the card headline. Fred, Oct 28 2026 2:57 PM ET: it is the
+# reply text's A, read from the one source, config/tweet_format.json reply_tier_a (TPCR_TWEET_FORMAT_CONFIG outside a
+# checkout, as tweet_format.py). Unusable config: ON_TARGET = None and only a reply build refuses (forecasts are unaffected).
+def _on_target():
+    try:
+        p = os.environ.get("TPCR_TWEET_FORMAT_CONFIG") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "config", "tweet_format.json")
+        a = json.load(open(p))["reply_tier_a"]
+        return float(a) if isinstance(a, (int, float)) and not isinstance(a, bool) and a > 0 else None
+    except Exception:  # noqa: BLE001 - reply_headline refuses
+        return None
+
+
+ON_TARGET = _on_target()
 LIM = 20          # fixed scorecard scale, -20..+20
 WORD = {1: "One", 2: "Two", 3: "Three", 4: "Four"}
 
@@ -120,8 +132,9 @@ def gap(fc, ob, p): return round(ob[p] - fc[p] + 1e-9, 1)
 
 
 def reply_headline(fc, ob, status=None):
-    """Error-based: within 2 WTI = on target. Name the largest miss; count on-target parks.
+    """Error-based: within ON_TARGET (config reply_tier_a, 3.0) WTI = on target. Name the largest miss; count on-target parks.
     Only open parks are graded (closed/unknown left out of the pick, AC 8). Unchanged when all four are open."""
+    if ON_TARGET is None: die("config/tweet_format.json reply_tier_a unset or invalid: no on-target rule for the reply headline")
     status = status or {}
     Q = [p for p in P if status.get(p, "open") == "open" and ob.get(p) is not None and fc.get(p) is not None]
     if not Q: return None
@@ -194,16 +207,19 @@ def reply_html(D, fc, ob, status=None):
 
 
 def meta(D, fc, S, status, title):
-    """Facts the tweet text needs (operations/tweet_v2/tweet_copy.py): headline, which parks it names, ranges."""
+    """Facts the forecast tweet text needs (tweet_copy.py): each park's card label, MK, EP, HS, AK order."""
     status = status or {}
-    op = [p for p in P if status.get(p, "open") == "open" and fc.get(p) is not None]
-    o = [p for p in op if dist(S, p, fc[p]) > 0]
-    top = max((dist(S, p, fc[p]) for p in o), default=0)
-    named = [p for p in o if abs(dist(S, p, fc[p]) - top) < 1e-9] if o else []
-    return {"date": D, "headline": title, "named": [N[p] for p in named],
-            "dirs": ["busy" if fc[p] > S[p][1] else "quiet" for p in named],
-            "open": [N[p] for p in op], "closed": [N[p] for p in P if status.get(p) == "closed"],
-            "parks": {N[p]: {"wti": round(fc[p], 1), "lo": round(S[p][0], 1), "hi": round(S[p][1], 1)} for p in op}}
+    return {"date": D, "headline": title,
+            "labels": {N[p]: "Closed" if status.get(p) == "closed" else qual(S, p, fc[p]) for p in P}}
+
+
+def reply_meta(D, fc, ob, status, title):
+    """Facts the reply tweet text needs (tweet_copy.py): each park's observed, forecast and gap (None = closed), and the
+    graded parks (open, the ones the card headline counts)."""
+    status = status or {}
+    parks = {N[p]: None if status.get(p) == "closed" else {"ob": round(ob[p], 1), "fc": round(fc[p], 1), "gap": gap(fc, ob, p)} for p in P}
+    return {"date": D, "headline": title, "parks": parks,
+            "graded": [N[p] for p in P if status.get(p, "open") == "open" and parks[N[p]]]}
 
 
 if __name__ == "__main__":
@@ -235,5 +251,5 @@ if __name__ == "__main__":
     if all(ob[p] is None for p in P if p not in cl): print(f"REPLY {D}: no observed yet, skipped"); sys.exit(0)
     if any(ob[p] is None for p in P if p not in cl): die(f"{D}: observed missing for {[p for p in P if ob[p] is None and p not in cl]} (partial)")
     t, h, al = reply_html(D, fc, ob, status)
-    json.dump({"date": D, "headline": t}, open(f"{a.out}/R-{D}.meta.json", "w"), indent=1)
+    json.dump(reply_meta(D, fc, ob, status, t), open(f"{a.out}/R-{D}.meta.json", "w"), indent=1)
     open(f"{a.out}/R-{D}.html", "w").write(h); open(f"{a.out}/R-{D}.alt.txt", "w").write(check_alt(al) + "\n"); print(f"REPLY {D}: {t}")
