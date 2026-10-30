@@ -17,6 +17,10 @@ Multi-candidate model competition (actuals_first vs full_feature vs lite)
 was removed 2026-03-21. It tripled training time and caused OOM crashes.
 It returns later as a shadow-mode feature in the competition framework.
 
+Training data: matched_pairs/actuals_training_v2/{PARK}.parquet under the write
+base (rebuilt by s06b the same run; the shadow dir in shadow mode). Geo-decay
+half-life is per park via cfg.get_halflife_days (default 730).
+
 See: docs/PIPELINE_V4_DESIGN.md
 
 === END V4 DESIGN PRINCIPLE ===
@@ -37,6 +41,7 @@ except ImportError:
     xgb = None
 
 from pipeline.config import PipelineConfig
+from pipeline.core import paths
 from pipeline.core.logging import PipelineLogger
 from pipeline.core.park_codes import entity_to_park
 from pipeline.core.validation import ValidationError
@@ -53,8 +58,9 @@ BASELINE_FEATURES = [
 ]
 
 
-def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
+def run(cfg: PipelineConfig, log: PipelineLogger, as_of: date | None = None) -> dict:
     """Train one XGBoost model per entity — V4 pure baseline."""
+    as_of = as_of or date.today()
 
     if xgb is None:
         raise ValidationError("XGBoost is required. pip install xgboost")
@@ -65,8 +71,8 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
     log.info(f"Features: {BASELINE_FEATURES}")
 
     # Look for per-park training data (preferred) or single file
-    actuals_dir = cfg.output_base / "matched_pairs" / "actuals_training_v2"
-    actuals_single = cfg.output_base / "matched_pairs" / "actuals_training_v2.parquet"
+    actuals_dir = paths.training_data_dir(cfg)
+    actuals_single = paths.training_data_combined_path(cfg)
 
     park_files = sorted(actuals_dir.glob("*.parquet")) if actuals_dir.is_dir() else []
     use_park_chunks = len(park_files) > 0
@@ -125,7 +131,8 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
             for entity_code in park_entities:
                 try:
                     result = _train_baseline_model(
-                        entity_code, park_df, cfg, min_obs
+                        entity_code, park_df, cfg, min_obs,
+                        as_of=as_of, halflife_days=cfg.get_halflife_days(park_code),
                     )
                     if result is not None:
                         successful += 1
@@ -162,56 +169,90 @@ def _train_baseline_model(
     park_df: pd.DataFrame,
     cfg: PipelineConfig,
     min_samples: int,
+    as_of: date | None = None,
+    halflife_days: int | None = None,
 ) -> dict | None:
-    """Train a single 5-feature XGBoost model for one entity."""
+    """Train a single baseline XGBoost model for one entity and save it."""
+    entity_df = park_df[park_df["entity_code"] == entity_code]
+    halflife_days = halflife_days or cfg.geo_decay_halflife_days
+    fitted = fit_baseline(entity_df, cfg, min_samples, as_of or date.today(), halflife_days)
+    if fitted is None:
+        return None
+    bst, stats = fitted
 
-    entity_df = park_df[park_df["entity_code"] == entity_code].copy()
-    entity_df = entity_df.reset_index(drop=True)  # CRITICAL: align index with position
+    model_dir = cfg.models_dir / entity_code
+    model_dir.mkdir(parents=True, exist_ok=True)
 
+    model_path = model_dir / "model_baseline.json"
+    bst.save_model(str(model_path))
+
+    metadata = {
+        "model_label": "BASELINE",
+        "entity_code": entity_code,
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "n_train": stats["n_train"],
+        "n_val": stats["n_val"],
+        "n_total": stats["n_train"] + stats["n_val"],
+        "mae": round(stats["mae"], 3),
+        "best_trees": stats["best_trees"],
+        "features": BASELINE_FEATURES,
+        "uses_geo_decay_weights": True,
+        "geo_decay_halflife_days": halflife_days,
+        "backend": "Python xgboost",
+        "hyperparameters": stats["params"],
+    }
+    meta_path = model_dir / "metadata_baseline.json"
+    with open(meta_path, "w") as f:
+        json.dump(metadata, f, indent=2, default=str)
+
+    return {"mae": stats["mae"], "n_samples": stats["n_train"], "best_trees": stats["best_trees"]}
+
+
+def baseline_matrix(entity_df: pd.DataFrame) -> pd.DataFrame:
+    """Rows ready for the baseline features: day_of_week derived, numeric, NaN-free."""
+    df = entity_df.reset_index(drop=True).copy()
+    if "day_of_week" not in df.columns:
+        df["day_of_week"] = pd.to_datetime(df["park_date"]).dt.dayofweek.astype(np.float32)
+    for col in BASELINE_FEATURES:
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+    df["actual_time"] = pd.to_numeric(df["actual_time"], errors="coerce")
+    return df
+
+
+def fit_baseline(
+    entity_df: pd.DataFrame,
+    cfg: PipelineConfig,
+    min_samples: int,
+    as_of: date,
+    halflife_days: int,
+):
+    """Fit the baseline model with geo-decay weights relative to as_of. None if too little data."""
     if len(entity_df) < min_samples:
         return None
-
-    # Compute derived features if requested but not in data
-    if "day_of_week" in BASELINE_FEATURES and "day_of_week" not in entity_df.columns:
-        entity_df["day_of_week"] = pd.to_datetime(entity_df["park_date"]).dt.dayofweek.astype(np.float32)
-
-    # Validate features exist
-    missing = [f for f in BASELINE_FEATURES if f not in entity_df.columns]
-    if missing:
+    if any(f not in entity_df.columns for f in BASELINE_FEATURES if f != "day_of_week"):
         return None
+    entity_df = baseline_matrix(entity_df)
 
-    # Clean numeric columns
-    for col in BASELINE_FEATURES:
-        entity_df[col] = pd.to_numeric(entity_df[col], errors="coerce").fillna(0)
-    entity_df["actual_time"] = pd.to_numeric(entity_df["actual_time"], errors="coerce")
-
-    # Build arrays
     X_all = entity_df[BASELINE_FEATURES].values.astype(np.float32)
     y_all = entity_df["actual_time"].values.astype(np.float32)
 
-    # Filter invalid rows
     valid_mask = ~np.isnan(y_all) & (y_all > 0) & ~np.any(np.isnan(X_all), axis=1)
     if valid_mask.sum() < min_samples:
         return None
 
-    # Apply mask to get clean arrays
     X = X_all[valid_mask]
     y = y_all[valid_mask]
 
-    # Geo-decay weights (using the valid rows from the reset-indexed DataFrame)
-    today = date.today()
     valid_dates = pd.to_datetime(entity_df.loc[valid_mask, "park_date"]).dt.date
-    days_old = np.array([(today - d).days for d in valid_dates], dtype=np.float32)
-    weights = np.float32(0.5) ** (days_old / cfg.geo_decay_halflife_days)
+    days_old = np.array([(as_of - d).days for d in valid_dates], dtype=np.float32)
+    weights = np.float32(0.5) ** (days_old / halflife_days)
 
-    # Synthetic weighting: real actuals get higher weight
     if "is_synthetic" in entity_df.columns:
         is_synth = entity_df.loc[valid_mask, "is_synthetic"].values.astype(bool)
         real_weight = getattr(cfg, "real_actual_weight", 10.0)
         synth_weight = getattr(cfg, "synthetic_weight", 1.0)
         weights = weights * np.where(is_synth, synth_weight, real_weight)
 
-    # Train/val split (85/15)
     n = len(y)
     split = int(n * 0.85)
     if n - split < 10:
@@ -243,38 +284,11 @@ def _train_baseline_model(
         verbose_eval=False,
     )
 
-    # Evaluate
     pred = bst.predict(dval)
     mae = float(np.mean(np.abs(y_val - pred)))
     best_trees = getattr(bst, "best_iteration", cfg.training_rounds)
-
-    # Save model
-    model_dir = cfg.models_dir / entity_code
-    model_dir.mkdir(parents=True, exist_ok=True)
-
-    model_path = model_dir / "model_baseline.json"
-    bst.save_model(str(model_path))
-
-    metadata = {
-        "model_label": "BASELINE",
-        "entity_code": entity_code,
-        "trained_at": datetime.now(timezone.utc).isoformat(),
-        "n_train": split,
-        "n_val": n - split,
-        "n_total": n,
-        "mae": round(mae, 3),
-        "best_trees": best_trees,
-        "features": BASELINE_FEATURES,
-        "uses_geo_decay_weights": True,
-        "geo_decay_halflife_days": cfg.geo_decay_halflife_days,
-        "backend": "Python xgboost",
-        "hyperparameters": params,
-    }
-    meta_path = model_dir / "metadata_baseline.json"
-    with open(meta_path, "w") as f:
-        json.dump(metadata, f, indent=2, default=str)
-
-    return {"mae": mae, "n_samples": split, "best_trees": best_trees}
+    return bst, {"n_train": split, "n_val": n - split, "mae": mae,
+                 "best_trees": best_trees, "params": params}
 
 
 def _scan_entity_counts(parquet_files: list[Path]) -> dict[str, int]:

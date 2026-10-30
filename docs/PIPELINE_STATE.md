@@ -70,7 +70,8 @@ All under **output_base** unless noted.
 | `output_base/` | Root for all pipeline data (see config) |
 | `output_base/logs/` | Pipeline logs (daily pipeline, queue_times_loop, docs_check, etc.) |
 | `output_base/dimension_tables/` | dimentity, dimparkhours, dimdategroupid, dimseason, etc. |
-| `output_base/raw_closures/` | Closure CSVs from S3 (current_wdw_closures.csv, etc.); input for operating calendar |
+| `output_base/raw_closures/` | Closure CSVs from S3 (current_wdw_closures.csv, etc.); refreshed daily by s07a_calendar; input for operating calendar |
+| `output_base/matched_pairs/actuals_training_v2/` | Per-park actuals training data, rebuilt daily by s06b_training_data |
 | `output_base/operating_calendar/` | operating_calendar.parquet (entity_code, park_date, is_operating); used by training, forecast, WTI |
 | `output_base/pipeline_validation/` | validation_report.json, validation_report.txt (post-run checks) |
 | `output_base/fact_tables/clean/` | Cleaned wait time fact CSVs (by date) |

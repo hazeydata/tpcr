@@ -33,6 +33,7 @@ class PipelineConfig:
     shadow: bool = False
     shadow_output_base: Path = field(default=None)
     prod_output_base: Path = field(default=None)  # Preserved for shadow reads
+    write_base: Path = field(default=None)
 
     # === Forecast ===
     # v3.0: 365 days (reduced from 730 to save memory during OOM era)
@@ -50,6 +51,7 @@ class PipelineConfig:
     training_rounds: int = 2000
     training_early_stopping: int = 20
     geo_decay_halflife_days: int = 730
+    geo_decay_halflife_days_per_park: dict = field(default_factory=dict)
     min_training_year: int = 0  # Global default: no cutoff
     min_training_year_per_park: dict = field(default_factory=lambda: {
         # 2014-2015 Disney actual-time API data contamination: high-frequency
@@ -111,6 +113,11 @@ class PipelineConfig:
             park_code, self.min_training_year
         )
 
+    def get_halflife_days(self, park_code: str) -> int:
+        return self.geo_decay_halflife_days_per_park.get(
+            park_code, self.geo_decay_halflife_days
+        )
+
     def get_park_stretch(self, park_code: str) -> float:
         """Get quantile mapping stretch factor for a park."""
         return self.quantile_mapping_per_park_stretch.get(
@@ -121,6 +128,8 @@ class PipelineConfig:
         """Derive paths from output_base.
 
         Shadow mode: read from production, write to shadow dir.
+        Models and forecasts are outputs, so in shadow mode they live under
+        the shadow dir too; production models/forecasts are never written.
         """
         prod_base = self.output_base
         self.prod_output_base = prod_base
@@ -137,11 +146,12 @@ class PipelineConfig:
         self.fact_tables_dir = self.fact_tables_dir or base / "fact_tables"
         self.parquet_dir = self.parquet_dir or base / "fact_tables" / "parquet"
         self.dimension_dir = self.dimension_dir or base / "dimension_tables"
-        self.models_dir = self.models_dir or base / "models"
-        self.forecast_dir = self.forecast_dir or base / "curves" / "forecast_parquet"
 
         # Write paths use shadow in shadow mode
         write_base = shadow_base if self.shadow else base
+        self.write_base = write_base
+        self.models_dir = self.models_dir or write_base / "models"
+        self.forecast_dir = self.forecast_dir or write_base / "curves" / "forecast_parquet"
         self.wti_dir = self.wti_dir or write_base / "wti"
         self.accuracy_dir = self.accuracy_dir or write_base / "accuracy"
         self.logs_dir = self.logs_dir or write_base / "logs"
