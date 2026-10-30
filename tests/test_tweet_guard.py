@@ -254,6 +254,18 @@ class ExpectedProgram(unittest.TestCase):
         rc, _ = self.check(body(PY, f"{C}/operations/scripts/wti_observed_tweet.py", "--dry-run"))
         self.assertEqual(rc, 3)
 
+    def test_extra_absolute_argument_blocks(self):
+        self.assert_unexpected(body(PY, f"{C}/operations/scripts/wti_observed_tweet.py", "/tmp/extra"))
+
+    def test_wrong_python_without_program_line_blocks(self):
+        b = body("/usr/bin/python3", f"{C}/operations/scripts/wti_observed_tweet.py").replace("\tprogram = /usr/bin/python3\n", "")
+        self.assert_unexpected(b)
+
+    def test_n20_relative_program_blocks_even_from_venv_cwd(self):
+        b = GOOD[OBS][0].replace(f"program = {PY}", "program = python")
+        with mock.patch("os.getcwd", return_value=f"{C}/.venv/bin"):
+            self.assert_unexpected(b)
+
     def test_script_only_blocks(self):
         rc, _ = self.check(body(f"{C}/operations/scripts/wti_observed_tweet.py"))
         self.assertEqual(rc, 3)
