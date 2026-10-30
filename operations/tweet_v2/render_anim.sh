@@ -16,7 +16,10 @@ render_one(){ i=$1; t=$(python3 -c "print($i/30)"); f=$F/b/$(printf %04d $i).png
 export -f render_one; export F C V CHROME
 seq 0 $((N-1)) | xargs -P10 -I{} bash -c 'render_one {}' 
 LAST=$F/b/$(printf %04d $((N-1))).png
-[ "$(ls $F/b | wc -l)" = "$N" ] || { echo "missing frames" >&2; exit 1; }
+# Count with arithmetic, not string equality: BSD/macOS wc -l left-pads ("     210"), which never equals "210"
+# and made every Mac Mini render die here with all frames present (rev5 deploy step B1).
+GOT=$(find "$F/b" -name '*.png' -size +0 | wc -l); GOT=$((GOT))
+[ "$GOT" -eq "$N" ] || { echo "missing frames: $GOT of $N in $F/b" >&2; exit 1; }
 mkdir -p "$F/s"; for i in 0 1 2; do cp "$LAST" "$F/s/$(printf %04d $i).png"; done
 for i in $(seq 0 $((N-1))); do cp "$F/b/$(printf %04d $i).png" "$F/s/$(printf %04d $((i+3))).png"; done
 "$FFMPEG" -y -loglevel error -framerate 30 -i "$F/s/%04d.png" -c:v libx264 -pix_fmt yuv420p -profile:v high -crf 16 -r 30 -movflags +faststart "$OUT"
