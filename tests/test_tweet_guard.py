@@ -294,6 +294,8 @@ class ExpectedProgram(unittest.TestCase):
             good = body(*expected)
             self.assertEqual(tg.job_verdict(good, expected, [])[0], "repo")
             self.assertEqual(tg.job_verdict(no_program(good), expected, [])[0], "repo")
+            via_dots = good.replace(f"program = {vb}/python", f"program = {vb}/../bin/python")
+            self.assertEqual(tg.job_verdict(via_dots, expected, [])[0], "repo")
             for prog in (target, Path(os.path.realpath(d)) / "pylink"):
                 with self.subTest(prog=prog):
                     bad = good.replace(f"program = {vb}/python", f"program = {prog}")

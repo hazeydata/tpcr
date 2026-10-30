@@ -114,9 +114,9 @@ def job_programs(body):
     (`program = x`, `program =\tx`, `PROGRAM=x`), and a bare `program` / `program =` gives an empty value."""
     values = []
     for line in body.splitlines():
-        key, eq, value = line.partition("=")
-        if " ".join(key.split()).lower() == "program" or (not eq and line.split()[:1] and line.split()[0].lower() == "program"):
-            values.append(value.strip() if eq else "")
+        key, _, value = line.partition("=")
+        if key.strip().lower() == "program":
+            values.append(value.strip())
     return values
 
 
