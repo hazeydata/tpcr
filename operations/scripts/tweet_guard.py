@@ -4,7 +4,7 @@
 The launchd jobs com.hazeydata.tpcr-tweet-observed and com.hazeydata.tpcr-tweet-predicted run these repo scripts.
 A live post is allowed only when no crontab line runs a repo tweet script and every loaded tweet job runs exactly
 <python> <checkout>/<its script> (one arguments block, absolute paths without ~, resolved; a program line, if any,
-must be that same <python>; checkout, python and scripts from config/tweet_guard.json,
+must be literally that same <python>, read in any case/whitespace; checkout, python and scripts from config/tweet_guard.json,
 checkout overridable by TPCR_TWEET_CHECKOUT, python by TPCR_TWEET_PYTHON). Anything else blocks (exit 3):
 an old wti_*_tweet_local.py, another program, no arguments, or unreadable crontab/launchctl.
 
@@ -110,7 +110,14 @@ def job_arguments(body):
 
 
 def job_programs(body):
-    return [line.strip()[len("program = "):] for line in body.splitlines() if line.strip().startswith("program = ")]
+    """Values of every program line, read fail-closed: the key is matched case-insensitively with any whitespace
+    (`program = x`, `program =\tx`, `PROGRAM=x`), and a bare `program` / `program =` gives an empty value."""
+    values = []
+    for line in body.splitlines():
+        key, eq, value = line.partition("=")
+        if " ".join(key.split()).lower() == "program" or (not eq and line.split()[:1] and line.split()[0].lower() == "program"):
+            values.append(value.strip() if eq else "")
+    return values
 
 
 def _literal_abs(arg):
@@ -131,7 +138,8 @@ def job_verdict(body, expected, local_patterns):
     if not all(_literal_abs(a) for a in args):
         return "unexpected", " ".join(args)
     programs = job_programs(body)
-    if len(programs) > 1 or (programs and (not _literal_abs(programs[0]) or _real(programs[0]) != expected[0])):
+    # launchd execs program, so it must be literally the expected python: not a symlink to it, not its target.
+    if len(programs) > 1 or (programs and programs[0] != expected[0]):
         return "unexpected", "program = " + "; ".join(programs)
     resolved = [_real(args[0])] + [os.path.realpath(a) for a in args[1:]]
     if resolved != expected:

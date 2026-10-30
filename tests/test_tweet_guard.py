@@ -2,6 +2,7 @@ import io
 import os
 import subprocess
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -155,6 +156,10 @@ def body(*args):
     return f"gui/501/x = {{\n\tstate = not running\n\tprogram = {args[0] if args else ''}\n\targuments = {{\n{inner}\t}}\n}}\n"
 
 
+def no_program(b):
+    return "".join(l for l in b.splitlines(True) if not l.strip().startswith("program = "))
+
+
 def text_runner(jobs, crontab="", launchctl="launchctl_loaded.txt"):
     def run(argv):
         if argv[0] == "crontab":
@@ -266,6 +271,45 @@ class ExpectedProgram(unittest.TestCase):
         with mock.patch("os.getcwd", return_value=f"{C}/.venv/bin"):
             self.assert_unexpected(b)
 
+    def test_t5_program_line_read_fail_closed(self):
+        # Kitty t5 P09, P09b, P15, P16: empty value, tab separator, upper case, bare key.
+        good = GOOD[OBS][0]
+        for line in ("program = ", "program =", "program =\t/bin/sh", "program\t=\t/bin/sh", "PROGRAM = /bin/sh",
+                     "Program=/bin/sh", "program", f"PROGRAM = {PY}x"):
+            with self.subTest(line=line):
+                self.assert_unexpected(good.replace(f"program = {PY}", line))
+        self.assertEqual(self.check(good.replace(f"program = {PY}", f"program =\t{PY}"))[0], 0)
+
+    def test_t5_program_compared_literally_not_by_realpath(self):
+        # Kitty t5 P04/P13 (Z12): launchd execs program as written; the venv's target python or another link to it
+        # resolves to the same file but is not the expected python.
+        with tempfile.TemporaryDirectory() as d:
+            vb = Path(os.path.realpath(d)) / "v" / ".venv" / "bin"
+            vb.mkdir(parents=True)
+            target = Path(os.path.realpath(d)) / "python3"
+            target.write_text("")
+            (vb / "python").symlink_to(target)
+            (Path(os.path.realpath(d)) / "pylink").symlink_to(vb / "python")
+            expected = [str(vb / "python"), f"{C}/operations/scripts/wti_observed_tweet.py"]
+            good = body(*expected)
+            self.assertEqual(tg.job_verdict(good, expected, [])[0], "repo")
+            self.assertEqual(tg.job_verdict(no_program(good), expected, [])[0], "repo")
+            for prog in (target, Path(os.path.realpath(d)) / "pylink"):
+                with self.subTest(prog=prog):
+                    bad = good.replace(f"program = {vb}/python", f"program = {prog}")
+                    self.assertEqual(tg.job_verdict(bad, expected, [])[0], "unexpected")
+
+    def test_t5_tilde_inside_absolute_path_blocks(self):
+        # Kitty t5 A01/A01b (Z03): absolute paths whose ~ segment would cancel out under realpath.
+        self.assert_unexpected(no_program(body(PY, f"{C}/operations/scripts/~/../wti_observed_tweet.py")))
+        self.assert_unexpected(no_program(body(f"{C}/.venv/bin/~x/../python", f"{C}/operations/scripts/wti_observed_tweet.py")))
+
+    def test_t5_relative_python_argument_blocks_without_program_line(self):
+        # Kitty t5 N12c/A03b (Z07): argv[0] must be absolute too, even when it resolves from our cwd.
+        for py in ("python", "./python"):
+            with self.subTest(py=py), mock.patch("os.getcwd", return_value=f"{C}/.venv/bin"):
+                self.assert_unexpected(no_program(body(py, f"{C}/operations/scripts/wti_observed_tweet.py")))
+
     def test_script_only_blocks(self):
         rc, _ = self.check(body(f"{C}/operations/scripts/wti_observed_tweet.py"))
         self.assertEqual(rc, 3)
@@ -314,12 +358,16 @@ class ExpectedProgram(unittest.TestCase):
         (real / "operations" / "scripts").mkdir(parents=True)
         (real / ".venv" / "bin").mkdir(parents=True)
         (root / "link").symlink_to(real)
-        jobs = {OBS: (body(f"{root}/link/.venv/bin/python", f"{root}/link/operations/scripts/../scripts/wti_observed_tweet.py"), ""),
-                PRED: (body(f"{real}/.venv/bin/python", f"{real}/operations/scripts/wti_predicted_tweet.py"), "")}
+        # arguments are compared resolved; a program line is compared literally, so these jobs carry none.
+        jobs = {OBS: (no_program(body(f"{root}/link/.venv/bin/python", f"{root}/link/operations/scripts/../scripts/wti_observed_tweet.py")), ""),
+                PRED: (no_program(body(f"{real}/.venv/bin/python", f"{real}/operations/scripts/wti_predicted_tweet.py")), "")}
         with mock.patch.dict(os.environ, {"TPCR_TWEET_CHECKOUT": str(real)}):
             tg.preflight(text_runner(jobs))
         with mock.patch.dict(os.environ, {"TPCR_TWEET_CHECKOUT": str(root / "link")}):
             tg.preflight(text_runner(jobs))
+        linked = dict(jobs, **{OBS: (body(f"{root}/link/.venv/bin/python", f"{real}/operations/scripts/wti_observed_tweet.py"), "")})
+        with mock.patch.dict(os.environ, {"TPCR_TWEET_CHECKOUT": str(real)}):
+            self.assertEqual(reason(text_runner(linked)).reason, "launchd_unexpected_program")
 
     def test_venv_python_symlink_not_followed(self):
         import shutil
