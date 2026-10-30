@@ -60,8 +60,9 @@ Two launchd jobs in `~/Library/LaunchAgents/` run the repo scripts from a separa
   `com.hazeydata.tpcr-tweet-observed`, `.../wti_predicted_tweet.py` for `com.hazeydata.tpcr-tweet-predicted`, and nothing
   else. The `arguments` block must appear exactly once and every argument must be a literal absolute path: launchd does not
   expand `~` and does not resolve relative paths against the guard's cwd, so `~/...`, `python` or
-  `operations/scripts/...` block. The `program` line, if present, must be literally that same `<python>` (launchd execs
-  `program`, not `argv[0]`, so a link to it or its target does not count); any other `program` blocks, read fail-closed:
+  `operations/scripts/...` block. The `program` line, if present, must be that same `<python>`, compared like `argv[0]` (launchd
+  execs `program`, not `argv[0]`; directories are resolved but the file name is not followed, so a link to it or its target
+  does not count); any other `program` blocks, read fail-closed:
   any case, any whitespace, an empty value or a bare `program` key all block. `<checkout>` is `checkout` in the config (`~/tpcr-tweet`) or `TPCR_TWEET_CHECKOUT`; `<python>` is `python` in the
   config (`~/theme-park-crowd-report/.venv/bin/python`) or `TPCR_TWEET_PYTHON` (a relative value is taken inside the checkout).
   Paths are compared resolved: symlinked directories and `..` are resolved, but the python's own name is not followed, so a

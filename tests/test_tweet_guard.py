@@ -280,7 +280,7 @@ class ExpectedProgram(unittest.TestCase):
                 self.assert_unexpected(good.replace(f"program = {PY}", line))
         self.assertEqual(self.check(good.replace(f"program = {PY}", f"program =\t{PY}"))[0], 0)
 
-    def test_t5_program_compared_literally_not_by_realpath(self):
+    def test_t5_program_file_name_not_followed(self):
         # Kitty t5 P04/P13 (Z12): launchd execs program as written; the venv's target python or another link to it
         # resolves to the same file but is not the expected python.
         with tempfile.TemporaryDirectory() as d:
@@ -358,16 +358,17 @@ class ExpectedProgram(unittest.TestCase):
         (real / "operations" / "scripts").mkdir(parents=True)
         (real / ".venv" / "bin").mkdir(parents=True)
         (root / "link").symlink_to(real)
-        # arguments are compared resolved; a program line is compared literally, so these jobs carry none.
         jobs = {OBS: (no_program(body(f"{root}/link/.venv/bin/python", f"{root}/link/operations/scripts/../scripts/wti_observed_tweet.py")), ""),
                 PRED: (no_program(body(f"{real}/.venv/bin/python", f"{real}/operations/scripts/wti_predicted_tweet.py")), "")}
         with mock.patch.dict(os.environ, {"TPCR_TWEET_CHECKOUT": str(real)}):
             tg.preflight(text_runner(jobs))
         with mock.patch.dict(os.environ, {"TPCR_TWEET_CHECKOUT": str(root / "link")}):
             tg.preflight(text_runner(jobs))
-        linked = dict(jobs, **{OBS: (body(f"{root}/link/.venv/bin/python", f"{real}/operations/scripts/wti_observed_tweet.py"), "")})
+        # Kitty t5 P03/P12: a program line through a symlinked dir or ../ names the same python and is allowed.
+        linked = dict(jobs, **{OBS: (body(f"{root}/link/.venv/bin/python", f"{real}/operations/scripts/wti_observed_tweet.py"), ""),
+                               PRED: (body(f"{real}/.venv/../.venv/bin/python", f"{real}/operations/scripts/wti_predicted_tweet.py"), "")})
         with mock.patch.dict(os.environ, {"TPCR_TWEET_CHECKOUT": str(real)}):
-            self.assertEqual(reason(text_runner(linked)).reason, "launchd_unexpected_program")
+            tg.preflight(text_runner(linked))
 
     def test_venv_python_symlink_not_followed(self):
         import shutil
