@@ -1,6 +1,7 @@
 """Step 3: Dimension Tables + Park Hours + Closures.
 
-Loads dimension tables, imputes park hours, builds operating calendar.
+Validates and loads dimension tables and imputes park hours. It does not
+download closures or build the operating calendar: that is s07a_calendar.
 
 During shadow phase: reads from production dimension tables.
 Post-swap: runs dimension fetch scripts.

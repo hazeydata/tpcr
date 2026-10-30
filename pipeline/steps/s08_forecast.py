@@ -14,6 +14,12 @@ Model loading priority (backward compat):
   3. model_julia_actuals.json (legacy)
   4. model_julia_v2.json (legacy)
   5. Fallback ratio (no model)
+
+Calendar features come from dimdategroupid/dimseason encoded with
+state/encoding_mappings.json (refreshed by s06b/s07a; the same mapping the
+training data used). A forecast date whose labels are missing or unmapped is
+left out and counted in the receipt as degraded; it is never encoded as 0.
+The operating calendar and dimentity prefer this run's s07a copies.
 """
 
 from __future__ import annotations
@@ -33,6 +39,8 @@ except ImportError:
     xgb = None
 
 from pipeline.config import PipelineConfig
+from pipeline.core import paths
+from pipeline.core.encodings import load_mappings, lookup
 from pipeline.core.db import read_connection
 from pipeline.core.logging import PipelineLogger
 from pipeline.core.park_codes import PARK_TIMEZONE, entity_to_park
@@ -91,6 +99,13 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
         park_entities.setdefault(park, []).append(entity)
 
     log.info(f"Total entities: {len(entity_list)} across {len(park_entities)} parks")
+
+    unmapped = unmapped_forecast_dates(date_features, start_date, end_date)
+    if unmapped:
+        log.warning(
+            f"{len(unmapped)} forecast dates have no calendar encoding and are skipped "
+            f"(first {unmapped[0]}, last {unmapped[-1]})"
+        )
 
     # Process one park at a time
     output_dir = cfg.forecast_dir
@@ -193,7 +208,23 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
     log.metric("forecast_failed", failed_entities)
     log.info("=" * 60)
 
-    return {"rows": total_predictions, "entities": total_entities, "failed": failed_entities}
+    receipt = {
+        "step": "s08_forecast",
+        "status": "degraded" if unmapped else "ok",
+        "unmapped_dates": len(unmapped),
+        "reason": (
+            f"{len(unmapped)} dates without calendar encoding, {unmapped[0]}..{unmapped[-1]}"
+            if unmapped else None
+        ),
+    }
+    return {"rows": total_predictions, "entities": total_entities, "failed": failed_entities,
+            "receipt": receipt}
+
+
+def unmapped_forecast_dates(date_features: dict, start_date: date, end_date: date) -> list[date]:
+    days = (end_date - start_date).days
+    return [d for d in (start_date + timedelta(days=i) for i in range(days + 1))
+            if d not in date_features]
 
 
 # =========================================================================
@@ -342,27 +373,11 @@ def _forecast_entity_fast(
 # =========================================================================
 
 def _load_date_features(cfg: PipelineConfig, log: PipelineLogger) -> dict:
-    """Load date_group_id, season, season_year encodings."""
+    """Encoded calendar features per date; dates with an unmapped label are omitted."""
     dim_dir = str(cfg.dimension_dir).replace("\\", "/")
-    pairs_path = cfg.output_base / "matched_pairs" / "all_pairs_v2.parquet"
-    pairs_str = str(pairs_path).replace("\\", "/")
+    mappings = load_mappings(paths.encoding_mappings_path(cfg))
 
     with read_connection() as con:
-        dgid_enc = dict(con.execute(f"""
-            SELECT DISTINCT date_group_id, date_group_id_encoded
-            FROM read_parquet('{pairs_str}')
-        """).fetchdf().values)
-
-        season_enc = dict(con.execute(f"""
-            SELECT DISTINCT season, season_encoded
-            FROM read_parquet('{pairs_str}')
-        """).fetchdf().values)
-
-        sy_enc = dict(con.execute(f"""
-            SELECT DISTINCT season_year, season_year_encoded
-            FROM read_parquet('{pairs_str}')
-        """).fetchdf().values)
-
         df = con.execute(f"""
             SELECT CAST(d.park_date AS DATE) as park_date,
                    d.date_group_id, s.season, s.season_year
@@ -371,19 +386,27 @@ def _load_date_features(cfg: PipelineConfig, log: PipelineLogger) -> dict:
                 ON d.park_date = s.park_date
         """).fetchdf()
 
-    features = {}
-    for _, row in df.iterrows():
-        park_date = pd.Timestamp(row["park_date"]).date()
-        features[park_date] = {
-            "date_group_id": row["date_group_id"],
-            "date_group_id_encoded": dgid_enc.get(row["date_group_id"], 0),
-            "season": row["season"],
-            "season_encoded": season_enc.get(row["season"], 0),
-            "season_year": row["season_year"],
-            "season_year_encoded": sy_enc.get(row["season_year"], 0),
-        }
+    features = encode_date_features(df, mappings)
+    log.info(f"Date features loaded: {len(features)} of {len(df)} dates encoded")
+    return features
 
-    log.info(f"Date features loaded: {len(features)} dates")
+
+def encode_date_features(df: pd.DataFrame, mappings: dict) -> dict:
+    features = {}
+    for row in df.itertuples(index=False):
+        codes = {
+            "date_group_id_encoded": lookup(mappings["date_group_id"], row.date_group_id),
+            "season_encoded": lookup(mappings["season"], row.season),
+            "season_year_encoded": lookup(mappings["season_year"], row.season_year),
+        }
+        if any(v is None for v in codes.values()):
+            continue
+        features[pd.Timestamp(row.park_date).date()] = {
+            "date_group_id": row.date_group_id,
+            "season": row.season,
+            "season_year": row.season_year,
+            **codes,
+        }
     return features
 
 
@@ -469,7 +492,7 @@ def _load_aggregates_indexed(cfg: PipelineConfig, log: PipelineLogger) -> dict:
 def _load_entity_list(cfg: PipelineConfig, log: PipelineLogger) -> list[str]:
     """Load list of forecastable entities."""
     parquet_str = str(cfg.parquet_dir).replace("\\", "/")
-    dim_str = str(cfg.dimension_dir / "dimentity.csv").replace("\\", "/")
+    dim_str = str(paths.dimentity_path(cfg)).replace("\\", "/")
 
     with read_connection() as con:
         entities = con.execute(f"""
@@ -501,7 +524,7 @@ def _load_operating_calendar_indexed(cfg: PipelineConfig, log: PipelineLogger) -
     Returns dict[entity_code_upper] → set(dates) or None if no OC.
     O(1) lookup per entity instead of scanning 9.3M tuples.
     """
-    oc_path = cfg.output_base / "operating_calendar" / "operating_calendar.parquet"
+    oc_path = paths.operating_calendar_path(cfg)
     if not oc_path.exists():
         log.info("No operating calendar — assuming all entities operating")
         return None
@@ -553,7 +576,10 @@ def _generate_park_time_grid(
     rows = []
     current = start_date
     while current <= end_date:
-        feat = date_features.get(current, {})
+        feat = date_features.get(current)
+        if feat is None:
+            current += timedelta(days=1)
+            continue
         hours_key = (park_code, current)
         hours_tuple = park_hours.get(hours_key)
         day_open = hours_tuple[0] if hours_tuple and hours_tuple[0] is not None else DEFAULT_OPEN
@@ -570,10 +596,10 @@ def _generate_park_time_grid(
                 "time_slot_15min": t.hour * 4 + t.minute // 15,
                 "hour_of_day": t.hour,
                 "mins_since_6am": max(0, (t.hour - 6) * 60 + t.minute),
-                "date_group_id": feat.get("date_group_id", "UNKNOWN"),
-                "date_group_id_encoded": feat.get("date_group_id_encoded", 0),
-                "season_encoded": feat.get("season_encoded", 0),
-                "season_year_encoded": feat.get("season_year_encoded", 0),
+                "date_group_id": feat["date_group_id"],
+                "date_group_id_encoded": feat["date_group_id_encoded"],
+                "season_encoded": feat["season_encoded"],
+                "season_year_encoded": feat["season_year_encoded"],
             })
 
         current += timedelta(days=1)

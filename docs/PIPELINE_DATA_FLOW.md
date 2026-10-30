@@ -219,6 +219,16 @@ The ML models use `date_group_id`, `season`, and `season_year` as features. A mo
 <a name="step-2a-closures-module"></a>
 ## Step 2a: Closures Module
 
+> **V4 pipeline (TPCR-BIAS-001):** these scripts now run daily inside
+> `pipeline/steps/s07a_calendar.py`, after s07 and before s08. Each script writes
+> into a staging dir under the write base; output is validated and promoted with an
+> atomic replace. Any failure marks the step `degraded` in
+> `logs/receipt_s07a_calendar_{date}.json` and keeps the previous files. The same
+> step extends `state/encoding_mappings.json` with any new `season`,
+> `season_year` or `date_group_id` labels from `dimseason.csv` /
+> `dimdategroupid.csv` (append-only, new codes = max+1 in sorted order). s03 does
+> not build the calendar. In shadow mode nothing is written under the production base.
+
 **Scripts:** `src/get_closures_from_s3.py` + `src/build_operating_calendar.py`  
 **Time:** ~9 seconds (incremental)  
 **What it does:** Determines which rides are open on which days.
@@ -976,7 +986,9 @@ Fred reviewed all open questions. Resolved decisions:
 | Pipeline output base | `/home/wilma/hazeydata/pipeline/` (aliased as `{output_base}`) |
 | Fact tables (fast) | `{output_base}/fact_tables/parquet/*.parquet` |
 | Matched pairs | `{output_base}/matched_pairs/all_pairs_v2.parquet` |
-| Actuals training data | `{output_base}/matched_pairs/actuals_training_v2.parquet` (ACTUALS-FIRST) |
+| Actuals training data | `{write_base}/matched_pairs/actuals_training_v2/{park}.parquet` (built daily by s06b; legacy combined `actuals_training_v2.parquet` still written) |
+| Encoding mappings | `{write_base}/state/encoding_mappings.json` (training and s08 both read this; unknown labels never encode as 0) |
+| Step receipts | `{write_base}/logs/receipt_{step}_{date}.json` (s06b, s07a) |
 | Models | `{output_base}/models/{entity}/model_julia_v2.json` or `model_julia_actuals.json` |
 | Forecasts | `{output_base}/curves/forecast_parquet/all_forecasts.parquet` |
 | WTI | `{output_base}/wti/wti.parquet` |
