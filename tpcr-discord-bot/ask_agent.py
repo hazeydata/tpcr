@@ -1,20 +1,30 @@
-import os
 """
 Ask Agent — AI-powered natural language query engine for TPCR Discord bot.
 
-Uses Anthropic Claude with DuckDB tool access to answer
+Uses a local OpenAI-compatible Qwen server (mlx_lm) with DuckDB tool access to answer
 theme park wait time questions from Discord users.
 """
 
 import asyncio
 import json
+import logging
+import os
+import re
 import duckdb
-import anthropic
+import httpx
 from datetime import datetime, date
 from pathlib import Path
 from typing import Optional
 
-DUCKDB_PATH = os.path.expanduser("~/hazeydata/pipeline") + "/tpcr_live.duckdb"
+# Host paths. The defaults are the original (Linux) host values; other hosts
+# override them with env vars, normally set in ~/.env, which bot.py loads with
+# python-dotenv. bot.py imports this module *before* it calls load_dotenv, so the
+# env vars are read at call time (see _duckdb_path/_usage_file/_question_log),
+# never at import time.
+DATA_ROOT_ENV = "TPCR_DATA_ROOT"
+DUCKDB_PATH_ENV = "TPCR_DUCKDB_PATH"
+USAGE_FILE_ENV = "TPCR_ASK_USAGE_FILE"
+QUESTION_LOG_ENV = "TPCR_ASK_QUESTION_LOG"
 
 # Failure patterns that trigger immediate self-healing
 _FAILURE_PATTERNS = [
@@ -80,7 +90,7 @@ def _trigger_self_heal(question: str, user_id: str, username: str, answer: str):
 SCHEMA_CONTEXT = """You are a theme park data analyst for the Theme Park Crowd Report (TPCR).
 You answer questions about theme park crowds, wait times, and visit planning using real forecast data.
 
-## Database: DuckDB at /Users/fredhazelton/hazeydata/pipeline/tpcr_live.duckdb (READ-ONLY)
+## Database: DuckDB at {duckdb_path} (READ-ONLY)
 
 ### Tables
 
@@ -118,27 +128,17 @@ You answer questions about theme park crowds, wait times, and visit planning usi
 
 ### Parquet Fallback (use when DuckDB tables return no data)
 
-CRITICAL: If a query against a DuckDB table returns no results, ALWAYS retry using the
-corresponding parquet file with read_parquet(). The parquet files often contain a fuller
+If a query against a DuckDB table returns no results, retry with the corresponding parquet
+file using read_parquet() at most once per question. The parquet files often contain a fuller
 date range (365+ days of forecasts) than the DuckDB tables.
 
-- WTI: `SELECT * FROM read_parquet('/Users/fredhazelton/hazeydata/pipeline/wti/wti.parquet') WHERE park_code = 'EP' AND park_date = '2026-10-01'`
-- Forecasts: `SELECT * FROM read_parquet('/Users/fredhazelton/hazeydata/pipeline/curves/forecast_parquet/all_forecasts.parquet') WHERE entity_code LIKE 'EP%' AND park_date = '2026-10-01'`
-- Fact tables (historical waits): `SELECT * FROM read_parquet('/Users/fredhazelton/hazeydata/pipeline/fact_tables/parquet/*.parquet') WHERE entity_code = 'MK01'`
+- WTI: `SELECT * FROM read_parquet('{data_root}/wti/wti.parquet') WHERE park_code = 'EP' AND park_date = '2026-10-01'`
+- Forecasts: `SELECT * FROM read_parquet('{data_root}/curves/forecast_parquet/all_forecasts.parquet') WHERE entity_code LIKE 'EP%' AND park_date = '2026-10-01'`
+- Fact tables (historical waits): `SELECT round(avg(wait_time_minutes),1) FROM read_parquet('{data_root}/fact_tables/parquet/*.parquet') WHERE entity_code = 'MK141' AND wait_time_type = 'POSTED' AND park_date = '2026-10-17'`
 
-Always try the DuckDB table first (faster), then fall back to parquet if no results.
+Fact-table parquet schema: park_date is VARCHAR and may contain 'NaT'; compare it as a string (park_date = '2026-10-17') or TRY_CAST(park_date AS DATE) and exclude park_date = 'NaT'. observed_at is VARCHAR; prefer observed_at_ts (TIMESTAMPTZ).
 
-### Parquet Fallback (use when DuckDB tables return no data)
-
-CRITICAL: If a query against a DuckDB table returns no results, ALWAYS retry using the
-corresponding parquet file with read_parquet(). The parquet files often contain a fuller
-date range (365+ days of forecasts) than the DuckDB tables.
-
-- WTI: `SELECT * FROM read_parquet('/Users/fredhazelton/hazeydata/pipeline/wti/wti.parquet') WHERE park_code = 'EP' AND park_date = '2026-10-01'`
-- Forecasts: `SELECT * FROM read_parquet('/Users/fredhazelton/hazeydata/pipeline/curves/forecast_parquet/all_forecasts.parquet') WHERE entity_code LIKE 'EP%' AND park_date = '2026-10-01'`
-- Fact tables (historical waits): `SELECT * FROM read_parquet('/Users/fredhazelton/hazeydata/pipeline/fact_tables/parquet/*.parquet') WHERE entity_code = 'MK01'`
-
-Always try the DuckDB table first (faster), then fall back to parquet if no results.
+Always try the DuckDB table first (faster), then fall back to parquet once if no results.
 
 ## Park Code Reference
 - MK = Magic Kingdom (Walt Disney World)
@@ -168,6 +168,10 @@ NOTE: "Universal Orlando" or "Universal Orlando Resort" means ALL THREE parks: U
 ## Guidelines
 - Today's date is {today} ({today_dow}).
 - CRITICAL: When displaying dates, ALWAYS use dayname() or strftime(park_date, '%A') in your SQL to get the correct day-of-week name from the database. NEVER guess day names — LLMs frequently get them wrong for future dates.
+- "Posted" wait means wait_time_type = 'POSTED' (uppercase; 'ACTUAL' is user-reported). Only the entities table uses lowercase values; compare entities.wait_time_type with LOWER().
+- If a query for the asked date returns no rows (after at most one parquet retry), run SELECT min(park_date), max(park_date) on that table and answer plainly that there is no data for that date, giving the available date range. Do not give up silently.
+- Match attractions with entity_name ILIKE '%...%' rather than equality.
+- Resolve relative dates like "last Saturday" relative to {today} ({today_dow}) and use the explicit date in queries.
 - Use the `run_query` tool to query the database. Always use read-only queries (SELECT only).
 - When comparing dates, show WTI values and explain what they mean.
 - For "best day to visit" questions, query WTI and sort by lowest.
@@ -219,22 +223,84 @@ NOTE: "Universal Orlando" or "Universal Orlando Resort" means ALL THREE parks: U
 """
 
 # Usage tracking (simple JSON file)
-USAGE_FILE = Path(__file__).resolve().parent / "ask_usage.json"
-QUESTION_LOG = Path(__file__).resolve().parent / "ask_questions.jsonl"
+_BOT_DIR = Path(__file__).resolve().parent
+USAGE_FILE = _BOT_DIR / "ask_usage.json"
+QUESTION_LOG = _BOT_DIR / "ask_questions.jsonl"
+
+
+def _env_path(var: str, default):
+    value = os.environ.get(var, "").strip()
+    return os.path.expanduser(value) if value else default
+
+
+def data_path(*parts: str) -> str:
+    """Path under TPCR_DATA_ROOT; no parts gives the root itself."""
+    root = _env_path(DATA_ROOT_ENV, "")
+    if not root:
+        raise RuntimeError(f"{DATA_ROOT_ENV} is not set; set it to the pipeline root (e.g. ~/hazeydata/pipeline on the Mini)")
+    return os.path.join(str(root), *parts)
+
+
+ASK_PROVIDERS = ("anthropic", "qwen")
+
+
+def ask_provider() -> str:
+    """TPCR_ASK_PROVIDER (default anthropic); any other value raises."""
+    provider = os.getenv("TPCR_ASK_PROVIDER", "anthropic").strip().lower() or "anthropic"
+    if provider not in ASK_PROVIDERS:
+        raise RuntimeError(
+            f"TPCR_ASK_PROVIDER={provider!r} is invalid; allowed values: {' or '.join(ASK_PROVIDERS)}"
+        )
+    return provider
+
+
+def validate_config() -> None:
+    """Startup check: fail loudly on a bad provider or a missing data root."""
+    ask_provider()
+    root = data_path()
+    if not os.path.isdir(root):
+        raise RuntimeError(f"{DATA_ROOT_ENV}={root} does not exist or is not a directory")
+
+
+def _duckdb_path() -> str:
+    return str(_env_path(DUCKDB_PATH_ENV, "") or data_path("tpcr_live.duckdb"))
+
+
+def _usage_file() -> Path:
+    return Path(_env_path(USAGE_FILE_ENV, USAGE_FILE))
+
+
+def _question_log() -> Path:
+    return Path(_env_path(QUESTION_LOG_ENV, QUESTION_LOG))
 
 
 def _load_usage() -> dict:
-    if USAGE_FILE.exists():
-        return json.loads(USAGE_FILE.read_text())
+    path = _usage_file()
+    if path.exists():
+        return json.loads(path.read_text())
     return {}
 
 
 def _save_usage(data: dict):
-    USAGE_FILE.write_text(json.dumps(data, indent=2))
+    path = _usage_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2))
 
 
 def track_usage(user_id: str) -> tuple[int, int]:
-    """Track usage and return (used_this_month, limit). Returns (-1, -1) if no limit."""
+    """Track usage and return (used_this_month, limit). Returns (-1, -1) if no limit.
+
+    Never raises: a usage-file problem is logged and must not break /ask.
+    """
+    try:
+        return _track_usage(user_id)
+    except Exception as e:
+        logger.error("ask usage tracking failed (%s=%s): %s",
+                     USAGE_FILE_ENV, _usage_file(), type(e).__name__)
+        return 0, -1
+
+
+def _track_usage(user_id: str) -> tuple[int, int]:
     data = _load_usage()
     month_key = date.today().strftime("%Y-%m")
 
@@ -249,8 +315,19 @@ def track_usage(user_id: str) -> tuple[int, int]:
     return count, -1  # No limit for now (free launch)
 
 
-def log_question(user_id: str, username: str, question: str, answer: str, duration_ms: int, model: str = "claude-sonnet-4-6"):
-    """Append question + answer to JSONL log for analysis."""
+def log_question(user_id: str, username: str, question: str, answer: str, duration_ms: int, model: str | None = None):
+    """Append question + answer to JSONL log for analysis.
+
+    Never raises: a question-log problem is logged and must not break /ask.
+    """
+    try:
+        _log_question(user_id, username, question, answer, duration_ms, model)
+    except Exception as e:
+        logger.error("ask question log failed (%s=%s): %s",
+                     QUESTION_LOG_ENV, _question_log(), type(e).__name__)
+
+
+def _log_question(user_id: str, username: str, question: str, answer: str, duration_ms: int, model: str | None = None):
     entry = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
         "user_id": str(user_id),
@@ -258,9 +335,11 @@ def log_question(user_id: str, username: str, question: str, answer: str, durati
         "question": question,
         "answer": answer[:2000],
         "duration_ms": duration_ms,
-        "model": model,
+        "model": model or _qwen_config()[1],
     }
-    with open(QUESTION_LOG, "a") as f:
+    path = _question_log()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as f:
         f.write(json.dumps(entry) + "\n")
 
 
@@ -275,13 +354,13 @@ def run_duckdb_query(sql: str, max_retries: int = 8) -> str:
     for attempt in range(max_retries):
         con = None
         try:
-            con = duckdb.connect(DUCKDB_PATH, read_only=True)
+            con = duckdb.connect(_duckdb_path(), read_only=True)
             result = con.execute(sql).fetchall()
             columns = [desc[0] for desc in con.description]
             con.close()
 
             if not result:
-                return "No results found."
+                return NO_RESULTS_MSG
 
             # Format as readable text (not full table — keep it compact)
             lines = [" | ".join(columns)]
@@ -309,162 +388,475 @@ def run_duckdb_query(sql: str, max_retries: int = 8) -> str:
                 # Even for non-lock errors, retry once with a brief pause
                 time.sleep(1)
                 continue
-            return "I hit a temporary glitch querying the data — please try your question again in a moment. If it keeps happening, let us know in #feedback!"
+            logger.warning("run_query failed after %d attempts: %s",
+                           attempt + 1, type(e).__name__)
+            return QUERY_GLITCH_MSG
 
-    return "Our database is momentarily busy — try your question again in a minute! The data refreshes constantly and things should clear up quickly. 🎢"
+    return QUERY_BUSY_MSG
 
 
-async def ask_agent(question: str, user_id: str, api_key: str, username: str = "unknown") -> str:
+NO_RESULTS_MSG = "No results found."
+
+
+def date_range_sql() -> str:
+    parquet = data_path("fact_tables", "parquet", "*.parquet")
+    return (
+        "SELECT min(d) AS min_date, max(d) AS max_date FROM ("
+        "SELECT park_date AS d FROM live_waits UNION ALL "
+        f"SELECT TRY_CAST(park_date AS DATE) FROM read_parquet('{parquet}') "
+        "WHERE park_date <> 'NaT')"
+    )
+
+
+QUERY_GLITCH_MSG = "I hit a temporary glitch querying the data — please try your question again in a moment. If it keeps happening, let us know in #feedback!"
+QUERY_BUSY_MSG = "Our database is momentarily busy — try your question again in a minute! The data refreshes constantly and things should clear up quickly. 🎢"
+
+
+def tool_result_status(result: str) -> str:
+    """Classify a run_query tool result as 'ok' or 'error' for logging."""
+    if result in (QUERY_GLITCH_MSG, QUERY_BUSY_MSG) or result.startswith("Error:"):
+        return "error"
+    return "ok"
+
+
+logger = logging.getLogger("tpcr-bot")
+
+# Defaults only. The live values come from the environment at call time via
+# _qwen_config(), so a load_dotenv() that runs after this module is imported
+# (as bot.py used to do) still takes effect.
+QWEN_BASE_URL = "http://localhost:8080"
+QWEN_MODEL = "Qwen3.8-27B-8bit"
+QWEN_TIMEOUT = 300.0
+
+
+def _qwen_config() -> tuple[str, str, float]:
+    """(base_url, model, timeout) from QWEN_BASE_URL/QWEN_MODEL/QWEN_TIMEOUT, read each call."""
+    base_url = os.getenv("QWEN_BASE_URL", QWEN_BASE_URL)
+    model = os.getenv("QWEN_MODEL", QWEN_MODEL)
+    timeout = float(os.getenv("QWEN_TIMEOUT", str(QWEN_TIMEOUT)))
+    return base_url, model, timeout
+
+CONTEXT_LIMIT = 32768  # server context window (tokens)
+MAX_TOKENS = 700  # default completion budget (TPCR_QWEN_MAX_TOKENS)
+TEMPERATURE = 0.2  # default (TPCR_QWEN_TEMPERATURE)
+_TOOL_CALL_RE = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+
+
+def _qwen_params() -> tuple[int, float, bool]:
+    """(max_tokens, temperature, thinking) from env, read at call time."""
+    def num(var, cast, default):
+        raw = os.getenv(var, "").strip()
+        try:
+            return cast(raw) if raw else default
+        except ValueError:
+            logger.warning("invalid %s=%r; using default %s", var, raw, default)
+            return default
+
+    max_tokens = num("TPCR_QWEN_MAX_TOKENS", int, MAX_TOKENS)
+    temperature = num("TPCR_QWEN_TEMPERATURE", float, TEMPERATURE)
+    thinking = os.getenv("TPCR_QWEN_THINKING", "").strip().lower() in ("1", "true", "yes", "on")
+    return max_tokens, temperature, thinking
+
+
+def parse_text_tool_calls(content: str) -> list[dict]:
+    """<tool_call>{"name":..,"arguments":{..}}</tool_call> blocks in text; malformed blocks are skipped."""
+    calls = []
+    for i, blk in enumerate(_TOOL_CALL_RE.findall(content or "")):
+        try:
+            j = json.loads(blk)
+            calls.append({"id": f"text{i}", "type": "function",
+                          "function": {"name": j["name"], "arguments": json.dumps(j["arguments"])}})
+        except Exception:  # any malformed block (incl. RecursionError) is skipped
+            pass
+    return calls
+_CHARS_PER_TOKEN = 3  # conservative: real text averages ~4
+_MSG_OVERHEAD = 8  # per-message role/format tokens
+_TOOLS_RESERVE = 200  # tool schema is sent with every request
+_TRUNC_NOTE = "\n...[truncated]"
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "run_query",
+            "description": "Execute a read-only SQL query against the TPCR DuckDB database. Use SELECT statements only. Returns results as formatted text.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "sql": {"type": "string", "description": "SQL SELECT query to execute"}
+                },
+                "required": ["sql"],
+            },
+        },
+    }
+]
+
+
+class QwenHTTPError(Exception):
+    """Non-2xx response from the Qwen server."""
+
+    def __init__(self, status: int, body: str = ""):
+        super().__init__(f"HTTP {status}: {body[:300]}")
+        self.status = status
+        self.body = body
+
+
+def estimate_tokens(text: str) -> int:
+    """Conservative token estimate (len/3 chars per token, rounded up)."""
+    return -(-len(text or "") // _CHARS_PER_TOKEN)
+
+
+def _msg_text(msg: dict) -> str:
+    text = msg.get("content") or ""
+    if msg.get("tool_calls"):
+        text += json.dumps(msg["tool_calls"])
+    return text
+
+
+def estimate_messages_tokens(messages: list[dict]) -> int:
+    return sum(estimate_tokens(_msg_text(m)) + _MSG_OVERHEAD for m in messages)
+
+
+def _truncate(text: str, max_tokens: int) -> str:
+    max_chars = max(0, max_tokens * _CHARS_PER_TOKEN - len(_TRUNC_NOTE))
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars] + _TRUNC_NOTE
+
+
+def trim_messages(
+    messages: list[dict],
+    max_tokens: int = MAX_TOKENS,
+    limit: int = CONTEXT_LIMIT,
+    with_tools: bool = True,
+) -> list[dict]:
+    """Return a copy of messages that fits in limit once max_tokens is reserved.
+
+    messages[0] is the system prompt; the latest user message is always kept.
+    Oldest history/tool messages are dropped first, then the biggest remaining
+    pieces (tool results, then the system prompt) are truncated.
+    """
+    budget = limit - max_tokens - (_TOOLS_RESERVE if with_tools else 0)
+    msgs = [dict(m) for m in messages]
+    if estimate_messages_tokens(msgs) <= budget:
+        return msgs
+
+    def total() -> int:
+        return estimate_messages_tokens(msgs)
+
+    last_user = max((i for i, m in enumerate(msgs) if m.get("role") == "user"), default=None)
+    keep = {i for i in (0 if msgs[0].get("role") == "system" else None, last_user) if i is not None}
+    keep_ids = {id(msgs[i]) for i in keep}
+
+    # Drop oldest history/tool messages first (an assistant tool_calls message
+    # goes together with its tool results so no orphans are left behind)
+    k = 0
+    while total() > budget and k < len(msgs):
+        if id(msgs[k]) in keep_ids:
+            k += 1
+            continue
+        end = k + 1
+        if msgs[k].get("tool_calls"):
+            while end < len(msgs) and msgs[end].get("role") == "tool" and id(msgs[end]) not in keep_ids:
+                end += 1
+        del msgs[k:end]
+    while msgs and msgs[0].get("role") == "tool":  # orphaned tool result
+        msgs.pop(0)
+
+    # Still too big: truncate tool results, then the user prompt, then the system prompt
+    def shrink(m: dict):
+        over = total() - budget
+        if over > 0:
+            content = m.get("content") or ""
+            m["content"] = _truncate(content, max(50, estimate_tokens(content) - over))
+
+    for m in msgs:
+        if m.get("role") == "tool":
+            shrink(m)
+    for role in ("user", "system"):
+        for m in reversed(msgs):
+            if m.get("role") == role:
+                shrink(m)
+                break
+    return msgs
+
+
+_THINK_TAG_RE = re.compile(r"<(/?)think\s*>", re.IGNORECASE)
+
+
+def strip_think_for_tools(text: str) -> str:
+    """Remove <think>...</think> blocks, nested or not, case-insensitively.
+
+    Tags are matched by depth, so a nested block is removed as a whole. An
+    unmatched opening tag hides everything to the end of the text. A stray
+    closing tag at depth 0 means the previous block was nested deeper than it
+    looked, so that block is extended to the stray tag (with no previous
+    block, everything before it is treated as thinking).
+    """
+    text = text or ""
+    out: list[str] = []
+    depth, pos, last_block_at = 0, 0, 0
+    for m in _THINK_TAG_RE.finditer(text):
+        closing = bool(m.group(1))
+        if depth == 0:
+            out.append(text[pos:m.start()])
+            if closing:  # stray close: extend the previous block to here
+                del out[last_block_at:]
+            else:
+                last_block_at = len(out)
+        if closing:
+            depth = max(depth - 1, 0)
+        else:
+            depth += 1
+        pos = m.end()
+    if depth == 0:
+        out.append(text[pos:])
+    return "".join(out).strip()
+
+
+def strip_think(text: str) -> str:
+    """User-visible answer: drop balanced <think>...</think> blocks only.
+
+    Case-insensitive and nesting-aware. A stray closing tag is ignored and
+    the text around it kept (AC26), so "The answer is 42 minutes.</think>"
+    stays visible. An unmatched opening tag strips to the end (AC11). Leftover
+    <tool_call>...</tool_call> markup (never executed from inside a think
+    region, see strip_think_for_tools) is removed from the reply too.
+
+    Nesting:
+    - Nested balanced blocks are removed whole (outermost pair):
+      "x<think>a<think>b</think>c</think>y" -> "xy".
+    - With an unclosed outer block, "<think>a<think>b</think>c" strips from
+      the outer tag to the end: the inner close only ends the inner block.
+    - Extra stray closes are dropped and the surrounding text kept:
+      "a</think>b</think>c" -> "abc".
+    """
+    text = text or ""
+    out: list[str] = []
+    stack: list[int] = []
+    pos = 0
+    for m in _THINK_TAG_RE.finditer(text):
+        out.append(text[pos:m.start()])
+        pos = m.end()
+        if m.group(1):
+            if stack:
+                del out[stack.pop():]
+            # stray close: tag dropped, text kept
+        else:
+            stack.append(len(out))
+    if stack:  # unmatched <think>: strip to the end (AC11)
+        del out[stack[0]:]
+    else:
+        out.append(text[pos:])
+    visible = "".join(out)
+    visible = _TOOL_CALL_RE.sub("", visible)
+    visible = re.sub(r"</?tool_call>", "", visible)
+    return visible.strip()
+
+
+async def _post_chat(payload: dict) -> dict:
+    """POST to the OpenAI-compatible chat completions endpoint."""
+    base_url, _model, timeout = _qwen_config()
+    url = f"{base_url.rstrip('/')}/v1/chat/completions"
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(url, json=payload)
+    if resp.status_code >= 400:
+        raise QwenHTTPError(resp.status_code, resp.text)
+    return resp.json()
+
+
+async def _chat(messages: list[dict], use_tools: bool) -> dict:
+    max_tokens, temperature, thinking = _qwen_params()
+    payload = {
+        "model": _qwen_config()[1],
+        "messages": trim_messages(messages, max_tokens, CONTEXT_LIMIT, with_tools=use_tools),
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "chat_template_kwargs": {"enable_thinking": thinking},
+    }
+    if use_tools:
+        payload["tools"] = TOOLS
+    return await _post_chat(payload)
+
+
+CLAUDE_MODEL = "claude-sonnet-4-6"
+CLAUDE_TOOLS = [
+    {
+        "name": "run_query",
+        "description": TOOLS[0]["function"]["description"],
+        "input_schema": TOOLS[0]["function"]["parameters"],
+    }
+]
+
+
+async def _claude_loop(api_key: str, system_prompt: str, question: str) -> str | None:
+    import anthropic
+
+    client = anthropic.AsyncAnthropic(api_key=api_key, timeout=60.0, max_retries=1)
+    messages = [{"role": "user", "content": question}]
+    for round_num in range(1, 6):
+        resp = await client.messages.create(
+            model=CLAUDE_MODEL, max_tokens=1500, system=system_prompt, messages=messages, tools=CLAUDE_TOOLS,
+        )
+        tool_uses = [b for b in resp.content if b.type == "tool_use"]
+        if not tool_uses:
+            return "".join(b.text for b in resp.content if b.type == "text").strip(), round_num
+
+        messages.append({"role": "assistant", "content": resp.content})
+        results = []
+        for block in tool_uses:
+            sql = (block.input or {}).get("sql", "")
+            logger.info("ask claude round=%d sql=%s", round_num, sql)
+            sql_upper = sql.strip().upper()
+            if not sql_upper.startswith("SELECT") and not sql_upper.startswith("WITH"):
+                result = "Error: Only SELECT queries are allowed."
+            else:
+                result = await asyncio.to_thread(run_duckdb_query, sql)
+            results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
+        messages.append({"role": "user", "content": results})
+    return None, 5
+
+
+async def ask_agent(question: str, user_id: str, api_key: str | None = None, username: str = "unknown") -> str:
     """
     Process a natural language question about theme park data.
-    Uses Claude with async DuckDB tool access.
+    Uses a local Qwen server (OpenAI-compatible) with async DuckDB tool access.
 
-    All blocking work (Anthropic API, DuckDB queries, file I/O) is run
-    off the event loop so the Discord heartbeat is never starved.
+    With TPCR_ASK_PROVIDER=anthropic (default) and an api_key, Claude answers and
+    Qwen is the fallback; TPCR_ASK_PROVIDER=qwen uses Qwen only.
+    All blocking work (DuckDB queries, file I/O) is run off the event loop so
+    the Discord heartbeat is never starved.
     """
     await asyncio.to_thread(track_usage, user_id)
 
     import time as _time
     _start = _time.monotonic()
 
-    client = anthropic.AsyncAnthropic(api_key=api_key, timeout=60.0, max_retries=1)
-
     today = date.today()
-    system_prompt = SCHEMA_CONTEXT.format(today=today.isoformat(), today_dow=today.strftime("%A"))
+    system_prompt = SCHEMA_CONTEXT.format(today=today.isoformat(), today_dow=today.strftime("%A"),
+                                          duckdb_path=_duckdb_path(), data_root=data_path())
 
-    tools = [
-        {
-            "name": "run_query",
-            "description": "Execute a read-only SQL query against the TPCR DuckDB database. Use SELECT statements only. Returns results as formatted text.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "sql": {
-                        "type": "string",
-                        "description": "SQL SELECT query to execute"
-                    }
-                },
-                "required": ["sql"]
-            }
-        }
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": question},
     ]
+    use_tools = True
+    query_results = []
 
-    messages = [{"role": "user", "content": question}]
-
-    model_used = "claude-sonnet-4-6"
-    try:
-        answer = await _claude_loop(client, system_prompt, tools, messages)
-    except (anthropic.APIError, anthropic.APIConnectionError, anthropic.APITimeoutError, asyncio.TimeoutError) as e:
-        print(f"⚠️ /ask: Anthropic failed ({type(e).__name__}: {str(e)[:160]}) — falling back to Qwen")
-        model_used = QWEN_LABEL
-        try:
-            answer = await asyncio.to_thread(_qwen_loop, system_prompt, question)
-        except Exception as qe:
-            print(f"❌ /ask: Qwen fallback failed too: {qe}")
-            answer = None
-
-    if answer is not None:
+    async def finish(answer: str, rounds: int, model: str | None = None) -> str:
         if len(answer) > 1900:
             answer = answer[:1900] + "..."
+
         duration_ms = int((_time.monotonic() - _start) * 1000)
-        print(f"✅ /ask answered by {model_used} in {duration_ms} ms")
-        await asyncio.to_thread(log_question, user_id, username, question, answer, duration_ms, model_used)
+        logger.info("/ask answered by %s after %d rounds in %d ms", model or _qwen_config()[1], rounds, duration_ms)
+        await asyncio.to_thread(log_question, user_id, username, question, answer, duration_ms, model)
+
         if _is_bad_response(answer):
             _trigger_self_heal(question, user_id, username, answer)
+
         return answer
+
+    provider = ask_provider()
+    if provider == "anthropic" and api_key:
+        try:
+            claude_result = await _claude_loop(api_key, system_prompt, question)
+        except Exception as e:  # any Claude failure (API, timeout, KeyError, ...) falls back
+            # Class name (and HTTP status) only: provider error text can echo the key (AC24/AC27).
+            status = getattr(e, "status_code", None)
+            if status in (401, 403):
+                logger.error("Claude /ask auth failed (%s, status %s); falling back to Qwen",
+                             type(e).__name__, status)
+            else:
+                logger.warning("Claude /ask failed (%s); falling back to Qwen", type(e).__name__)
+        else:
+            claude_answer, claude_rounds = (claude_result if isinstance(claude_result, tuple)
+                                            else (claude_result, 5))
+            if claude_answer:
+                return await finish(claude_answer, claude_rounds, CLAUDE_MODEL)
+    elif provider == "anthropic":
+        logger.warning("TPCR_ASK_PROVIDER=anthropic but no api_key; using Qwen")
+
+    # Allow up to 5 tool-use rounds
+    for round_num in range(1, 6):
+        try:
+            data = await _chat(messages, use_tools)
+        except QwenHTTPError as e:
+            # Server may not support tools: retry once without them
+            if use_tools and (400 <= e.status < 500 or "tool" in e.body.lower()):
+                logger.warning("Qwen rejected tools request (%s); retrying without tools", type(e).__name__)
+                use_tools = False
+                data = await _chat(messages, use_tools)
+            else:
+                raise
+
+        message = data["choices"][0]["message"]
+        tool_calls = (message.get("tool_calls") or parse_text_tool_calls(strip_think_for_tools(message.get("content") or ""))) if use_tools else None
+
+        if tool_calls:
+            messages.append({
+                "role": "assistant",
+                "content": message.get("content") or "",
+                "tool_calls": tool_calls,
+            })
+            for call in tool_calls:
+                fn = call.get("function", {})
+                tool_name = fn.get("name") or "?"
+                logger.info("ask tool_call name=%s id=%s", tool_name, call.get("id", ""))
+                try:
+                    args = fn.get("arguments") or "{}"
+                    args = json.loads(args) if isinstance(args, str) else args
+                    sql = args.get("sql", "")
+                except (ValueError, AttributeError):
+                    sql = ""
+
+                logger.info("ask round=%d sql=%s", round_num, sql)
+
+                # Safety: reject non-SELECT queries
+                sql_upper = sql.strip().upper()
+                if not sql_upper.startswith("SELECT") and not sql_upper.startswith("WITH"):
+                    result = "Error: Only SELECT queries are allowed."
+                else:
+                    result = await asyncio.to_thread(run_duckdb_query, sql)
+                    query_results.append(result)
+
+                logger.info("ask tool_result name=%s status=%s", tool_name, tool_result_status(result))
+
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": call.get("id", ""),
+                    "content": result,
+                })
+        else:
+            # Final text response
+            return await finish(strip_think(message.get("content") or ""), round_num)
+
+    messages.append({"role": "user", "content": "You have no more queries. Answer the question now from the results you have."})
+    try:
+        data = await _chat(messages, use_tools=False)
+        answer = strip_think(data["choices"][0]["message"].get("content") or "")
+    except Exception as e:
+        logger.warning("final no-tools answer failed: %s", type(e).__name__)
+        answer = ""
+
+    if answer:
+        return await finish(answer, 5)
+
+    if query_results and all(r == NO_RESULTS_MSG for r in query_results):
+        # AC4: rounds exhausted, final call empty/raised, >=1 SELECT ran, all empty.
+        no_data = "I don't have any wait data for that date."
+        try:
+            bounds = await asyncio.to_thread(run_duckdb_query, date_range_sql())
+            min_date, max_date = [v.strip() for v in bounds.split("\n")[2].split("|")]
+            if "None" not in (min_date, max_date):
+                no_data += f" Data is available from {min_date} to {max_date}."
+        except Exception as e:
+            logger.warning("date range lookup failed: %s", type(e).__name__)
+        return await finish(no_data, 5)
 
     fallback = "I wasn't able to fully answer that question. Try rephrasing or asking something more specific!"
     duration_ms = int((_time.monotonic() - _start) * 1000)
-    await asyncio.to_thread(log_question, user_id, username, question, fallback, duration_ms, model_used)
+    await asyncio.to_thread(log_question, user_id, username, question, fallback, duration_ms)
+
     _trigger_self_heal(question, user_id, username, fallback)
+
     return fallback
-
-
-QWEN_URL = os.environ.get("TPCR_QWEN_URL", "http://127.0.0.1:8080/v1/chat/completions")
-QWEN_MODEL = os.environ.get("TPCR_QWEN_MODEL", "/Users/fredhazelton/models/Qwen3.8-27B-8bit")
-QWEN_LABEL = "qwen-local"
-_QWEN_TOOLS = [{"type": "function", "function": {
-    "name": "run_query",
-    "description": "Execute a read-only SQL query against the TPCR DuckDB database. Use SELECT statements only. Returns results as formatted text.",
-    "parameters": {"type": "object", "properties": {"sql": {"type": "string", "description": "SQL SELECT query to execute"}}, "required": ["sql"]}}}]
-
-
-def _qwen_loop(system_prompt: str, question: str) -> Optional[str]:
-    """Same prompt + run_query tool flow as Claude, against local mlx_lm (OpenAI-compatible). Blocking; call via to_thread."""
-    import re
-    import requests
-    msgs = [{"role": "system", "content": system_prompt}, {"role": "user", "content": question}]
-    for _ in range(5):
-        r = requests.post(QWEN_URL, json={
-            "model": QWEN_MODEL, "messages": msgs, "tools": _QWEN_TOOLS,
-            "max_tokens": 700, "temperature": 0.2,
-            "chat_template_kwargs": {"enable_thinking": False},
-        }, timeout=300)
-        r.raise_for_status()
-        m = r.json()["choices"][0]["message"]
-        content = m.get("content") or ""
-        calls = m.get("tool_calls") or []
-        if not calls:
-            for blk in re.findall(r"<tool_call>(.*?)</tool_call>", content, re.S):
-                try:
-                    j = json.loads(blk)
-                    calls.append({"id": f"c{len(msgs)}", "function": {"name": j["name"], "arguments": json.dumps(j["arguments"])}})
-                except Exception:
-                    pass
-        if not calls:
-            text = re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip()
-            return text or None
-        msgs.append({"role": "assistant", "content": content, "tool_calls": [
-            {"id": c.get("id", "x"), "type": "function", "function": c["function"]} for c in calls]})
-        for c in calls:
-            try:
-                sql = json.loads(c["function"]["arguments"]).get("sql", "")
-            except Exception:
-                sql = ""
-            su = sql.strip().upper()
-            result = run_duckdb_query(sql) if (su.startswith("SELECT") or su.startswith("WITH")) else "Error: Only SELECT queries are allowed."
-            msgs.append({"role": "tool", "tool_call_id": c.get("id", "x"), "content": result})
-    return None
-
-
-async def _claude_loop(client, system_prompt, tools, messages) -> Optional[str]:
-    # Allow up to 5 tool-use rounds
-    for _ in range(5):
-        response = await client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1500,
-            system=system_prompt,
-            tools=tools,
-            messages=messages,
-        )
-
-        # Check if we need to handle tool use
-        if response.stop_reason == "tool_use":
-            # Process all tool calls
-            tool_results = []
-            assistant_content = response.content
-
-            for block in response.content:
-                if block.type == "tool_use":
-                    sql = block.input.get("sql", "")
-
-                    # Safety: reject non-SELECT queries
-                    sql_upper = sql.strip().upper()
-                    if not sql_upper.startswith("SELECT") and not sql_upper.startswith("WITH"):
-                        result = "Error: Only SELECT queries are allowed."
-                    else:
-                        result = await asyncio.to_thread(run_duckdb_query, sql)
-
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": result
-                    })
-
-            messages.append({"role": "assistant", "content": assistant_content})
-            messages.append({"role": "user", "content": tool_results})
-        else:
-            # Final text response
-            text_parts = [b.text for b in response.content if hasattr(b, "text")]
-            return "\n".join(text_parts)
-    return None

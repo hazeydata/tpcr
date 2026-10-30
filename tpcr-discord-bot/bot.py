@@ -44,14 +44,11 @@ from forecast_image import generate_forecast_image
 logger = logging.getLogger("tpcr-bot")
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)-8s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 from calendar_image import generate_calendar_image
-import os
-from ask_agent import ask_agent as ask_agent_anthropic
-from ask_agent_ollama import ask_agent_ollama
-
-def ask_agent(*args, **kwargs):
-    if os.getenv("USE_OLLAMA") == "1":
-        return ask_agent_ollama(*args, **kwargs)
-    return ask_agent_anthropic(*args, **kwargs)
+# Load ~/.env BEFORE importing ask_agent so its QWEN_* settings see it
+# (ask_agent also reads them at call time; this is defense in depth).
+load_dotenv(os.path.expanduser("~/.env"))
+from ask_agent import ask_agent, data_path, _duckdb_path, validate_config
+validate_config()
 
 # Add theme-park-crowd-report/src to sys.path for live inference model
 theme_park_src = os.path.expanduser("~/theme-park-crowd-report/src")
@@ -66,8 +63,7 @@ except ImportError as e:
     LiveInferenceModel = None
     LIVE_INFERENCE_AVAILABLE = False
 
-# Load token from ~/.env
-load_dotenv(os.path.expanduser("~/.env"))
+# ~/.env was loaded above, before the ask_agent import
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 
 # Bot setup
@@ -81,17 +77,31 @@ tree = app_commands.CommandTree(client)
 # Data paths
 # --- Data paths ---
 # Primary: shared DuckDB (populated by scraper + daily pipeline)
-DUCKDB_PATH = os.path.expanduser("~/hazeydata/pipeline") + "/tpcr_live.duckdb"
+DUCKDB_PATH = _duckdb_path()
 
 # Fallback: direct file paths (used only if DuckDB is unavailable)
-WTI_PATH = os.path.expanduser("~/hazeydata/pipeline") + "/wti/wti.parquet"
-FORECASTS_PATH = os.path.expanduser("~/hazeydata/pipeline") + "/curves/forecast_parquet/all_forecasts.parquet"
-ENTITIES_PATH = os.path.expanduser("~/hazeydata/pipeline") + "/dimension_tables/dimentity.csv"
-STAGING_DIR = os.path.expanduser("~/hazeydata/pipeline") + "/staging/queue_times"
-FACT_PARQUET_DIR = os.path.expanduser("~/hazeydata/pipeline") + "/fact_tables/parquet"
+WTI_PATH = data_path("wti/wti.parquet")
+FORECASTS_PATH = data_path("curves/forecast_parquet/all_forecasts.parquet")
+ENTITIES_PATH = data_path("dimension_tables/dimentity.csv")
+STAGING_DIR = data_path("staging/queue_times")
+FACT_PARQUET_DIR = data_path("fact_tables/parquet")
 
 # DuckDB availability flag
 _USE_DUCKDB = os.path.exists(DUCKDB_PATH)
+
+
+def _parquet_df(query: str):
+    """Run a parquet-fallback query on a dedicated in-memory connection.
+
+    The module-level duckdb.sql() uses the shared default connection, which
+    DuckDB 2.x refuses to reuse while an earlier execute() result is still
+    unfinished (ResourceInUseException). A short-lived connection avoids that.
+    """
+    con = duckdb.connect()
+    try:
+        return con.execute(query).fetchdf()
+    finally:
+        con.close()
 
 
 def get_db(max_retries: int = 5):
@@ -373,7 +383,7 @@ def get_wti_score(park_code: str, target_date: date_type) -> float:
               AND park_date = '{target_date}'
             LIMIT 1
         """
-        result = duckdb.sql(query).fetchdf()
+        result = _parquet_df(query)
         if len(result) > 0:
             return float(result.iloc[0]['wti'])
         return None
@@ -423,7 +433,7 @@ def get_forecasts(park_code: str, target_date: date_type):
             GROUP BY entity_code
             ORDER BY avg_wait DESC
         """
-        result = duckdb.sql(query).fetchdf()
+        result = _parquet_df(query)
         return result
     except Exception as e:
         print(f"⚠️ Error getting forecasts: {e}")
@@ -432,7 +442,7 @@ def get_forecasts(park_code: str, target_date: date_type):
 def get_archived_forecasts(park_code: str, target_date: date_type):
     """Get forecast from archived forecast files (for today/past dates not in current forecast)."""
     try:
-        archive_dir = os.path.expanduser("~/hazeydata/pipeline") + "/accuracy/archive"
+        archive_dir = data_path("accuracy/archive")
         if not os.path.exists(archive_dir):
             return pd.DataFrame()
         
@@ -463,7 +473,7 @@ def get_archived_forecasts(park_code: str, target_date: date_type):
             GROUP BY entity_code
             ORDER BY avg_wait DESC
         """
-        result = duckdb.sql(query).fetchdf()
+        result = _parquet_df(query)
         return result
     except Exception as e:
         print(f"⚠️ Error getting archived forecasts: {e}")
@@ -688,11 +698,18 @@ def get_wti_range(park_code: str, target_date: date_type) -> dict:
                 GROUP BY time_slot
                 ORDER BY time_slot
             """
-            result = duckdb.sql(query).fetchdf()
-            wti_row = duckdb.sql(f"""
-                SELECT wti FROM read_parquet('{WTI_PATH}')
-                WHERE park_code = '{wti_code}' AND park_date = '{target_date}'
-            """).fetchone()
+            result = _parquet_df(query)
+            # Dedicated connection + execute(): DuckDB 2.x relations (duckdb.sql)
+            # have no fetchone(), and the shared default connection rejects new
+            # work while a prior execute() result is unfinished.
+            _con = duckdb.connect()
+            try:
+                wti_row = _con.execute(
+                    "SELECT wti FROM read_parquet(?) WHERE park_code = ? AND park_date = ?",
+                    [WTI_PATH, wti_code, target_date],
+                ).fetchone()
+            finally:
+                _con.close()
 
         if len(result) == 0:
             return None
@@ -738,7 +755,7 @@ async def on_ready():
     if LIVE_INFERENCE_AVAILABLE:
         try:
             print("🤖 Loading live inference model...")
-            live_inference_model = LiveInferenceModel(output_base=Path(os.path.expanduser("~/hazeydata/pipeline") ))
+            live_inference_model = LiveInferenceModel(output_base=Path(data_path()))
             print("✅ Live inference model loaded successfully")
         except Exception as e:
             print(f"⚠️ Failed to load live inference model: {e}")
@@ -983,7 +1000,7 @@ async def best_day_command(interaction: discord.Interaction, park: str, timefram
                   AND park_date BETWEEN '{start}' AND '{end}'
                 ORDER BY park_date
             """
-            df = duckdb.sql(query).fetchdf()
+            df = _parquet_df(query)
     except Exception as e:
         print(f"⚠️ Error in /best-day: {e}")
         _log_bot_error("best-day", type(e).__name__, str(e), "shown_error")
@@ -1146,7 +1163,7 @@ async def best_day_command(interaction: discord.Interaction, park: str, timefram
         # 90+ day views: calendar image instead of text
         # Try pre-generated image first, fall back to live rendering
         try:
-            pre_gen_path = fos.path.expanduser("~/hazeydata/pipeline") + "/calendar_images/{park_code}_{timeframe}.png"
+            pre_gen_path = data_path("calendar_images", f"{park_code}_{timeframe}.png")
             if os.path.exists(pre_gen_path):
                 file = discord.File(pre_gen_path, filename="calendar.png")
                 print(f"📸 Serving pre-generated image: {pre_gen_path}")
@@ -1305,7 +1322,7 @@ def _wait_dot(minutes: int) -> str:
 
 
 # ── Park hours lookup for smarter "no data" messages ──
-DIMPARKHOURS_PATH = os.path.expanduser("~/hazeydata/pipeline") + "/dimension_tables/dimparkhours.csv"
+DIMPARKHOURS_PATH = data_path("dimension_tables/dimparkhours.csv")
 
 # Park code → dimparkhours park code mapping
 _PARK_HOURS_CODE = {
@@ -1630,7 +1647,8 @@ async def about_command(interaction: discord.Interaction):
 # ── /ask — AI-powered natural language Q&A ──────────────────────────
 import json as _json
 
-FEEDBACK_LOG = Path(__file__).resolve().parent / "ask_feedback.jsonl"
+FEEDBACK_LOG = Path(os.path.expanduser(os.getenv("TPCR_ASK_FEEDBACK_LOG", "").strip()
+                                        or os.path.join(os.path.dirname(os.path.abspath(__file__)), "ask_feedback.jsonl")))
 
 
 class AskFeedbackView(discord.ui.View):
@@ -1677,8 +1695,12 @@ class AskFeedbackView(discord.ui.View):
             "reviewer_name": reviewer_name,
             "rating": rating,
         }
-        with open(FEEDBACK_LOG, "a") as f:
-            f.write(_json.dumps(entry) + "\n")
+        try:
+            with open(FEEDBACK_LOG, "a") as f:
+                f.write(_json.dumps(entry) + "\n")
+        except Exception as e:
+            logging.getLogger(__name__).warning("ask feedback log failed (TPCR_ASK_FEEDBACK_LOG=%s): %s: %s",
+                                                FEEDBACK_LOG, type(e).__name__, e)
 
     async def on_timeout(self):
         # Disable buttons after timeout
@@ -1699,19 +1721,23 @@ except Exception as e:
 BOT_COMMANDS_CHANNEL = 1478240248361128079  # #bot-commands (recreated Mar 2)
 
 
+FRIENDLY_ERROR = "Sorry, I couldn't answer that right now. Please try again in a bit."
+
+
 @tree.command(name="ask", description="Ask anything about theme park crowds, wait times, and visit planning")
 @app_commands.describe(question="Your question (e.g., 'What's the best day to visit Magic Kingdom this month?')")
 async def ask_command(interaction: discord.Interaction, question: str):
     print(f"📥 /ask called: question='{question}' by {interaction.user}")
 
-    # No Anthropic key -> ask_agent gets an auth error and falls back to local Qwen.
-
-    # Defer — this will take a few seconds
+    # Ack immediately: defer, then post a placeholder we edit with the answer
     if not await safe_defer(interaction):
         return
 
+    placeholder = None
     try:
-        answer = await ask_agent(question, str(interaction.user.id), ANTHROPIC_API_KEY or "missing-key", username=str(interaction.user))
+        placeholder = await interaction.followup.send("Thinking…", wait=True)
+
+        answer = await ask_agent(question, str(interaction.user.id), api_key=ANTHROPIC_API_KEY, username=str(interaction.user))
 
         # Build embed
         embed = discord.Embed(
@@ -1722,14 +1748,26 @@ async def ask_command(interaction: discord.Interaction, question: str):
         embed.set_footer(text="AI-powered • Data may not be 100% accurate • hazeydata.ai")
 
         view = AskFeedbackView(question, str(interaction.user.id), str(interaction.user))
-        await interaction.followup.send(embed=embed, view=view)
+        try:
+            await placeholder.edit(content=None, embed=embed, view=view)
+        except Exception:
+            logger.warning("/ask placeholder edit failed; sending new message", exc_info=True)
+            await interaction.followup.send(embed=embed, view=view)
 
-    except Exception as e:
-        print(f"❌ /ask error: {e}")
-        await interaction.followup.send(
-            f"❌ Sorry, I hit an error processing that question. Try rephrasing!\n`{str(e)[:100]}`",
-            ephemeral=True
-        )
+    except Exception:
+        # Full details server-side only; users never see raw exception text
+        logger.error("/ask failed", exc_info=True)
+        try:
+            if placeholder is not None:
+                await placeholder.edit(content=FRIENDLY_ERROR, embed=None, view=None)
+            else:
+                await interaction.followup.send(FRIENDLY_ERROR, ephemeral=True)
+        except Exception:
+            logger.error("/ask could not deliver error message", exc_info=True)
+            try:
+                await interaction.followup.send(FRIENDLY_ERROR, ephemeral=True)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

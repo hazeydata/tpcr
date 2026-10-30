@@ -147,6 +147,37 @@ QUEUE_TIMES_PARK_MAP: Dict[int, str] = {
 # DUCKDB DUAL-WRITE (live_waits for bot + dashboard)
 # =============================================================================
 
+# Writes go through live_duckdb_writes (constraint-free: works whether or not
+# live_waits / data_freshness have PKs); the subprocess runs write_scraper_batch.
+# Body of the script run via `python -c` (see _live_write_script).
+_LIVE_WRITE_SCRIPT_BODY = """sys.path.insert(0, SRC_DIR)
+try:
+    import live_duckdb_writes
+    con = duckdb.connect(DB_PATH)
+    try:
+        dropped = live_duckdb_writes.write_scraper_batch(con, TMP_PATH)
+    finally:
+        con.close()
+    os.unlink(TMP_PATH)
+    print("DROPPED:" + str(dropped))
+    print("OK")
+except Exception as e:
+    print("ERR:" + str(e), file=sys.stderr)
+    sys.exit(1)
+"""
+
+
+def _live_write_script(db_path, tmp_path) -> str:
+    """Build the `python -c` script; paths are embedded as repr() literals."""
+    return (
+        "import duckdb, os, sys\n"
+        f"DB_PATH = {str(db_path)!r}\n"
+        f"TMP_PATH = {str(tmp_path)!r}\n"
+        f"SRC_DIR = {str(Path(__file__).resolve().parent)!r}\n"
+        + _LIVE_WRITE_SCRIPT_BODY
+    )
+
+
 def _write_to_live_duckdb(
     df: pd.DataFrame,
     park_tz: ZoneInfo,
@@ -171,6 +202,7 @@ def _write_to_live_duckdb(
         return False
 
     # Prepare data
+    raw_count = len(df)
     try:
         df = df.copy()
         df["park_date"] = derive_park_date(df["observed_at"], park_tz)
@@ -194,26 +226,7 @@ def _write_to_live_duckdb(
         logger.warning(f"Failed to write temp CSV: {e}")
         return False
 
-    write_script = f'''import duckdb, os, sys
-try:
-    con = duckdb.connect("{db_path}")
-    con.execute("""
-        INSERT OR IGNORE INTO live_waits (entity_code, observed_at, wait_time_type, wait_time_minutes, park_date)
-        SELECT entity_code, observed_at::TIMESTAMPTZ, wait_time_type,
-               wait_time_minutes::INTEGER, park_date::DATE
-        FROM read_csv_auto("{tmp_path}")
-    """)
-    con.execute("""
-        INSERT OR REPLACE INTO data_freshness (source, last_updated, row_count, notes)
-        VALUES ('scraper', CURRENT_TIMESTAMP, (SELECT COUNT(*) FROM live_waits), 'queue-times')
-    """)
-    con.close()
-    os.unlink("{tmp_path}")
-    print("OK")
-except Exception as e:
-    print(f"ERR:{{e}}", file=sys.stderr)
-    sys.exit(1)
-'''
+    write_script = _live_write_script(db_path, tmp_path)
 
     for attempt in range(max_retries):
         try:
@@ -222,6 +235,13 @@ except Exception as e:
                 capture_output=True, text=True, timeout=30,
             )
             if result.returncode == 0 and "OK" in result.stdout:
+                m = re.search(r"DROPPED:(\d+)", result.stdout)
+                total_dropped = (raw_count - len(df)) + (int(m.group(1)) if m else 0)
+                if total_dropped > 0:
+                    logger.warning(
+                        f"live_waits: dropped {total_dropped} row(s) with NULL/empty "
+                        "entity_code, observed_at or wait_time_type"
+                    )
                 logger.debug(f"Wrote {len(df)} rows to live_waits (subprocess)")
                 return True
             raise RuntimeError(result.stderr[:300] if result.stderr else "subprocess failed")
