@@ -16,7 +16,7 @@ For park day D:
 |---|---|
 | `cards.py` | Static card HTML + alt text + `*.meta.json` from Step 14 content (`predicted_D.json`, `observed_D.json`) and `wti.parquet` history (each park's own p25–p75 since Jan 2022). Refuses on wrong date, non-ready status or a missing park. |
 | `build_day.sh` | Runs `cards.py`, screenshots PNGs (headless Chrome), renders the MP4s, checks the last frame equals the static PNG. No network. |
-| `render_anim.sh`, `anim_forecast.js`, `anim_reply.js` | 30 fps frames -> H.264 MP4 (about 7 s). |
+| `render_anim.sh`, `anim_forecast.js`, `anim_reply.js` | 30 fps frames -> H.264 MP4 (about 7 s). Portable to macOS/BSD: the frame count is compared as a number (BSD `wc -l` pads with spaces); a short render fails with `missing frames: GOT of N`. Tested by `tests/test_render_anim.py` (stub Chrome/ffmpeg). |
 | `tweet_copy.py` | New-format tweet text (see Tweet text below), from `F-D.meta.json` / `R-D.meta.json`. Over 280 (X weighted) returns None -> silent. |
 | `park_status.py` | `open` / `closed` / `unknown` per park. `closed` only from the hand-filled `data/closures.csv`; `open` from `dimparkhours.csv` official rows; else `unknown`. |
 | `headline_copy.py` | Every fallback headline ("All open parks normal", "<Park> normal", "All open parks within 3 of forecast", and the all-four lines). Final copy from Lindsay; `cards.py` takes them only from here. |
