@@ -1,5 +1,10 @@
 {
   "legacy_cron_patterns": ["wti_predicted_tweet\\.py", "wti_observed_tweet\\.py"],
-  "launchd_labels": ["com.hazeydata.tpcr-tweet-observed", "com.hazeydata.tpcr-tweet-predicted"],
+  "launchd_jobs": {
+    "com.hazeydata.tpcr-tweet-observed": "operations/scripts/wti_observed_tweet.py",
+    "com.hazeydata.tpcr-tweet-predicted": "operations/scripts/wti_predicted_tweet.py"
+  },
+  "checkout": "~/tpcr-tweet",
+  "python": "~/theme-park-crowd-report/.venv/bin/python",
   "local_script_patterns": ["wti_predicted_tweet_local\\.py", "wti_observed_tweet_local\\.py"]
 }

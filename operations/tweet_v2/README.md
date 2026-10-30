@@ -27,29 +27,48 @@ Data host (no defaults; `tweet_v2.py`, `wti_observed_tweet.py` and `wti_predicte
 Env for `build_day.sh`: `PY` (python with pandas + pyarrow), `PYIMG` (python with Pillow, default `PY`), `CHROME`, `FFMPEG`.
 
 ## Scheduling (Mac Mini launchd)
-Two launchd jobs in `~/Library/LaunchAgents/` run the repo scripts from the checkout `~/theme-park-crowd-report`
-(ruling: Fred, Oct 30 2026 1:06 PM ET, "Repoint the tweet jobs to the repo's scripts"):
+Two launchd jobs in `~/Library/LaunchAgents/` run the repo scripts from a separate clean checkout `~/tpcr-tweet`
+(rulings, relayed by chief: Fred, Oct 30 2026 1:06 PM ET, "Repoint the tweet jobs to the repo's scripts"; 1:26 PM ET,
+"Use a separate clean checkout at ~/tpcr-tweet for the tweet jobs"). They share the pipeline checkout's venv
+`~/theme-park-crowd-report/.venv`; the pipeline checkout itself is not used by the tweet jobs:
 
 | Label | When (ET) | ProgramArguments |
 |---|---|---|
-| `com.hazeydata.tpcr-tweet-observed` | 08:30 | `~/theme-park-crowd-report/.venv/bin/python ~/theme-park-crowd-report/operations/scripts/wti_observed_tweet.py` |
-| `com.hazeydata.tpcr-tweet-predicted` | 16:00 | `~/theme-park-crowd-report/.venv/bin/python ~/theme-park-crowd-report/operations/scripts/wti_predicted_tweet.py` |
+| `com.hazeydata.tpcr-tweet-observed` | 08:30 | `~/theme-park-crowd-report/.venv/bin/python ~/tpcr-tweet/operations/scripts/wti_observed_tweet.py` |
+| `com.hazeydata.tpcr-tweet-predicted` | 16:00 | `~/theme-park-crowd-report/.venv/bin/python ~/tpcr-tweet/operations/scripts/wti_predicted_tweet.py` |
 
-- Interpreter: the checkout's `.venv` (Python 3.12, pandas + pyarrow). `WorkingDirectory` is the checkout; the scripts find
+- Interpreter: `~/theme-park-crowd-report/.venv/bin/python` (Python 3.12, pandas + pyarrow). `WorkingDirectory` is `~/tpcr-tweet`; the scripts find
   `build_day.sh`, `config/` and `data/closures.csv` from their own path, so the cwd only matters for logs.
 - Env names the scripts read (values come from the plist or `~/.env`, never from this repo): `TWITTER_CONSUMER_KEY`,
   `TWITTER_CONSUMER_SECRET`, `TWITTER_ACCESS_TOKEN`, `TWITTER_ACCESS_TOKEN_SECRET`, `DISCORD_BOT_TOKEN`, `TPCR_SSH_HOST`,
   `TPCR_CONTENT_DIR`, `TPCR_WTI_PARQUET`, optional `TPCR_PARK_HOURS`, `TPCR_CLOSURES`, `TPCR_TWEET_V2_DIR`, `PY`, `PYIMG`,
-  `CHROME`, `FFMPEG`, `TPCR_REMOTION_DIR` (old-format reply until Nov 1), `TPCR_TWEET_FORMAT_CONFIG`, and the dry-run switch `TPCR_TWEET_DRY_RUN`.
-- `TPCR_TWEET_DRY_RUN`: any value other than `0` makes the run a dry run (same as `--dry-run`); `0` or unset is live.
-  `--dry-run` always wins. The plists keep `TPCR_TWEET_DRY_RUN=1` until a manual dry run shows the new format.
+  `CHROME`, `FFMPEG`, `TPCR_REMOTION_DIR` (old-format reply until Nov 1), `TPCR_TWEET_FORMAT_CONFIG`, the guard's `TPCR_TWEET_CHECKOUT` / `TPCR_TWEET_PYTHON`, and the dry-run switch `TPCR_TWEET_DRY_RUN`.
+- `TPCR_TWEET_DRY_RUN` (compared as the exact string, no trimming or case folding; `--dry-run` always gives a dry run):
+
+  | `TPCR_TWEET_DRY_RUN` | run |
+  |---|---|
+  | unset | live |
+  | `0` | live |
+  | anything else, including `1`, `` (empty), ` 0`, `false`, `true` | dry |
+
+  The plists keep `TPCR_TWEET_DRY_RUN=1` until a manual dry run shows the new format.
 - The old `~/hazeydata/scripts/wti_{observed,predicted}_tweet_local.py` are not in this repo and print coloured circles
   (`crowd_bar`). They are the rollback target only.
-- Guard (`operations/scripts/tweet_guard.py`, config `config/tweet_guard.json`): a live run exits 3 and posts nothing if a
-  crontab line still runs `wti_*_tweet.py`, if either tweet label is loaded but its `launchctl print gui/<uid>/<label>`
-  still names a `wti_*_tweet_local.py`, or if crontab/launchctl can't be read. A label that isn't loaded (manual run) is
-  fine. `python3 operations/scripts/tweet_guard.py status` prints each label as `runs repo script`, `runs local script`
-  or `not loaded`, then `allowed_post: yes|no`; `check` exits 0 or 3.
+- Guard (`operations/scripts/tweet_guard.py`, config `config/tweet_guard.json`): a live run is allowed only if no crontab
+  line runs `wti_*_tweet.py` and every loaded tweet label runs exactly the expected command, read from the `arguments`
+  block of `launchctl print gui/<uid>/<label>`: `<python> <checkout>/operations/scripts/wti_observed_tweet.py` for
+  `com.hazeydata.tpcr-tweet-observed`, `.../wti_predicted_tweet.py` for `com.hazeydata.tpcr-tweet-predicted`, and nothing
+  else. `<checkout>` is `checkout` in the config (`~/tpcr-tweet`) or `TPCR_TWEET_CHECKOUT`; `<python>` is `python` in the
+  config (`~/theme-park-crowd-report/.venv/bin/python`) or `TPCR_TWEET_PYTHON` (a relative value is taken inside the checkout).
+  Paths are compared resolved: symlinked directories and `..` are resolved, but the python's own name is not followed, so a
+  job running the venv's target interpreter directly does not match. Anything else exits 3 and posts nothing:
+  `launchd_runs_local_script` (a `wti_*_tweet_local.py`), `launchd_unexpected_program` (another program, wrong script or
+  python, extra arguments), `launchd_job_no_arguments` (no `arguments` block), `launchctl_unreadable` / `crontab_unreadable`
+  (including a non-zero exit), `legacy_cron_active`. A label that isn't loaded (manual run) is fine.
+  `python3 operations/scripts/tweet_guard.py status` prints each label as `runs repo script`, `runs local script`,
+  `runs unexpected program`, `no program arguments` or `not loaded`, the expected command, then `allowed_post: yes|no`;
+  `check` exits 0 or 3. If launchd runs a checkout other than the default, the job (and any manual `check`) must have
+  `TPCR_TWEET_CHECKOUT` set to it.
 
 ## Emoji scope
 No coloured-circle emojis (🟢🟡🟠🔴🔵⚪⚫) appear in the new-format code: `operations/tweet_v2/`, `operations/scripts/tweet_v2.py`, `tweet_format.py`, `tweet_guard.py`, `tweet_note.py`. The legacy code still has them and is unchanged: `crowd_bar` in `wti_predicted_tweet.py:174` and `wti_observed_tweet.py:214` (neither file calls its own `format_tweet`), `tweet_v1_legacy.py:19` (used only by `reply_old_format`), and `scripts/post_{predicted,observed}_tweet.py`. The old-format reply path ends at `old_retires` (2026-11-01 00:00 ET in `config/tweet_format.json`, enforced in `tweet_format.reply_format`, `tweet_format.py:153`). Nothing in the repo retires `scripts/post_*_tweet.py`. The two tweet launchd jobs run the repo scripts (see Scheduling); the guard refuses a live post while either still points at a `_local` script. Whether `scripts/post_*_tweet.py` are scheduled anywhere else is not visible from the repo.
@@ -150,7 +169,7 @@ A closed park's row is `<Park>: closed`. No colour-coded circles. Every text is 
 (`operations/scripts/tweet_v1_legacy.py`).
 
 ## Dry run
-Both scripts take `--dry-run` (or `TPCR_TWEET_DRY_RUN` set to anything but `0`): builds everything, blocks every HTTP call in-process, skips `~/.env` and credentials,
+Both scripts take `--dry-run` (or `TPCR_TWEET_DRY_RUN` set to anything but unset/`0`, see the table under Scheduling): builds everything, blocks every HTTP call in-process, skips `~/.env` and credentials,
 writes no state (no tweet state, no no-data streak). A dry run that reaches the build step writes `dry_run.json`
 (would_post, posts_at, text, media, alt text, reply target, guard status; `result: skipped_all_closed` when every park is
 closed). Runs that stop before the build write no `dry_run.json`; they only print the log line: `skipped_no_data`,
