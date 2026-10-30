@@ -192,6 +192,46 @@ class ExpectedProgram(unittest.TestCase):
         self.assertEqual(rc, 3)
         self.assertIn("launchd_job_no_arguments", err)
 
+    def assert_unexpected(self, obs_body):
+        rc, err = self.check(obs_body)
+        self.assertEqual(rc, 3)
+        self.assertIn("launchd_unexpected_program", err)
+
+    def test_n20_program_key_other_than_python_blocks(self):
+        good = GOOD[OBS][0]
+        self.assert_unexpected(good.replace(f"program = {PY}", "program = /bin/sh"))
+
+    def test_n20_program_key_absent_or_python_allows(self):
+        good = GOOD[OBS][0]
+        self.assertEqual(self.check(good.replace(f"\tprogram = {PY}\n", ""))[0], 0)
+        self.assertEqual(self.check(good)[0], 0)
+
+    def test_n20_relative_or_repeated_program_key_blocks(self):
+        good = GOOD[OBS][0]
+        self.assert_unexpected(good.replace(f"program = {PY}", "program = python"))
+        self.assert_unexpected(good.replace(f"\tprogram = {PY}\n", f"\tprogram = {PY}\n\tprogram = /bin/sh\n"))
+
+    def test_n19_duplicate_arguments_blocks_block(self):
+        good = GOOD[OBS][0]
+        evil = "\targuments = {\n\t\t/bin/echo\n\t}\n"
+        self.assert_unexpected(good.replace("\tprogram", evil + "\tprogram"))
+        self.assert_unexpected(good[:-2] + evil + "}\n")
+
+    def test_n16_tilde_in_args_blocks(self):
+        home = "/Users/fred"
+        with mock.patch.dict(os.environ, {"HOME": home}):
+            self.assert_unexpected(body(PY.replace(home, "~"), f"{C}/operations/scripts/wti_observed_tweet.py"))
+            self.assert_unexpected(body(PY, f"~/theme-park-crowd-report/operations/scripts/wti_observed_tweet.py"))
+
+    def test_n12_relative_paths_block_even_from_checkout_cwd(self):
+        # launchd's cwd is not ours: a relative path that happens to resolve from our cwd still blocks.
+        cases = [(C, body(PY, "operations/scripts/wti_observed_tweet.py")),
+                 (f"{C}/.venv/bin", body("python", f"{C}/operations/scripts/wti_observed_tweet.py")),
+                 (C, body(".venv/bin/python", f"{C}/operations/scripts/wti_observed_tweet.py"))]
+        for cwd, obs_body in cases:
+            with self.subTest(cwd=cwd), mock.patch("os.getcwd", return_value=cwd):
+                self.assert_unexpected(obs_body)
+
     def test_unrelated_program_blocks(self):
         rc, err = self.check(body("/bin/echo", "hi"))
         self.assertEqual(rc, 3)

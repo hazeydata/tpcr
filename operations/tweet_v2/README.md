@@ -58,12 +58,15 @@ Two launchd jobs in `~/Library/LaunchAgents/` run the repo scripts from a separa
   line runs `wti_*_tweet.py` and every loaded tweet label runs exactly the expected command, read from the `arguments`
   block of `launchctl print gui/<uid>/<label>`: `<python> <checkout>/operations/scripts/wti_observed_tweet.py` for
   `com.hazeydata.tpcr-tweet-observed`, `.../wti_predicted_tweet.py` for `com.hazeydata.tpcr-tweet-predicted`, and nothing
-  else. `<checkout>` is `checkout` in the config (`~/tpcr-tweet`) or `TPCR_TWEET_CHECKOUT`; `<python>` is `python` in the
+  else. The `arguments` block must appear exactly once and every argument must be a literal absolute path: launchd does not
+  expand `~` and does not resolve relative paths against the guard's cwd, so `~/...`, `python` or
+  `operations/scripts/...` block. The `program` line, if present, must be that same `<python>` (launchd execs `program`,
+  not `argv[0]`); any other `program` blocks. `<checkout>` is `checkout` in the config (`~/tpcr-tweet`) or `TPCR_TWEET_CHECKOUT`; `<python>` is `python` in the
   config (`~/theme-park-crowd-report/.venv/bin/python`) or `TPCR_TWEET_PYTHON` (a relative value is taken inside the checkout).
   Paths are compared resolved: symlinked directories and `..` are resolved, but the python's own name is not followed, so a
   job running the venv's target interpreter directly does not match. Anything else exits 3 and posts nothing:
-  `launchd_runs_local_script` (a `wti_*_tweet_local.py`), `launchd_unexpected_program` (another program, wrong script or
-  python, extra arguments), `launchd_job_no_arguments` (no `arguments` block), `launchctl_unreadable` / `crontab_unreadable`
+  `launchd_runs_local_script` (a `wti_*_tweet_local.py`), `launchd_unexpected_program` (another program or `program` line, wrong script or
+  python, extra arguments, a repeated `arguments` block, a `~` or relative path), `launchd_job_no_arguments` (no `arguments` block), `launchctl_unreadable` / `crontab_unreadable`
   (including a non-zero exit), `legacy_cron_active`. A label that isn't loaded (manual run) is fine.
   `python3 operations/scripts/tweet_guard.py status` prints each label as `runs repo script`, `runs local script`,
   `runs unexpected program`, `no program arguments` or `not loaded`, the expected command, then `allowed_post: yes|no`;

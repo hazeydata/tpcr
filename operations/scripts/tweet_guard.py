@@ -3,7 +3,8 @@
 
 The launchd jobs com.hazeydata.tpcr-tweet-observed and com.hazeydata.tpcr-tweet-predicted run these repo scripts.
 A live post is allowed only when no crontab line runs a repo tweet script and every loaded tweet job runs exactly
-<python> <checkout>/<its script> (resolved paths; checkout, python and scripts from config/tweet_guard.json,
+<python> <checkout>/<its script> (one arguments block, absolute paths without ~, resolved; a program line, if any,
+must be that same <python>; checkout, python and scripts from config/tweet_guard.json,
 checkout overridable by TPCR_TWEET_CHECKOUT, python by TPCR_TWEET_PYTHON). Anything else blocks (exit 3):
 an old wti_*_tweet_local.py, another program, no arguments, or unreadable crontab/launchctl.
 
@@ -95,26 +96,44 @@ def loaded_labels(text, labels):
 
 
 def job_arguments(body):
+    """Arguments of the single `arguments = {` block; None if absent, unclosed or repeated (launchd's would be ambiguous)."""
     lines = body.splitlines()
-    for i, line in enumerate(lines):
-        if line.strip() == "arguments = {":
-            args = []
-            for inner in lines[i + 1:]:
-                if inner.strip() == "}":
-                    return args
-                args.append(inner.strip())
-            return None
+    starts = [i for i, line in enumerate(lines) if line.strip() == "arguments = {"]
+    if len(starts) != 1:
+        return None
+    args = []
+    for inner in lines[starts[0] + 1:]:
+        if inner.strip() == "}":
+            return args
+        args.append(inner.strip())
     return None
+
+
+def job_programs(body):
+    return [line.strip()[len("program = "):] for line in body.splitlines() if line.strip().startswith("program = ")]
+
+
+def _literal_abs(arg):
+    # launchd neither expands ~ nor resolves relative paths against our cwd, so only literal absolute paths can match.
+    return "~" not in arg and os.path.isabs(arg)
 
 
 def job_verdict(body, expected, local_patterns):
     local = sorted({m.group(0) for p in local_patterns for m in re.finditer(p, body)})
     if local:
         return "local", ", ".join(local)
+    blocks = sum(1 for line in body.splitlines() if line.strip() == "arguments = {")
+    if blocks > 1:
+        return "unexpected", f"{blocks} arguments blocks"
     args = job_arguments(body)
     if not args:
         return "no_arguments", ""
-    resolved = [_real(args[0])] + [os.path.realpath(Path(a).expanduser()) for a in args[1:]]
+    if not all(_literal_abs(a) for a in args):
+        return "unexpected", " ".join(args)
+    programs = job_programs(body)
+    if len(programs) > 1 or (programs and (not _literal_abs(programs[0]) or _real(programs[0]) != expected[0])):
+        return "unexpected", "program = " + "; ".join(programs)
+    resolved = [_real(args[0])] + [os.path.realpath(a) for a in args[1:]]
     if resolved != expected:
         return "unexpected", " ".join(args)
     return "repo", ""
