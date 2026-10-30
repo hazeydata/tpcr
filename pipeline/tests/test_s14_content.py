@@ -157,7 +157,7 @@ def _stub_modules():
         stubs[name] = types.ModuleType(name)
     stubs["requests_oauthlib"].OAuth1 = object
     stubs["tweet_guard"].enforce = lambda *a, **k: None
-    stubs["tweet_guard"].preflight_legacy = lambda *a, **k: None
+    stubs["tweet_guard"].preflight = lambda *a, **k: None
     return stubs
 
 

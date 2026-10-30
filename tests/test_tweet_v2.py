@@ -178,10 +178,12 @@ class Guard494(Base):
     def loaded(self, argv):
         return (GFIX / "launchctl_loaded.txt").read_text(), ""
 
-    def test_live_runs_blocked_when_local_launchd_loaded(self):
+    def test_live_runs_blocked_when_jobs_run_local_scripts(self):
         for mod in (wpt, wot):
             post = mock.Mock(side_effect=AssertionError("posted despite guard"))
             with mock.patch.object(tg, "read_launchctl", lambda runner=None: self.loaded(None)), \
+                 mock.patch.object(tg, "read_crontab", lambda runner=None: ("", "")), \
+                 mock.patch.object(tg, "read_job", lambda label, runner=None: ("arguments = { /x/wti_observed_tweet_local.py }", "")), \
                  mock.patch.object(mod, "load_env"), mock.patch.object(requests, "post", post), \
                  mock.patch.object(tweet_v2, "build", side_effect=AssertionError("built despite guard")):
                 with self.assertRaises(SystemExit) as cm:
@@ -192,11 +194,12 @@ class Guard494(Base):
     def test_dry_run_reports_guard_status_without_enforcing(self):
         with mock.patch.object(tg, "read_launchctl", lambda runner=None: self.loaded(None)), \
              mock.patch.object(tg, "read_crontab", lambda runner=None: ("", "")), \
+             mock.patch.object(tg, "read_job", lambda label, runner=None: ("arguments = { /x/wti_observed_tweet_local.py }", "")), \
              mock.patch.object(tweet_v2, "build", self.fake_build):
             rc, _, _ = self.run_main(wot, ["--dry-run", "--date", D, "--content-dir", str(self.cdir),
                                            "--history", "h", "--state-file", str(self.state), "--out", str(self.tmp / "o")])
         m = json.loads((self.tmp / "o" / "dry_run.json").read_text())
-        self.assertIn("allowed_legacy: no", m["guard_status"])
+        self.assertIn("allowed_post: no", m["guard_status"])
         self.assertEqual(rc, 0)
 
 

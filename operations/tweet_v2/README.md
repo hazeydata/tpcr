@@ -26,8 +26,33 @@ Data host (no defaults; `tweet_v2.py`, `wti_observed_tweet.py` and `wti_predicte
 `TPCR_CONTENT_DIR` (Step 14 content dir there; not needed with `--content-dir`), `TPCR_WTI_PARQUET` (wti.parquet path there; not needed with `--history`).
 Env for `build_day.sh`: `PY` (python with pandas + pyarrow), `PYIMG` (python with Pillow, default `PY`), `CHROME`, `FFMPEG`.
 
+## Scheduling (Mac Mini launchd)
+Two launchd jobs in `~/Library/LaunchAgents/` run the repo scripts from the checkout `~/theme-park-crowd-report`
+(ruling: Fred, Oct 30 2026 1:06 PM ET, "Repoint the tweet jobs to the repo's scripts"):
+
+| Label | When (ET) | ProgramArguments |
+|---|---|---|
+| `com.hazeydata.tpcr-tweet-observed` | 08:30 | `~/theme-park-crowd-report/.venv/bin/python ~/theme-park-crowd-report/operations/scripts/wti_observed_tweet.py` |
+| `com.hazeydata.tpcr-tweet-predicted` | 16:00 | `~/theme-park-crowd-report/.venv/bin/python ~/theme-park-crowd-report/operations/scripts/wti_predicted_tweet.py` |
+
+- Interpreter: the checkout's `.venv` (Python 3.12, pandas + pyarrow). `WorkingDirectory` is the checkout; the scripts find
+  `build_day.sh`, `config/` and `data/closures.csv` from their own path, so the cwd only matters for logs.
+- Env names the scripts read (values come from the plist or `~/.env`, never from this repo): `TWITTER_CONSUMER_KEY`,
+  `TWITTER_CONSUMER_SECRET`, `TWITTER_ACCESS_TOKEN`, `TWITTER_ACCESS_TOKEN_SECRET`, `DISCORD_BOT_TOKEN`, `TPCR_SSH_HOST`,
+  `TPCR_CONTENT_DIR`, `TPCR_WTI_PARQUET`, optional `TPCR_PARK_HOURS`, `TPCR_CLOSURES`, `TPCR_TWEET_V2_DIR`, `PY`, `PYIMG`,
+  `CHROME`, `FFMPEG`, `TPCR_REMOTION_DIR` (old-format reply until Nov 1), `TPCR_TWEET_FORMAT_CONFIG`, and the dry-run switch `TPCR_TWEET_DRY_RUN`.
+- `TPCR_TWEET_DRY_RUN`: any value other than `0` makes the run a dry run (same as `--dry-run`); `0` or unset is live.
+  `--dry-run` always wins. The plists keep `TPCR_TWEET_DRY_RUN=1` until a manual dry run shows the new format.
+- The old `~/hazeydata/scripts/wti_{observed,predicted}_tweet_local.py` are not in this repo and print coloured circles
+  (`crowd_bar`). They are the rollback target only.
+- Guard (`operations/scripts/tweet_guard.py`, config `config/tweet_guard.json`): a live run exits 3 and posts nothing if a
+  crontab line still runs `wti_*_tweet.py`, if either tweet label is loaded but its `launchctl print gui/<uid>/<label>`
+  still names a `wti_*_tweet_local.py`, or if crontab/launchctl can't be read. A label that isn't loaded (manual run) is
+  fine. `python3 operations/scripts/tweet_guard.py status` prints each label as `runs repo script`, `runs local script`
+  or `not loaded`, then `allowed_post: yes|no`; `check` exits 0 or 3.
+
 ## Emoji scope
-No coloured-circle emojis (🟢🟡🟠🔴🔵⚪⚫) appear in the new-format code: `operations/tweet_v2/`, `operations/scripts/tweet_v2.py`, `tweet_format.py`, `tweet_guard.py`, `tweet_note.py`. The legacy code still has them and is unchanged: `crowd_bar` in `wti_predicted_tweet.py:174` and `wti_observed_tweet.py:214` (neither file calls its own `format_tweet`), `tweet_v1_legacy.py:19` (used only by `reply_old_format`), and `scripts/post_{predicted,observed}_tweet.py`. The old-format reply path ends at `old_retires` (2026-11-01 00:00 ET in `config/tweet_format.json`, enforced in `tweet_format.reply_format`, `tweet_format.py:153`). Nothing in the repo retires `scripts/post_*_tweet.py`. Whether those scripts are still scheduled depends on the Mini's launchd setup, which the repo can't show.
+No coloured-circle emojis (🟢🟡🟠🔴🔵⚪⚫) appear in the new-format code: `operations/tweet_v2/`, `operations/scripts/tweet_v2.py`, `tweet_format.py`, `tweet_guard.py`, `tweet_note.py`. The legacy code still has them and is unchanged: `crowd_bar` in `wti_predicted_tweet.py:174` and `wti_observed_tweet.py:214` (neither file calls its own `format_tweet`), `tweet_v1_legacy.py:19` (used only by `reply_old_format`), and `scripts/post_{predicted,observed}_tweet.py`. The old-format reply path ends at `old_retires` (2026-11-01 00:00 ET in `config/tweet_format.json`, enforced in `tweet_format.reply_format`, `tweet_format.py:153`). Nothing in the repo retires `scripts/post_*_tweet.py`. The two tweet launchd jobs run the repo scripts (see Scheduling); the guard refuses a live post while either still points at a `_local` script. Whether `scripts/post_*_tweet.py` are scheduled anywhere else is not visible from the repo.
 
 ## Format transition (TPCR-TWEET-RESTYLE-CUTOVER, Fred Oct 27 2026)
 A parallel transition. The window lives only in `config/tweet_format.json` (read by `operations/scripts/tweet_format.py`):
@@ -63,7 +88,7 @@ A parallel transition. The window lives only in `config/tweet_format.json` (read
   the state file by `posted_at` (idempotent). Runs outside a checkout set `TPCR_TWEET_FORMAT_CONFIG` to the config path.
 
 ## Posting
-1. #494 guard (`tweet_guard.enforce`) runs first on every live run; blocked = exit 3, nothing built or posted.
+1. Guard (`tweet_guard.enforce(tweet_guard.preflight)`, see Scheduling) runs first on every live run; blocked = exit 3, nothing built or posted.
 2. Validate `data/closures.csv` (or `--closures` / `TPCR_CLOSURES`). Missing file, wrong header, unknown park, bad date or a
    non-https `source_url` = exit 1 plus a Discord alert, before anything is built or posted.
 3. No ready content = `skipped_no_data`: exit 0, nothing posted. Streak kept in `no_data_streak.json` next to `tweet_state.json`
@@ -125,7 +150,7 @@ A closed park's row is `<Park>: closed`. No colour-coded circles. Every text is 
 (`operations/scripts/tweet_v1_legacy.py`).
 
 ## Dry run
-Both scripts take `--dry-run`: builds everything, blocks every HTTP call in-process, skips `~/.env` and credentials,
+Both scripts take `--dry-run` (or `TPCR_TWEET_DRY_RUN` set to anything but `0`): builds everything, blocks every HTTP call in-process, skips `~/.env` and credentials,
 writes no state (no tweet state, no no-data streak). A dry run that reaches the build step writes `dry_run.json`
 (would_post, posts_at, text, media, alt text, reply target, guard status; `result: skipped_all_closed` when every park is
 closed). Runs that stop before the build write no `dry_run.json`; they only print the log line: `skipped_no_data`,

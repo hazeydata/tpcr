@@ -28,7 +28,7 @@ from requests_oauthlib import OAuth1
 import tweet_format
 import tweet_note
 import tweet_v2
-from tweet_guard import enforce, preflight_legacy, status as guard_status
+from tweet_guard import enforce, preflight, status as guard_status
 
 # --- Configuration ---
 # Data host from env, no defaults: TPCR_SSH_HOST (ssh target), TPCR_CONTENT_DIR (Step 14 content dir there).
@@ -278,14 +278,14 @@ def safe_alert(message):
 
 def main(argv=None):
     args = tweet_v2.parse_args("predicted", argv)
-    dry = args.dry_run
+    dry = tweet_v2.dry_run_requested(args)
     if dry:
         tweet_v2.block_http_for_dry_run()
         print("DRY RUN: building only; nothing will be posted and no state will be written")
         guard = guard_status()
     else:
         load_env()
-        enforce(preflight_legacy)
+        enforce(preflight)
         guard = "enforced"
 
     reference_date = args.date or tweet_v2.default_reference_date("predicted")

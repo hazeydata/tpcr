@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""Mutual-exclusion guard between legacy crontab tweet jobs and launchd _local tweet jobs.
+"""Pre-post guard for operations/scripts/wti_{observed,predicted}_tweet.py.
+
+The launchd jobs com.hazeydata.tpcr-tweet-observed and com.hazeydata.tpcr-tweet-predicted run these repo scripts.
+A live post is blocked (exit 3) when a crontab line still runs a repo tweet script, or when a loaded tweet job
+still points at an old ~/hazeydata/scripts/wti_*_tweet_local.py. Unreadable crontab/launchctl blocks too.
 
 Usage:
   tweet_guard.py status
-  tweet_guard.py check-local    exit 0 only if the _local job may post
-  tweet_guard.py check-legacy   exit 0 only if the legacy job may post
+  tweet_guard.py check     exit 0 only if a repo tweet script may post
 """
 
 import json
@@ -26,7 +29,7 @@ class GuardBlocked(Exception):
 
 def load_config(path=CONFIG_FILE):
     cfg = json.loads(Path(path).read_text())
-    return cfg["legacy_cron_patterns"], cfg["local_launchd_patterns"]
+    return cfg["legacy_cron_patterns"], cfg["launchd_labels"], cfg["local_script_patterns"]
 
 
 def _run(argv):
@@ -47,6 +50,10 @@ def read_launchctl(runner=_run):
     return runner(["launchctl", "list"])
 
 
+def read_job(label, runner=_run):
+    return runner(["launchctl", "print", f"gui/{os.getuid()}/{label}"])
+
+
 def active_cron_lines(text, patterns):
     regs = [re.compile(p) for p in patterns]
     hits = []
@@ -59,16 +66,13 @@ def active_cron_lines(text, patterns):
     return hits
 
 
-def loaded_local_jobs(text, patterns):
-    regs = [re.compile(p) for p in patterns]
-    hits = []
+def loaded_labels(text, labels):
+    loaded = set()
     for line in text.splitlines():
         cols = line.split()
-        if not cols or cols[-1] == "Label":
-            continue
-        if any(r.search(cols[-1]) for r in regs):
-            hits.append(cols[-1])
-    return hits
+        if cols and cols[-1] in labels:
+            loaded.add(cols[-1])
+    return [l for l in labels if l in loaded]
 
 
 def legacy_side(cron_patterns, runner=_run):
@@ -78,58 +82,68 @@ def legacy_side(cron_patterns, runner=_run):
     return active_cron_lines(text, cron_patterns), ""
 
 
-def local_side(launchd_patterns, runner=_run):
+def launchd_side(labels, local_patterns, runner=_run):
     text, err = read_launchctl(runner)
     if text is None:
         return None, err
-    return loaded_local_jobs(text, launchd_patterns), ""
+    regs = [re.compile(p) for p in local_patterns]
+    jobs = []
+    for label in loaded_labels(text, labels):
+        body, err = read_job(label, runner)
+        if body is None:
+            return None, f"{label}: {err}"
+        local = sorted({m.group(0) for r in regs for m in r.finditer(body)})
+        jobs.append((label, local))
+    return jobs, ""
 
 
-def preflight_local(runner=_run, config=CONFIG_FILE):
-    cron_patterns, _ = load_config(config)
+def preflight(runner=_run, config=CONFIG_FILE):
+    cron_patterns, labels, local_patterns = load_config(config)
     hits, err = legacy_side(cron_patterns, runner)
     if hits is None:
         raise GuardBlocked("crontab_unreadable", err)
     if hits:
         raise GuardBlocked("legacy_cron_active", "; ".join(hits))
-
-
-def preflight_legacy(runner=_run, config=CONFIG_FILE):
-    _, launchd_patterns = load_config(config)
-    hits, err = local_side(launchd_patterns, runner)
-    if hits is None:
+    jobs, err = launchd_side(labels, local_patterns, runner)
+    if jobs is None:
         raise GuardBlocked("launchctl_unreadable", err)
-    if hits:
-        raise GuardBlocked("local_launchd_loaded", "; ".join(hits))
+    stale = [f"{label} -> {', '.join(local)}" for label, local in jobs if local]
+    if stale:
+        raise GuardBlocked("launchd_runs_local_script", "; ".join(stale))
 
 
-def enforce(preflight):
+def enforce(check):
     try:
-        preflight()
+        check()
     except GuardBlocked as e:
         print(f"tweet_guard: {e.reason} {e.detail}".rstrip(), file=sys.stderr)
         sys.exit(3)
 
 
 def status(runner=_run, config=CONFIG_FILE):
-    cron_patterns, launchd_patterns = load_config(config)
+    cron_patterns, labels, local_patterns = load_config(config)
     cron_hits, cron_err = legacy_side(cron_patterns, runner)
-    local_hits, local_err = local_side(launchd_patterns, runner)
+    jobs, job_err = launchd_side(labels, local_patterns, runner)
     lines = []
     if cron_hits is None:
         lines.append(f"legacy_cron: unreadable ({cron_err})")
     else:
         lines.append(f"legacy_cron: {'active' if cron_hits else 'inactive'} ({len(cron_hits)} line(s))")
         lines.extend(f"  {h}" for h in cron_hits)
-    if local_hits is None:
-        lines.append(f"local_launchd: unreadable ({local_err})")
+    if jobs is None:
+        lines.append(f"launchd: unreadable ({job_err})")
     else:
-        lines.append(f"local_launchd: {'loaded' if local_hits else 'not loaded'} ({len(local_hits)} job(s))")
-        lines.extend(f"  {h}" for h in local_hits)
-    local_ok = cron_hits == []
-    legacy_ok = local_hits == []
-    lines.append(f"allowed_local: {'yes' if local_ok else 'no'}")
-    lines.append(f"allowed_legacy: {'yes' if legacy_ok else 'no'}")
+        lines.append(f"launchd: {len(jobs)} of {len(labels)} tweet job(s) loaded")
+        loaded = dict(jobs)
+        for label in labels:
+            if label not in loaded:
+                lines.append(f"  {label}: not loaded")
+            elif loaded[label]:
+                lines.append(f"  {label}: runs local script ({', '.join(loaded[label])})")
+            else:
+                lines.append(f"  {label}: runs repo script")
+    ok = cron_hits == [] and jobs is not None and not any(local for _, local in jobs)
+    lines.append(f"allowed_post: {'yes' if ok else 'no'}")
     return "\n".join(lines)
 
 
@@ -139,10 +153,9 @@ def main(argv=None, runner=_run):
     if cmd == "status":
         print(status(runner))
         return 0
-    if cmd in ("check-local", "check-legacy"):
-        pre = preflight_local if cmd == "check-local" else preflight_legacy
+    if cmd == "check":
         try:
-            pre(runner)
+            preflight(runner)
         except GuardBlocked as e:
             print(f"tweet_guard: {e.reason} {e.detail}".rstrip(), file=sys.stderr)
             return 3
