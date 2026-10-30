@@ -16,7 +16,7 @@ For park day D:
 |---|---|
 | `cards.py` | Static card HTML + alt text + `*.meta.json` from Step 14 content (`predicted_D.json`, `observed_D.json`) and `wti.parquet` history (each park's own p25–p75 since Jan 2022). Refuses on wrong date, non-ready status or a missing park. |
 | `build_day.sh` | Runs `cards.py`, screenshots PNGs (headless Chrome), renders the MP4s, checks the last frame equals the static PNG. No network. |
-| `render_anim.sh`, `anim_forecast.js`, `anim_reply.js` | 30 fps frames -> H.264 MP4 (about 7 s). Portable to macOS/BSD: the frame count is compared as a number (BSD `wc -l` pads with spaces); a short render fails with `missing frames: GOT of N`. Tested by `tests/test_render_anim.py` (stub Chrome/ffmpeg). |
+| `render_anim.sh`, `anim_forecast.js`, `anim_reply.js` | 30 fps frames -> H.264 MP4 (about 7 s). Portable to macOS/BSD: the frame count is compared as a number (BSD `wc -l` pads with spaces); a short render fails with `missing frames: GOT of N`. Tested by `tests/test_render_anim.py` (stub Chrome/ffmpeg): an exact count passes; one frame too many, one too few after a successful render step, or a failed frame render all fail and write no MP4. |
 | `tweet_copy.py` | New-format tweet text (see Tweet text below), from `F-D.meta.json` / `R-D.meta.json`. Over 280 (X weighted) returns None -> silent. |
 | `park_status.py` | `open` / `closed` / `unknown` per park. `closed` only from the hand-filled `data/closures.csv`; `open` from `dimparkhours.csv` official rows; else `unknown`. |
 | `headline_copy.py` | Every fallback headline ("All open parks normal", "<Park> normal", "All open parks within 3 of forecast", and the all-four lines). Final copy from Lindsay; `cards.py` takes them only from here. |
@@ -25,6 +25,9 @@ Scripts find `build_day.sh` via `TPCR_TWEET_V2_DIR` (default: `operations/tweet_
 Data host (no defaults; `tweet_v2.py`, `wti_observed_tweet.py` and `wti_predicted_tweet.py` stop with `<NAME> is not set` if one is needed and unset): `TPCR_SSH_HOST` (ssh target for the data host),
 `TPCR_CONTENT_DIR` (Step 14 content dir there; not needed with `--content-dir`), `TPCR_WTI_PARQUET` (wti.parquet path there; not needed with `--history`).
 Env for `build_day.sh`: `PY` (python with pandas + pyarrow), `PYIMG` (python with Pillow, default `PY`), `CHROME`, `FFMPEG`.
+
+## Emoji scope
+No coloured-circle emojis (🟢🟡🟠🔴🔵⚪⚫) appear in the new-format code: `operations/tweet_v2/`, `operations/scripts/tweet_v2.py`, `tweet_format.py`, `tweet_guard.py`, `tweet_note.py`. The legacy code still has them and is unchanged: `crowd_bar` in `wti_predicted_tweet.py:174` and `wti_observed_tweet.py:214` (neither file calls its own `format_tweet`), `tweet_v1_legacy.py:19` (used only by `reply_old_format`), and `scripts/post_{predicted,observed}_tweet.py`. The old-format reply path ends at `old_retires` (2026-11-01 00:00 ET in `config/tweet_format.json`, enforced in `tweet_format.reply_format`, `tweet_format.py:153`). Nothing in the repo retires `scripts/post_*_tweet.py`. Whether those scripts are still scheduled depends on the Mini's launchd setup, which the repo can't show.
 
 ## Format transition (TPCR-TWEET-RESTYLE-CUTOVER, Fred Oct 27 2026)
 A parallel transition. The window lives only in `config/tweet_format.json` (read by `operations/scripts/tweet_format.py`):

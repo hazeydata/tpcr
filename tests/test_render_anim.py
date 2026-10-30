@@ -33,5 +33,21 @@ class RenderAnimFrameCount(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0); self.assertFalse(mp4)
 
 
+    # The two cases below get past the render step (every render_one exits 0) and reach the frame-count check, so they
+    # pin it to an exact numeric match: too many frames and too few must both fail with "missing frames: GOT of N".
+    WRITE = 'for a; do case $a in --screenshot=*) f=${a#--screenshot=};; esac; done; echo png > "$f"\n'
+
+    def test_extra_frame_fails_at_count_check(self):  # 0.2 s = 6 frames; frame 0 also drops a stray 9999.png -> 7
+        r, mp4, _ = self.run_sh(self.WRITE + 'case $f in *0000.png) echo png > "$(dirname "$f")/9999.png";; esac\n')
+        self.assertNotEqual(r.returncode, 0); self.assertFalse(mp4)
+        self.assertIn("missing frames: 7 of 6", r.stderr)
+
+    def test_short_count_past_render_fails_at_count_check(self):  # frame 5 deletes frame 0 after frame 0 was checked -> 5
+        r, mp4, _ = self.run_sh(self.WRITE + 'case $f in *0005.png) d=$(dirname "$f"); until [ -s "$d/0000.png" ]; do sleep 0.1; done;'
+                                ' sleep 2; rm "$d/0000.png";; esac\n')
+        self.assertNotEqual(r.returncode, 0); self.assertFalse(mp4)
+        self.assertIn("missing frames: 5 of 6", r.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
