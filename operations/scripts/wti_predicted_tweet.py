@@ -31,7 +31,7 @@ import tweet_v2
 from tweet_guard import enforce, preflight, status as guard_status
 
 # --- Configuration ---
-# Data host from env, no defaults: TPCR_SSH_HOST (ssh target), TPCR_CONTENT_DIR (Step 14 content dir there).
+# Data source from env, no defaults: TPCR_SSH_HOST (ssh target), TPCR_CONTENT_DIR (Step 14 content dir there, or local when TPCR_SSH_HOST is unset).
 # tweet_v2.env_required raises '<NAME> is not set' when one is needed (see operations/tweet_v2/README.md).
 STATE_FILE = Path.home() / "hazeydata" / "reports" / "wti_daily" / "tweet_state.json"
 DISCORD_CHANNEL_ID = "1479351574177513576"
