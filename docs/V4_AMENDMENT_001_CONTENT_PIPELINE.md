@@ -187,7 +187,7 @@ These are separate from the v4 pipeline. They read content JSONs and tweet_state
 > **Superseded for the tweets themselves** (TPCR-TWEET-V2, TPCR-TWEET-RESTYLE-CUTOVER): `operations/scripts/wti_predicted_tweet.py` and
 > `wti_observed_tweet.py` now post the v2 card MP4 with alt text (locked design, tpcr-meta#12), not a Remotion render. During the
 > Oct 29-31 2026 overlap a reply to an old-format original still uses the old Remotion reply (`operations/scripts/tweet_v1_legacy.py`).
-> Tweet text and current behaviour: `operations/tweet_v2/README.md` ("Tweet text (new format)"). The steps and taglines below describe the pre-v2 crons.
+> Tweet text and current behaviour: `operations/tweet_v2/README.md` ("Tweet text (new format)"). The steps and taglines below describe the pre-v2 crons; the jobs are now launchd (`com.hazeydata.tpcr-tweet-*`, see that README's "Scheduling").
 
 ### Predicted Tweet Cron (~4:00 PM ET)
 

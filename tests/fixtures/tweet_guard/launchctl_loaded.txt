@@ -1,4 +1,4 @@
 PID	Status	Label
 -	0	com.apple.Spotlight
--	0	com.hazeydata.wti_predicted_tweet_local
--	0	com.hazeydata.wti_observed_tweet_local
+-	0	com.hazeydata.tpcr-tweet-predicted
+-	0	com.hazeydata.tpcr-tweet-observed

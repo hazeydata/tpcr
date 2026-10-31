@@ -1,0 +1,11 @@
+gui/501/com.hazeydata.tpcr-tweet-observed = {
+	active count = 0
+	path = /Users/fred/Library/LaunchAgents/com.hazeydata.tpcr-tweet-observed.plist
+	state = not running
+	program = /Users/fred/theme-park-crowd-report/.venv/bin/python
+	arguments = {
+		/Users/fred/theme-park-crowd-report/.venv/bin/python
+		/Users/fred/theme-park-crowd-report/operations/scripts/wti_observed_tweet.py
+	}
+	working directory = /Users/fred/theme-park-crowd-report
+}

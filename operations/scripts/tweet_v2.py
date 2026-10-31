@@ -58,6 +58,10 @@ def parse_args(kind, argv=None):
     return ap.parse_args(argv)
 
 
+def dry_run_requested(args, environ=os.environ):
+    return bool(args.dry_run) or environ.get("TPCR_TWEET_DRY_RUN", "0") != "0"
+
+
 def default_reference_date(kind, today=None):
     today = today or date.today()
     return (today + timedelta(days=1) if kind == "predicted" else today - timedelta(days=1)).isoformat()

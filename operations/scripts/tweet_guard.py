@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""Mutual-exclusion guard between legacy crontab tweet jobs and launchd _local tweet jobs.
+"""Pre-post guard for operations/scripts/wti_{observed,predicted}_tweet.py.
+
+The launchd jobs com.hazeydata.tpcr-tweet-observed and com.hazeydata.tpcr-tweet-predicted run these repo scripts.
+A live post is allowed only when no crontab line runs a repo tweet script and every loaded tweet job runs exactly
+<python> <checkout>/<its script> (one arguments block, absolute paths without ~, resolved; a program line, if any,
+must be that same <python> (file name not followed), read in any case/whitespace; checkout, python and scripts from config/tweet_guard.json,
+checkout overridable by TPCR_TWEET_CHECKOUT, python by TPCR_TWEET_PYTHON). Anything else blocks (exit 3):
+an old wti_*_tweet_local.py, another program, no arguments, or unreadable crontab/launchctl.
 
 Usage:
   tweet_guard.py status
-  tweet_guard.py check-local    exit 0 only if the _local job may post
-  tweet_guard.py check-legacy   exit 0 only if the legacy job may post
+  tweet_guard.py check     exit 0 only if a repo tweet script may post
 """
 
 import json
@@ -24,9 +30,26 @@ class GuardBlocked(Exception):
         self.detail = detail
 
 
-def load_config(path=CONFIG_FILE):
+class Config:
+    def __init__(self, cron_patterns, jobs, python, local_patterns):
+        self.cron_patterns = cron_patterns
+        self.jobs = jobs
+        self.labels = list(jobs)
+        self.python = python
+        self.local_patterns = local_patterns
+
+
+def _real(path):
+    p = Path(path).expanduser()
+    return str(Path(os.path.realpath(p.parent)) / p.name)
+
+
+def load_config(path=CONFIG_FILE, environ=os.environ):
     cfg = json.loads(Path(path).read_text())
-    return cfg["legacy_cron_patterns"], cfg["local_launchd_patterns"]
+    checkout = Path(environ.get("TPCR_TWEET_CHECKOUT") or cfg["checkout"]).expanduser()
+    python = checkout / Path(environ.get("TPCR_TWEET_PYTHON") or cfg["python"]).expanduser()
+    jobs = {label: [_real(python), os.path.realpath(checkout / script)] for label, script in cfg["launchd_jobs"].items()}
+    return Config(cfg["legacy_cron_patterns"], jobs, _real(python), cfg["local_script_patterns"])
 
 
 def _run(argv):
@@ -47,6 +70,10 @@ def read_launchctl(runner=_run):
     return runner(["launchctl", "list"])
 
 
+def read_job(label, runner=_run):
+    return runner(["launchctl", "print", f"gui/{os.getuid()}/{label}"])
+
+
 def active_cron_lines(text, patterns):
     regs = [re.compile(p) for p in patterns]
     hits = []
@@ -59,16 +86,66 @@ def active_cron_lines(text, patterns):
     return hits
 
 
-def loaded_local_jobs(text, patterns):
-    regs = [re.compile(p) for p in patterns]
-    hits = []
+def loaded_labels(text, labels):
+    loaded = set()
     for line in text.splitlines():
         cols = line.split()
-        if not cols or cols[-1] == "Label":
-            continue
-        if any(r.search(cols[-1]) for r in regs):
-            hits.append(cols[-1])
-    return hits
+        if cols and cols[-1] in labels:
+            loaded.add(cols[-1])
+    return [l for l in labels if l in loaded]
+
+
+def job_arguments(body):
+    """Arguments of the single `arguments = {` block; None if absent, unclosed or repeated (launchd's would be ambiguous)."""
+    lines = body.splitlines()
+    starts = [i for i, line in enumerate(lines) if line.strip() == "arguments = {"]
+    if len(starts) != 1:
+        return None
+    args = []
+    for inner in lines[starts[0] + 1:]:
+        if inner.strip() == "}":
+            return args
+        args.append(inner.strip())
+    return None
+
+
+def job_programs(body):
+    """Values of every program line, read fail-closed: the key is matched case-insensitively with any whitespace
+    (`program = x`, `program =\tx`, `PROGRAM=x`), and a bare `program` / `program =` gives an empty value."""
+    values = []
+    for line in body.splitlines():
+        key, _, value = line.partition("=")
+        if key.strip().lower() == "program":
+            values.append(value.strip())
+    return values
+
+
+def _literal_abs(arg):
+    # launchd neither expands ~ nor resolves relative paths against our cwd, so only literal absolute paths can match.
+    return "~" not in arg and os.path.isabs(arg)
+
+
+def job_verdict(body, expected, local_patterns):
+    local = sorted({m.group(0) for p in local_patterns for m in re.finditer(p, body)})
+    if local:
+        return "local", ", ".join(local)
+    blocks = sum(1 for line in body.splitlines() if line.strip() == "arguments = {")
+    if blocks > 1:
+        return "unexpected", f"{blocks} arguments blocks"
+    args = job_arguments(body)
+    if not args:
+        return "no_arguments", ""
+    if not all(_literal_abs(a) for a in args):
+        return "unexpected", " ".join(args)
+    programs = job_programs(body)
+    # launchd execs program, so it must be the expected python itself: directories may be resolved (as for argv[0]),
+    # but the file name is not followed, so the venv's target interpreter or another link to it does not count.
+    if len(programs) > 1 or (programs and (not _literal_abs(programs[0]) or _real(programs[0]) != expected[0])):
+        return "unexpected", "program = " + "; ".join(programs)
+    resolved = [_real(args[0])] + [os.path.realpath(a) for a in args[1:]]
+    if resolved != expected:
+        return "unexpected", " ".join(args)
+    return "repo", ""
 
 
 def legacy_side(cron_patterns, runner=_run):
@@ -78,58 +155,74 @@ def legacy_side(cron_patterns, runner=_run):
     return active_cron_lines(text, cron_patterns), ""
 
 
-def local_side(launchd_patterns, runner=_run):
+def launchd_side(cfg, runner=_run):
     text, err = read_launchctl(runner)
     if text is None:
         return None, err
-    return loaded_local_jobs(text, launchd_patterns), ""
+    jobs = []
+    for label in loaded_labels(text, cfg.labels):
+        body, err = read_job(label, runner)
+        if body is None:
+            return None, f"{label}: {err}"
+        jobs.append((label, *job_verdict(body, cfg.jobs[label], cfg.local_patterns)))
+    return jobs, ""
 
 
-def preflight_local(runner=_run, config=CONFIG_FILE):
-    cron_patterns, _ = load_config(config)
-    hits, err = legacy_side(cron_patterns, runner)
+BLOCK_REASON = {"local": "launchd_runs_local_script", "no_arguments": "launchd_job_no_arguments",
+                "unexpected": "launchd_unexpected_program"}
+
+
+def preflight(runner=_run, config=CONFIG_FILE):
+    cfg = load_config(config)
+    hits, err = legacy_side(cfg.cron_patterns, runner)
     if hits is None:
         raise GuardBlocked("crontab_unreadable", err)
     if hits:
         raise GuardBlocked("legacy_cron_active", "; ".join(hits))
-
-
-def preflight_legacy(runner=_run, config=CONFIG_FILE):
-    _, launchd_patterns = load_config(config)
-    hits, err = local_side(launchd_patterns, runner)
-    if hits is None:
+    jobs, err = launchd_side(cfg, runner)
+    if jobs is None:
         raise GuardBlocked("launchctl_unreadable", err)
-    if hits:
-        raise GuardBlocked("local_launchd_loaded", "; ".join(hits))
+    bad = [(label, verdict, detail) for label, verdict, detail in jobs if verdict != "repo"]
+    if bad:
+        raise GuardBlocked(BLOCK_REASON[bad[0][1]], "; ".join(f"{l} -> {d or v}" for l, v, d in bad))
 
 
-def enforce(preflight):
+def enforce(check):
     try:
-        preflight()
+        check()
     except GuardBlocked as e:
         print(f"tweet_guard: {e.reason} {e.detail}".rstrip(), file=sys.stderr)
         sys.exit(3)
 
 
+STATUS_TEXT = {"repo": "runs repo script", "local": "runs local script", "no_arguments": "no program arguments",
+               "unexpected": "runs unexpected program"}
+
+
 def status(runner=_run, config=CONFIG_FILE):
-    cron_patterns, launchd_patterns = load_config(config)
-    cron_hits, cron_err = legacy_side(cron_patterns, runner)
-    local_hits, local_err = local_side(launchd_patterns, runner)
+    cfg = load_config(config)
+    cron_hits, cron_err = legacy_side(cfg.cron_patterns, runner)
+    jobs, job_err = launchd_side(cfg, runner)
     lines = []
     if cron_hits is None:
         lines.append(f"legacy_cron: unreadable ({cron_err})")
     else:
         lines.append(f"legacy_cron: {'active' if cron_hits else 'inactive'} ({len(cron_hits)} line(s))")
         lines.extend(f"  {h}" for h in cron_hits)
-    if local_hits is None:
-        lines.append(f"local_launchd: unreadable ({local_err})")
+    if jobs is None:
+        lines.append(f"launchd: unreadable ({job_err})")
     else:
-        lines.append(f"local_launchd: {'loaded' if local_hits else 'not loaded'} ({len(local_hits)} job(s))")
-        lines.extend(f"  {h}" for h in local_hits)
-    local_ok = cron_hits == []
-    legacy_ok = local_hits == []
-    lines.append(f"allowed_local: {'yes' if local_ok else 'no'}")
-    lines.append(f"allowed_legacy: {'yes' if legacy_ok else 'no'}")
+        lines.append(f"launchd: {len(jobs)} of {len(cfg.labels)} tweet job(s) loaded")
+        loaded = {label: (verdict, detail) for label, verdict, detail in jobs}
+        for label in cfg.labels:
+            if label not in loaded:
+                lines.append(f"  {label}: not loaded")
+                continue
+            verdict, detail = loaded[label]
+            lines.append(f"  {label}: {STATUS_TEXT[verdict]}" + (f" ({detail})" if detail else ""))
+    lines.append(f"expected: {cfg.python} <checkout>/operations/scripts/wti_*_tweet.py")
+    ok = cron_hits == [] and jobs is not None and all(v == "repo" for _, v, _ in jobs)
+    lines.append(f"allowed_post: {'yes' if ok else 'no'}")
     return "\n".join(lines)
 
 
@@ -139,10 +232,9 @@ def main(argv=None, runner=_run):
     if cmd == "status":
         print(status(runner))
         return 0
-    if cmd in ("check-local", "check-legacy"):
-        pre = preflight_local if cmd == "check-local" else preflight_legacy
+    if cmd == "check":
         try:
-            pre(runner)
+            preflight(runner)
         except GuardBlocked as e:
             print(f"tweet_guard: {e.reason} {e.detail}".rstrip(), file=sys.stderr)
             return 3
