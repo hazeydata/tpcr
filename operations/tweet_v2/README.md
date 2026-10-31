@@ -22,8 +22,10 @@ For park day D:
 | `headline_copy.py` | Every fallback headline ("All open parks normal", "<Park> normal", "All open parks within 3 of forecast", and the all-four lines). Final copy from Lindsay; `cards.py` takes them only from here. |
 
 Scripts find `build_day.sh` via `TPCR_TWEET_V2_DIR` (default: `operations/tweet_v2` in this checkout).
-Data host (no defaults; `tweet_v2.py`, `wti_observed_tweet.py` and `wti_predicted_tweet.py` stop with `<NAME> is not set` if one is needed and unset): `TPCR_SSH_HOST` (ssh target for the data host),
+Data source (no defaults; `tweet_v2.py`, `wti_observed_tweet.py` and `wti_predicted_tweet.py` stop with `<NAME> is not set` if one is needed and unset): `TPCR_SSH_HOST` (ssh target for the data host),
 `TPCR_CONTENT_DIR` (Step 14 content dir there; not needed with `--content-dir`), `TPCR_WTI_PARQUET` (wti.parquet path there; not needed with `--history`).
+With `TPCR_SSH_HOST` unset (the Mini, where the pipeline writes locally) there is no ssh/scp: content is read from the local `TPCR_CONTENT_DIR` and the parquet from the local `TPCR_WTI_PARQUET`.
+An unset var or a missing path stops the run with `config_missing: <NAME> is not set` / `config_missing: <NAME> path does not exist: <path>`. The old-format reply render (`tweet_v1_legacy.py`) still needs `TPCR_SSH_HOST`.
 Env for `build_day.sh`: `PY` (python with pandas + pyarrow), `PYIMG` (python with Pillow, default `PY`), `CHROME`, `FFMPEG`.
 
 ## Scheduling (Mac Mini launchd)
@@ -185,7 +187,7 @@ closed). Runs that stop before the build write no `dry_run.json`; they only prin
 python3 operations/scripts/wti_predicted_tweet.py --dry-run --date 2026-10-29 --out /tmp/f29
 python3 operations/scripts/wti_observed_tweet.py  --dry-run --date 2026-10-29 --out /tmp/o29
 ```
-Optional: `--content-dir DIR` (local `predicted_D.json`/`observed_D.json` instead of wilma over ssh), `--history wti.parquet`,
+Optional: `--content-dir DIR` (local `predicted_D.json`/`observed_D.json` instead of `TPCR_CONTENT_DIR`), `--history wti.parquet`,
 `--state-file`, `--park-hours dimparkhours.csv`, `--closures closures.csv`.
 
 ## Tests

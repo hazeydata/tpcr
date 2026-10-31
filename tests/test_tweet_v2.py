@@ -811,14 +811,54 @@ class SourceHygieneTest(unittest.TestCase):
                 self.assertEqual(mod.ssh_read_file("/c/f.json"), "ok")
                 self.assertEqual(run.call_args[0][0][:2], ["ssh", "datahost"])
 
-    def test_unset_data_host_env_fails_clearly(self):
+    def test_unset_host_and_dirs_fail_config_missing(self):
         import os as _os
         from unittest import mock as _mock
-        with _mock.patch.dict(_os.environ, {}, clear=True):
-            with self.assertRaisesRegex(RuntimeError, "TPCR_CONTENT_DIR is not set"):
-                tweet_v2.read_content("predicted_2026-10-27.json", ssh_read=lambda p: "x")
-            with self.assertRaisesRegex(RuntimeError, "TPCR_SSH_HOST is not set"):
+        ssh = _mock.Mock(side_effect=AssertionError("ssh ran"))
+        with _mock.patch.dict(_os.environ, {}, clear=True), _mock.patch.object(tweet_v2.subprocess, "run", ssh):
+            with self.assertRaisesRegex(RuntimeError, "config_missing: TPCR_CONTENT_DIR is not set"):
+                tweet_v2.read_content("predicted_2026-10-27.json", ssh_read=ssh)
+            with self.assertRaisesRegex(RuntimeError, "config_missing: TPCR_WTI_PARQUET is not set"):
                 tweet_v2.fetch_history("/nonexistent-work")
+        with _mock.patch.dict(_os.environ, {"TPCR_CONTENT_DIR": "/nonexistent-c", "TPCR_WTI_PARQUET": "/nonexistent-w.parquet"}, clear=True), \
+                _mock.patch.object(tweet_v2.subprocess, "run", ssh):
+            with self.assertRaisesRegex(RuntimeError, "config_missing: TPCR_CONTENT_DIR path does not exist: /nonexistent-c"):
+                tweet_v2.read_content("predicted_2026-10-27.json", ssh_read=ssh)
+            with self.assertRaisesRegex(RuntimeError, "config_missing: TPCR_WTI_PARQUET path does not exist"):
+                tweet_v2.fetch_history("/nonexistent-work")
+
+    def test_unset_host_reads_local_content_and_parquet(self):
+        import os as _os, tempfile as _tmp
+        from unittest import mock as _mock
+        ssh = _mock.Mock(side_effect=AssertionError("ssh ran"))
+        with _tmp.TemporaryDirectory() as d:
+            (Path(d) / "predicted_2026-10-27.json").write_text('{"a": 1}')
+            pq = Path(d) / "wti.parquet"
+            pq.write_bytes(b"PAR1")
+            with _mock.patch.dict(_os.environ, {"TPCR_CONTENT_DIR": d, "TPCR_WTI_PARQUET": str(pq)}, clear=True), \
+                    _mock.patch.object(tweet_v2.subprocess, "run", ssh):
+                self.assertEqual(tweet_v2.read_content("predicted_2026-10-27.json", ssh_read=ssh), '{"a": 1}')
+                self.assertIsNone(tweet_v2.read_content("observed_2026-10-26.json", ssh_read=ssh))
+                self.assertEqual(tweet_v2.fetch_history(d), pq)
+            for mod in (wot, wpt):
+                with self.subTest(script=mod.__name__), _mock.patch.dict(_os.environ, {"TPCR_CONTENT_DIR": d}, clear=True), \
+                        _mock.patch.object(mod.subprocess, "run", ssh):
+                    self.assertEqual(tweet_v2.read_content("predicted_2026-10-27.json", None, mod.ssh_read_file), '{"a": 1}')
+
+    def test_set_host_still_uses_ssh_and_scp(self):
+        import os as _os, tempfile as _tmp
+        from unittest import mock as _mock
+        env = {"TPCR_SSH_HOST": "datahost", "TPCR_CONTENT_DIR": "/c", "TPCR_WTI_PARQUET": "/w/wti.parquet"}
+        with _tmp.TemporaryDirectory() as d, _mock.patch.dict(_os.environ, env, clear=True):
+            seen = []
+            self.assertEqual(tweet_v2.read_content("p.json", ssh_read=lambda p: seen.append(p) or "x"), "x")
+            self.assertEqual(seen, ["/c/p.json"])
+            def scp(cmd, **kw):
+                Path(cmd[-1]).write_bytes(b"PAR1")
+                return _mock.Mock(returncode=0, stderr="")
+            with _mock.patch.object(tweet_v2.subprocess, "run", side_effect=scp) as run:
+                self.assertEqual(tweet_v2.fetch_history(d), Path(d) / "wti.parquet")
+            self.assertEqual(run.call_args[0][0][:3], ["scp", "-q", "datahost:/w/wti.parquet"])
 
 
 # TPCR-TWEET-RESTYLE-CUTOVER: the suites above test the new-format path, so they run as if the old format had

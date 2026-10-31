@@ -24,12 +24,19 @@ ROOT = Path(__file__).resolve().parents[2]
 # copies in ~/hazeydata/scripts). Default: this repo's operations/tweet_v2.
 BUILD_DAY = Path(os.environ.get("TPCR_TWEET_V2_DIR") or ROOT / "operations" / "tweet_v2") / "build_day.sh"
 # Data host and paths come from the environment only (no machine-specific defaults in source).
-# TPCR_SSH_HOST (ssh target), TPCR_CONTENT_DIR (Step 14 content dir on that host), TPCR_WTI_PARQUET (wti.parquet path there).
+# TPCR_SSH_HOST (ssh target), TPCR_CONTENT_DIR (Step 14 content dir), TPCR_WTI_PARQUET (wti.parquet path): on that host, or local paths when TPCR_SSH_HOST is unset.
 def env_required(name):
     v = os.environ.get(name, "").strip()
     if not v:
         raise RuntimeError(f"{name} is not set; export it (see operations/tweet_v2/README.md) or pass --content-dir/--history")
     return v
+
+
+def local_path(name):
+    v = os.environ.get(name, "").strip()
+    if not v or not Path(v).exists():
+        raise RuntimeError(f"config_missing: {name} " + (f"path does not exist: {v}" if v else "is not set"))
+    return Path(v)
 
 TWITTER_METADATA_API = "https://upload.twitter.com/1.1/media/metadata/create.json"
 ALT_MAX = 1000
@@ -80,6 +87,8 @@ def block_http_for_dry_run():
 
 def read_content(name, content_dir=None, ssh_read=None):
     """Return the raw JSON text of a Step 14 content file, or None."""
+    if not content_dir and not os.environ.get("TPCR_SSH_HOST", "").strip():
+        content_dir = local_path("TPCR_CONTENT_DIR")
     if content_dir:
         p = Path(content_dir) / name
         return p.read_text() if p.exists() else None
@@ -89,6 +98,8 @@ def read_content(name, content_dir=None, ssh_read=None):
 def fetch_history(work, local=None):
     if local:
         return Path(local)
+    if not os.environ.get("TPCR_SSH_HOST", "").strip():
+        return local_path("TPCR_WTI_PARQUET")
     dst = Path(work) / "wti.parquet"
     r = subprocess.run(["scp", "-q", f"{env_required('TPCR_SSH_HOST')}:{env_required('TPCR_WTI_PARQUET')}", str(dst)], capture_output=True, text=True, timeout=120)
     if r.returncode != 0 or not dst.exists():
