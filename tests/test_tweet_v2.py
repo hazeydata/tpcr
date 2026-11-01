@@ -355,7 +355,8 @@ class LivePosting(Base):
     def test_observed_staleness_reads_parquet_last_date(self):
         try:
             import pandas as pd
-            pd.DataFrame({"park_date": ["2026-09-03", "2026-09-04"]}).to_parquet(self.tmp / "w.parquet")
+            pd.DataFrame({"park_date": ["2026-09-03", "2026-09-04"], "park_code": ["MK", "MK"], "wti": [40.0, 41.0],
+                          "source": ["historical", "historical"]}).to_parquet(self.tmp / "w.parquet")
         except ImportError:
             self.skipTest("pandas/pyarrow not installed")
         with mock.patch.object(tweet_v2, "parquet_last_date", REAL_PARQUET_LAST_DATE):
@@ -363,6 +364,48 @@ class LivePosting(Base):
             self.assertIn("2026-09-04 != target", tweet_v2.observed_staleness(self.tmp / "w.parquet", D))
             self.assertIsNone(tweet_v2.observed_staleness(self.tmp / "w.parquet", "2026-09-04"))
             self.assertIn("unreadable", tweet_v2.observed_staleness(self.tmp / "missing.parquet", D))
+
+    def test_naive_generated_at_from_s14_is_mini_local_toronto(self):
+        """rev7g: s14_content writes naive datetime.now().isoformat(); read it as America/Toronto, not stale."""
+        from datetime import datetime
+        at = datetime.fromisoformat("2026-11-01T16:00:00-05:00")  # 4 PM ET on D-1
+        naive = content("2026-11-02", [1, 2, 3, 4], generated_at="2026-11-01T06:17:51.720703")
+        self.assertIsNone(tweet_v2.forecast_staleness(naive, "2026-11-02", at))
+        aware = content("2026-11-02", [1, 2, 3, 4], generated_at="2026-11-01T06:17:51.720703-05:00")
+        self.assertIsNone(tweet_v2.forecast_staleness(aware, "2026-11-02", at))
+        zulu = content("2026-11-02", [1, 2, 3, 4], generated_at="2026-11-01T11:17:51Z")
+        self.assertIsNone(tweet_v2.forecast_staleness(zulu, "2026-11-02", at))
+        old = content("2026-11-02", [1, 2, 3, 4], generated_at="2026-10-30T06:17:51.720703")  # naive, 57.7h old
+        self.assertIn("old", tweet_v2.forecast_staleness(old, "2026-11-02", at))
+        bad = content("2026-11-02", [1, 2, 3, 4], generated_at="not-a-time")
+        self.assertIn("unreadable", tweet_v2.forecast_staleness(bad, "2026-11-02", at))
+
+    def _wti_parquet(self, rows):
+        try:
+            import pandas as pd
+            pd.DataFrame(rows, columns=["park_date", "park_code", "wti", "source"]).to_parquet(self.tmp / "wti.parquet")
+        except ImportError:
+            self.skipTest("pandas/pyarrow not installed")
+        return self.tmp / "wti.parquet"
+
+    def test_observed_staleness_ignores_future_forecast_rows(self):
+        """rev7g: real wti.parquet has forecast rows to 2028; observed rows for the target are what count."""
+        p = self._wti_parquet([("2026-10-30", "MK", 40.1, "historical"), ("2026-10-31", "MK", 42.3, "historical"),
+                               ("2026-10-31", "EP", 38.0, "historical"), ("NaT", "MK", None, "historical"),
+                               ("2026-10-31", "MK", 41.0, "forecast"), ("2026-11-01", "MK", 44.0, "forecast"),
+                               ("2028-03-20", "MK", 39.5, "forecast")])
+        with mock.patch.object(tweet_v2, "parquet_last_date", REAL_PARQUET_LAST_DATE):
+            self.assertEqual(tweet_v2.parquet_last_date(p), "2026-10-31")
+            self.assertIsNone(tweet_v2.observed_staleness(p, "2026-10-31"))
+
+    def test_observed_staleness_no_observed_rows_for_target_is_stale(self):
+        p = self._wti_parquet([("2026-10-30", "MK", 40.1, "historical"), ("2026-10-31", "MK", None, "historical"),
+                               ("2026-10-31", "MK", 41.0, "forecast"), ("2028-03-20", "MK", 39.5, "forecast")])
+        with mock.patch.object(tweet_v2, "parquet_last_date", REAL_PARQUET_LAST_DATE):
+            self.assertIn("2026-10-30 != target 2026-10-31", tweet_v2.observed_staleness(p, "2026-10-31"))
+        p = self._wti_parquet([("2026-10-31", "MK", 41.0, "forecast"), ("2028-03-20", "MK", 39.5, "forecast")])
+        with mock.patch.object(tweet_v2, "parquet_last_date", REAL_PARQUET_LAST_DATE):
+            self.assertIn("None != target 2026-10-31", tweet_v2.observed_staleness(p, "2026-10-31"))
 
     def test_park_hours_unreadable_alerts_once(self):
         """AC 2a: unreadable hours -> one park_hours_unreadable alert per run; nothing shows Closed."""
@@ -503,13 +546,12 @@ class LivePosting(Base):
                             "--state-file", str(self.state), "--out", str(self.tmp / "dry")])
         self.assertEqual(p.read_text(), before)
 
-    def test_naive_generated_at_is_stale(self):
-        """F05: generated_at with no timezone is stale (fail safe), even when its wall time looks fresh."""
+    def test_naive_generated_at_is_mini_local(self):
+        """F05 (revised rev7h): a naive generated_at is Mini-local America/Toronto, judged on age like an aware one."""
         from datetime import datetime
-        why = tweet_v2.forecast_staleness(content(D, [1, 2, 3, 4], generated_at="2026-10-27T10:00:00"), D,
-                                          datetime.fromisoformat(NOW))
-        self.assertIsNotNone(why)
-        self.assertIn("timezone", why)
+        at = datetime.fromisoformat(NOW)
+        self.assertIsNone(tweet_v2.forecast_staleness(content(D, [1, 2, 3, 4], generated_at="2026-10-27T10:00:00"), D, at))
+        self.assertIn("old", tweet_v2.forecast_staleness(content(D, [1, 2, 3, 4], generated_at="2026-10-26T03:00:00"), D, at))
 
     def test_parquet_ending_after_target_is_stale(self):
         """F10: wti.parquet whose last date is after D is not 'ends on D' -> skipped_stale, no build, no post."""

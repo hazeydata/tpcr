@@ -122,8 +122,10 @@ A parallel transition. The window lives only in `config/tweet_format.json` (read
    AC 5b (R5): a `skipped_stale` day neither counts toward the streak nor resets it, so skip, stale, skip alerts on the second skip.
    Dry runs log it but write no streak state. Crashes and API errors (upload, alt text, tweet) still exit 1.
 4. Freshness (AC 16): the forecast posts only if the content's `generated_at` is within 36h of the run (final, R5 closed OQ-6) and its
-   ET date is on or after D - 1; missing `generated_at` counts as stale. The reply posts only if `wti.parquet`'s last `park_date`
-   equals D. Otherwise `skipped_stale`: exit 0, one Discord alert, nothing built or posted.
+   ET date is on or after D - 1; missing or unparseable `generated_at` counts as stale. A naive `generated_at` (what s14_content
+   writes, e.g. `2026-11-01T06:17:51.720703`) is read as Mini-local America/Toronto; aware values keep their offset (rev7h).
+   The reply posts only if the last `park_date` of `wti.parquet`'s observed rows (`source = 'historical'`, `wti` non-null)
+   equals D, i.e. D's observed rows exist. Forecast rows (`source = 'forecast'`, which run years ahead) are ignored (rev7h). Otherwise `skipped_stale`: exit 0, one Discord alert, nothing built or posted.
 5. Unreadable `--park-hours` file (AC 2a): every park `unknown` (silent, never Closed) and one `park_hours_unreadable` alert per run.
 6. Build the card. No card (missing data, partial observed, bad content) = silent (Fred, Oct 26: "Stay silent on missing-data days"). No text-only fallback.
 7. Upload the MP4 (v1.1 chunked INIT/APPEND/FINALIZE), then set alt text with `POST /1.1/media/metadata/create.json`
@@ -180,7 +182,7 @@ Both scripts take `--dry-run` (or `TPCR_TWEET_DRY_RUN` set to anything but unset
 writes no state (no tweet state, no no-data streak). A dry run that reaches the build step writes `dry_run.json`
 (would_post, posts_at, text, media, alt text, reply target, guard status; `result: skipped_all_closed` when every park is
 closed). Runs that stop before the build write no `dry_run.json`; they only print the log line: `skipped_no_data`,
-`skipped_stale` (forecast content, or wti.parquet not ending on D), "Already posted" (idempotency guard), and a bad
+`skipped_stale` (forecast content, or wti.parquet's observed rows not ending on D), "Already posted" (idempotency guard), and a bad
 `closures.csv` (exit 1).
 
 ```
