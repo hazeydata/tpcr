@@ -38,6 +38,51 @@ def local_path(name):
         raise RuntimeError(f"config_missing: {name} " + (f"path does not exist: {v}" if v else "is not set"))
     return Path(v)
 
+PROFILE_URL = "https://x.com/HazeyDataFred"  # rev7i: the account the tweet jobs post as
+
+
+def status_url(tweet_id):
+    return f"{PROFILE_URL}/status/{tweet_id}" if tweet_id else f"{PROFILE_URL} (tweet id missing)"
+
+
+class PostedWithoutId(str):
+    """post_tweet result when X returned 2xx (the tweet exists) but no id could be read. Falsy like "", but a
+    caller must check it before the plain failure branch: it is a successful post, not a failed one."""
+
+
+ID_MISSING = PostedWithoutId("")
+
+
+def parse_tweet_id(body):
+    """Tweet id from a create-tweet result. X API v2 JSON is {"data": {"id": "...", "text": "..."}}; a tweepy
+    Response carries the same dict on .data. Also accepts a bare {"id"/"id_str"} (v1.1). Returns str or None."""
+    data = body.get("data") if isinstance(body, dict) else getattr(body, "data", None)
+    for src in (data, body):
+        if isinstance(src, dict):
+            v = src.get("id") or src.get("id_str")
+        else:
+            v = getattr(src, "id", None) if src is not None and not isinstance(src, (str, bytes, list)) else None
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return None
+
+
+def tweet_id_from_response(resp):
+    """requests.Response from POST /2/tweets -> (posted, tweet_id). posted is True on any 2xx; tweet_id may be None."""
+    if not 200 <= resp.status_code < 300:
+        return False, None
+    try:
+        body = resp.json()
+    except ValueError:
+        body = None
+    return True, parse_tweet_id(body)
+
+
+def already_posted(entry):
+    """Idempotency (#468): a state entry means posted if it has a tweet_id, or was saved with id_missing (rev7i)."""
+    return bool(entry and (entry.get("tweet_id") or entry.get("id_missing")))
+
+
 TWITTER_METADATA_API = "https://upload.twitter.com/1.1/media/metadata/create.json"
 ALT_MAX = 1000
 # Closed-row R3: the hand-filled closures file, the only closure source. Runs outside a checkout set TPCR_CLOSURES.
