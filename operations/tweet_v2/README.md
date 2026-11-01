@@ -132,6 +132,21 @@ A parallel transition. The window lives only in `config/tweet_format.json` (read
    `{media_id, alt_text:{text}}`. Alt text failure = no tweet (fail closed).
 8. Post (v2 tweets), save `predicted[D]` / `observed[D]` in `tweet_state.json`. A second run for the same D posts nothing (#468).
 
+## Tweet id, state and links (rev7i, TPCR-TWEET-LOCAL)
+
+- **Id parsing:** both jobs' `post_tweet` read the id with `tweet_v2.tweet_id_from_response` / `parse_tweet_id`: X API v2
+  `{"data": {"id": "...", "text": "..."}}` (also a tweepy-style object with `.data`, or a bare v1.1 `id`/`id_str`). Non-2xx =
+  failed post: `Twitter API error ...`, `:x:` alert, exit 1, nothing saved (unchanged).
+- **Posted but no id:** 2xx with no readable id returns `tweet_v2.ID_MISSING`. That is a successful post: the job saves
+  `observed[D]` / `predicted[D]` with `tweet_id: null, id_missing: true` (so a re-run never posts twice; the idempotency
+  check is `tweet_v2.already_posted`), sends one `:warning: ... posted, id missing` alert and exits 0.
+- **Recording a missed id:** `python3 operations/scripts/tweet_state_record.py --kind observed --date D --tweet-id ID
+  [--reply-to ID] [--state-file PATH]` writes the entry with the job's own `save_state` (same file, same format; `posted_at` from
+  the id's snowflake time) and tags it in `tweet_formats.json`. Same id again = `unchanged`, nothing written; a different id
+  already recorded = exit 1, untouched. It blocks all HTTP, so it can never post.
+- **Links:** Discord success messages link `https://x.com/HazeyDataFred/status/<id>` (`tweet_v2.status_url`).
+- **Alt text:** every MP4 gets alt text via v1.1 `media/metadata/create` (`tweet_v2.set_alt_text`) before the tweet; no alt text = no tweet.
+
 ## Edge cases (edge copy v2)
 - Headline: `<Park> busy`, `<Park> quiet` or `All four parks normal`; no "today". Exact tie names every tied park in order MK, EP, HS, AK.
 - `{lo}–{hi}` is each park's own p25–p75; only the axis label is the shared 10–35 scale.

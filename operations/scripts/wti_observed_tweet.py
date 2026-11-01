@@ -157,7 +157,7 @@ def load_content(reference_date, content_dir=None):
     return None, None
 
 
-def save_state(tweet_id, reference_date, reply_to):
+def save_state(tweet_id, reference_date, reply_to, posted_at=None):
     """Record the observed tweet under observed[D] so the #468 idempotency check can see it."""
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     with tweet_note.locked(STATE_FILE):
@@ -168,9 +168,11 @@ def save_state(tweet_id, reference_date, reply_to):
             except json.JSONDecodeError:
                 pass
         state.setdefault("observed", {})[reference_date] = {
-            "tweet_id": tweet_id, "in_reply_to": reply_to,
-            "posted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "tweet_id": tweet_id or None, "in_reply_to": reply_to,
+            "posted_at": posted_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
+        if not tweet_id:  # rev7i: posted (2xx) but the id was unreadable; blocks a re-post (see idempotency guard)
+            state["observed"][reference_date]["id_missing"] = True
         cutoff = (date.today() - timedelta(days=14)).isoformat()
         state["observed"] = {k: v for k, v in state["observed"].items() if k >= cutoff}
         tweet_note._save(STATE_FILE, state)
@@ -231,14 +233,16 @@ def post_tweet(text, reply_to=None, media_id=None):
         payload["media"] = {"media_ids": [media_id]}
 
     resp = requests.post(TWITTER_API, json=payload, auth=auth, timeout=30)
-    if resp.status_code in (200, 201):
-        data = resp.json()
-        tweet_id = data["data"]["id"]
-        print(f"Tweet posted: {tweet_id}" + (f" (reply to {reply_to})" if reply_to else ""))
-        return tweet_id
-    else:
+    posted, tweet_id = tweet_v2.tweet_id_from_response(resp)
+    if not posted:
         print(f"Twitter API error {resp.status_code}: {resp.text}", file=sys.stderr)
         return None
+    if not tweet_id:
+        # rev7i: X accepted the tweet but no id was readable. Not a failed post: return ID_MISSING (falsy).
+        print(f"ERROR: Tweet posted (HTTP {resp.status_code}) but no tweet id in response: {resp.text[:500]}", file=sys.stderr)
+        return tweet_v2.ID_MISSING
+    print(f"Tweet posted: {tweet_id}" + (f" (reply to {reply_to})" if reply_to else ""))
+    return tweet_id
 
 
 def post_discord(message):
@@ -251,6 +255,18 @@ def post_discord(message):
         headers={"Authorization": f"Bot {token}", "Content-Type": "application/json"},
         timeout=15,
     )
+
+
+def posted_without_id(reference_date, reply_to):
+    """rev7i: X returned 2xx but no readable id. The reply exists, so record observed[D] (id_missing) so a re-run
+    cannot post twice, and alert loudly as a warning, not as a failed tweet. Exit 0: this is not a post failure."""
+    save_state(None, reference_date, reply_to)
+    msg = (f":warning: **WTI Observed Tweet posted, id missing** \u2014 ref={reference_date}: X accepted the reply to "
+           f"{reply_to} but returned no tweet id. observed[{reference_date}] saved with id_missing; record the id with "
+           "operations/scripts/tweet_state_record.py. " + tweet_v2.PROFILE_URL)
+    print(msg, file=sys.stderr)
+    post_discord(msg[:1900])
+    return None
 
 
 def reply_old_format(reference_date, content, reply_to, how, fmt_why, dry, args, state_file, guard):
@@ -279,6 +295,8 @@ def reply_old_format(reference_date, content, reply_to, how, fmt_why, dry, args,
             post_discord(f":x: **WTI Observed Tweet** \u2014 ref={reference_date}: video upload failed, nothing posted")
             sys.exit(1)
         tweet_id = post_tweet(r["text"], reply_to=reply_to, media_id=media_id)
+        if tweet_id is tweet_v2.ID_MISSING:
+            return posted_without_id(reference_date, reply_to)
         if not tweet_id:
             post_discord(":x: **WTI Observed Tweet** \u2014 Twitter API error, tweet failed")
             sys.exit(1)
@@ -286,7 +304,7 @@ def reply_old_format(reference_date, content, reply_to, how, fmt_why, dry, args,
         tweet_format.record(state_file, tweet_id, tweet_format.OLD, "observed", reference_date,
                             time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         post_discord(f":white_check_mark: **WTI Observed Tweet posted** (reply, old format) \u2014 ref={reference_date}\n"
-                     f"Replied to predicted tweet: {reply_to}\nhttps://x.com/DisneyStatsWhiz/status/{tweet_id}")
+                     f"Replied to predicted tweet: {reply_to}\n" + tweet_v2.status_url(tweet_id))
         print("Done.")
     finally:
         tweet_v2.cleanup(tmp)
@@ -331,7 +349,7 @@ def main(argv=None):
     if state_file.exists():
         try:
             existing = json.loads(state_file.read_text())
-            if existing.get("observed", {}).get(reference_date, {}).get("tweet_id"):
+            if tweet_v2.already_posted(existing.get("observed", {}).get(reference_date)):
                 print(f"Already posted observed tweet for {reference_date}, exiting.")
                 return None
         except (json.JSONDecodeError, KeyError):
@@ -414,6 +432,8 @@ def main(argv=None):
             sys.exit(1)
 
         tweet_id = post_tweet(tweet_text, reply_to=reply_to, media_id=media_id)
+        if tweet_id is tweet_v2.ID_MISSING:
+            return posted_without_id(reference_date, reply_to)
         if not tweet_id:
             post_discord(":x: **WTI Observed Tweet** \u2014 Twitter API error, tweet failed")
             sys.exit(1)
@@ -425,7 +445,7 @@ def main(argv=None):
             f":white_check_mark: **WTI Observed Tweet posted** (reply) \u2014 ref={reference_date}"
             "\n"
             f"Replied to predicted tweet: {reply_to}\n"
-            f"https://x.com/DisneyStatsWhiz/status/{tweet_id}"
+            f"{tweet_v2.status_url(tweet_id)}"
         )
         print("Done.")
     finally:
