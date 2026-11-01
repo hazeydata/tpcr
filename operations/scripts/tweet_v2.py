@@ -268,6 +268,8 @@ def check_closures(kind, reference_date, path, alert):
 # AC 16 (closed-row R4): freshness. 36h is final (R5 closed OQ-6).
 FORECAST_MAX_AGE_H = 36
 ET = "America/New_York"
+MINI_TZ = "America/Toronto"  # s14_content writes generated_at as naive datetime.now() in the Mini's local zone
+OBSERVED_SOURCE = "historical"  # s09_wti tags observed WTI rows source='historical'; forecast rows are 'forecast'
 
 
 def now():
@@ -278,14 +280,15 @@ def now():
 
 def forecast_staleness(raw, D, at=None):
     """None if predicted content is fresh, else the reason. Fresh = generated_at within FORECAST_MAX_AGE_H of the run
-    and its ET date on or after D - 1. Missing or unparseable generated_at counts as stale (fail safe)."""
+    and its ET date on or after D - 1. Missing or unparseable generated_at counts as stale (fail safe).
+    A naive generated_at (s14_content's datetime.now().isoformat()) is read as Mini-local MINI_TZ; aware values keep their offset."""
     from datetime import datetime
     from zoneinfo import ZoneInfo
     at = at or now()
     try:
         g = datetime.fromisoformat(str(json.loads(raw)["generated_at"]).replace("Z", "+00:00"))
         if g.tzinfo is None:
-            raise ValueError("generated_at has no timezone")
+            g = g.replace(tzinfo=ZoneInfo(MINI_TZ))
     except (KeyError, ValueError, TypeError, json.JSONDecodeError) as e:
         return f"generated_at missing or unreadable ({e})"
     age_h = (at - g).total_seconds() / 3600
@@ -297,18 +300,22 @@ def forecast_staleness(raw, D, at=None):
 
 
 def parquet_last_date(path):
+    """Last park_date with observed WTI (source == OBSERVED_SOURCE, wti non-null). Forecast rows run years ahead, so
+    they are excluded. None if there are no observed rows."""
     import pandas as pd
-    h = pd.read_parquet(path, columns=["park_date"])
-    return None if h.empty else pd.to_datetime(h.park_date).max().date().isoformat()
+    h = pd.read_parquet(path, columns=["park_date", "source", "wti"])
+    h = h[(h.source == OBSERVED_SOURCE) & h.wti.notna()]
+    d = pd.to_datetime(h.park_date, errors="coerce").dropna()  # park_date is VARCHAR and may hold 'NaT'
+    return None if d.empty else d.max().date().isoformat()
 
 
 def observed_staleness(history, D):
-    """None if wti.parquet's last date equals D, else the reason."""
+    """None if wti.parquet's last observed (source='historical') date equals D, i.e. D's observed rows exist; else the reason."""
     try:
         last = parquet_last_date(history)
     except Exception as e:  # noqa: BLE001 - unreadable parquet is stale data, not a post
         return f"wti.parquet unreadable ({e})"
-    return None if last == D else f"wti.parquet last date {last} != target {D}"
+    return None if last == D else f"wti.parquet last observed date {last} != target {D}"
 
 
 def record_stale(kind, reference_date, why, alert, state_file=None, dry=False):
