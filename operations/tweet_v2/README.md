@@ -143,7 +143,8 @@ A parallel transition. The window lives only in `config/tweet_format.json` (read
 - **Recording a missed id:** `python3 operations/scripts/tweet_state_record.py --kind observed --date D --tweet-id ID
   [--reply-to ID] [--state-file PATH]` writes the entry with the job's own `save_state` (same file, same format; `posted_at` from
   the id's snowflake time) and tags it in `tweet_formats.json`. Same id again = `unchanged`, nothing written; a different id
-  already recorded = exit 1, untouched. It blocks all HTTP, so it can never post.
+  already recorded = exit 1, untouched. It blocks all HTTP, so it can never post. Both jobs' `save_state` prune entries older
+  than 14 days but never the day being saved, so a backfill of an older day is kept.
 - **Links:** Discord success messages link `https://x.com/HazeyDataFred/status/<id>` (`tweet_v2.status_url`).
 - **Alt text:** every MP4 gets alt text via v1.1 `media/metadata/create` (`tweet_v2.set_alt_text`) before the tweet; no alt text = no tweet.
 

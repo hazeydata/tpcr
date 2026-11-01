@@ -69,7 +69,10 @@ def main(argv=None):
         job.tweet_format.record(state_file, args.tweet_id, job.tweet_format.NEW, "observed", args.date, posted_at)
     else:
         job.save_state(args.tweet_id, args.date, posted_at=posted_at)
-    entry = json.loads(state_file.read_text())[args.kind][args.date]
+    entry = json.loads(state_file.read_text()).get(args.kind, {}).get(args.date)
+    if not entry or entry.get("tweet_id") != args.tweet_id:
+        print(f"ERROR: {args.kind}[{args.date}] not found after save in {state_file}", file=sys.stderr)
+        return 1
     print(f"recorded: {args.kind}[{args.date}] = {json.dumps(entry)} in {state_file}")
     return 0
 

@@ -248,7 +248,8 @@ def save_state(tweet_id, reference_date, posted_at=None):
 
         # Prune entries older than 14 days
         cutoff = (date.today() - timedelta(days=14)).isoformat()
-        state["predicted"] = {k: v for k, v in state["predicted"].items() if k >= cutoff}
+        # rev7i R14: never prune the entry just saved (a backfill can record a day older than the window)
+        state["predicted"] = {k: v for k, v in state["predicted"].items() if k >= cutoff or k == reference_date}
 
         tweet_note._save(STATE_FILE, state)
     if tweet_id:
