@@ -8,6 +8,8 @@ Posts nothing: every HTTP call is blocked before the jobs' modules are used.
       --tweet-id 2116886013188379069 [--reply-to 2116258879692571134] [--state-file PATH]
 
 Re-running with the same id changes nothing (exit 0). A different id already recorded for that day = exit 1, untouched.
+After saving, the entry is read back; if it is missing or has a different id, exit 1 with
+"not found after save" on stderr.
 """
 
 import argparse

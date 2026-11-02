@@ -121,6 +121,7 @@ class ObservedMain(Harness):
         self.assertTrue(disc[0].startswith(":warning:") and "id missing" in disc[0], disc)
         self.assertFalse(any(":x:" in m for m in disc))
         self.assertIn("id missing", err)
+        self.assertIn('"text":"posted"', err)  # raw response body is logged
 
     def test_rerun_after_id_missing_does_not_post(self):  # m13
         self.run_main(wot, NO_ID())
@@ -148,8 +149,9 @@ class PredictedMain(Harness):
         self.assertIn(f"https://x.com/HazeyDataFred/status/{TID}", disc[-1])
 
     def test_posted_without_id_warns_saves_exit0(self):  # m17 m18 m20
-        rc, posts, disc, _, _ = self.run_main(wpt, NO_ID())
+        rc, posts, disc, _, err = self.run_main(wpt, NO_ID())
         self.assertEqual((rc, len(posts)), (0, 1))
+        self.assertIn('"text":"posted"', err)  # raw response body is logged
         e = self.read()["predicted"][D]
         self.assertEqual((e["tweet_id"], e["id_missing"]), (None, True))
         self.assertEqual(len(disc), 1)
@@ -242,6 +244,37 @@ class RecordMain(Harness):
         rc, _, _ = self.record("--date", D, "--tweet-id", TID, "--reply-to", RT)
         self.assertEqual(rc, 0)
         self.assertEqual(list(self.read()["observed"]), [D])
+
+    def test_predicted_job_save_state_still_prunes_other_old_days(self):
+        old = (date.today() - timedelta(days=30)).isoformat()
+        self.write({"predicted": {old: {"tweet_id": "1"}}})
+        rc, _, _ = self.record("--kind", "predicted", "--date", D, "--tweet-id", TID)
+        self.assertEqual(rc, 0)
+        self.assertEqual(list(self.read()["predicted"]), [D])
+
+    def test_prune_window_edge_both_jobs(self):  # 13 days old kept, 15 days old pruned
+        d13 = (date.today() - timedelta(days=13)).isoformat()
+        d15 = (date.today() - timedelta(days=15)).isoformat()
+        for kind, extra in (("observed", ["--reply-to", RT]), ("predicted", [])):
+            with self.subTest(kind=kind):
+                self.write({kind: {d13: {"tweet_id": "13"}, d15: {"tweet_id": "15"}}})
+                rc, _, err = self.record("--kind", kind, "--date", D, "--tweet-id", TID, *extra)
+                self.assertEqual(rc, 0, err)
+                self.assertEqual(sorted(self.read()[kind]), sorted([d13, D]))
+
+    def test_readback_missing_exits1(self):
+        for kind in ("observed", "predicted"):
+            job = wot if kind == "observed" else wpt
+            for name, fake in (("writes nothing", lambda *a, **k: None),
+                               ("different id", lambda *a, **k: self.write({kind: {D: {"tweet_id": "999"}}}))):
+                with self.subTest(kind=kind, case=name):
+                    self.write({"predicted": {D: {"tweet_id": RT}}} if kind == "observed" else {})
+                    with mock.patch.object(job, "save_state", side_effect=fake), \
+                            mock.patch.object(wot.tweet_format, "record"):
+                        rc, out, err = self.record("--kind", kind, "--date", D, "--tweet-id", TID)
+                    self.assertEqual(rc, 1, out)
+                    self.assertIn("not found after save", err)
+                    self.assertNotIn("recorded:", out)
 
 
 if __name__ == "__main__":
