@@ -1,3 +1,4 @@
+import json
 from datetime import date, timedelta
 
 import pandas as pd
@@ -6,8 +7,9 @@ import pytest
 from pipeline.config import PipelineConfig
 from pipeline.core import paths
 from pipeline.core.encodings import UnmappedLabelError, encode, extend_mappings, lookup
+from pipeline.core.logging import PipelineLogger
 from pipeline.steps import s08_forecast
-from pipeline.tests.bias_fixtures import frozen_mappings
+from pipeline.tests.bias_fixtures import build_base, frozen_mappings
 
 
 def test_extend_appends_without_renumbering_and_is_deterministic():
@@ -80,3 +82,21 @@ def test_halflife_is_per_park_with_global_default():
     cfg = PipelineConfig(geo_decay_halflife_days_per_park={"AK": 180})
     assert cfg.get_halflife_days("AK") == 180
     assert cfg.get_halflife_days("MK") == 730
+
+
+def test_s08_load_date_features_reads_refreshed_mapping_not_stale_prod(tmp_path):
+    prod, shadow = build_base(tmp_path / "prod"), tmp_path / "shadow"
+    refreshed, _ = extend_mappings(frozen_mappings(), {"season_year": ["AUTUMN_2026"]})
+    cfg = PipelineConfig(output_base=prod, shadow=True, shadow_output_base=shadow)
+    written = paths.encoding_mappings_write_path(cfg)
+    written.parent.mkdir(parents=True, exist_ok=True)
+    written.write_text(json.dumps(refreshed))
+    stale = json.loads((prod / paths.ENCODING_MAPPINGS).read_text())
+    assert "AUTUMN_2026" not in stale["season_year"]
+
+    feats = s08_forecast._load_date_features(cfg, PipelineLogger("t"))
+    autumn = [d for d in feats if d >= date(2026, 9, 1) and d.year == 2026]
+    code = refreshed["season_year"]["AUTUMN_2026"]
+    assert code != 0
+    assert date(2026, 10, 30) in feats
+    assert autumn and {feats[d]["season_year_encoded"] for d in autumn} == {code}
