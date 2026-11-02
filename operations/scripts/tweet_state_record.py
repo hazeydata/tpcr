@@ -8,6 +8,8 @@ Posts nothing: every HTTP call is blocked before the jobs' modules are used.
       --tweet-id 2116886013188379069 [--reply-to 2116258879692571134] [--state-file PATH]
 
 Re-running with the same id changes nothing (exit 0). A different id already recorded for that day = exit 1, untouched.
+After saving, the entry is read back; if it is missing or has a different id, exit 1 with
+"not found after save" on stderr.
 """
 
 import argparse
@@ -69,7 +71,10 @@ def main(argv=None):
         job.tweet_format.record(state_file, args.tweet_id, job.tweet_format.NEW, "observed", args.date, posted_at)
     else:
         job.save_state(args.tweet_id, args.date, posted_at=posted_at)
-    entry = json.loads(state_file.read_text())[args.kind][args.date]
+    entry = json.loads(state_file.read_text()).get(args.kind, {}).get(args.date)
+    if not entry or entry.get("tweet_id") != args.tweet_id:
+        print(f"ERROR: {args.kind}[{args.date}] not found after save in {state_file}", file=sys.stderr)
+        return 1
     print(f"recorded: {args.kind}[{args.date}] = {json.dumps(entry)} in {state_file}")
     return 0
 

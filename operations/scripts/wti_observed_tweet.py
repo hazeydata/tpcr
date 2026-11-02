@@ -174,7 +174,8 @@ def save_state(tweet_id, reference_date, reply_to, posted_at=None):
         if not tweet_id:  # rev7i: posted (2xx) but the id was unreadable; blocks a re-post (see idempotency guard)
             state["observed"][reference_date]["id_missing"] = True
         cutoff = (date.today() - timedelta(days=14)).isoformat()
-        state["observed"] = {k: v for k, v in state["observed"].items() if k >= cutoff}
+        # rev7i R14: never prune the entry just saved (a backfill can record a day older than the window)
+        state["observed"] = {k: v for k, v in state["observed"].items() if k >= cutoff or k == reference_date}
         tweet_note._save(STATE_FILE, state)
 
 
