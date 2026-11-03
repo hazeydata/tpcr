@@ -56,7 +56,7 @@ def _archive_forecast(cfg: PipelineConfig, log: PipelineLogger, run_date: str):
                 with read_connection() as con:
                     con.execute(f"""
                         COPY (
-                            SELECT entity_code, park_date, time_slot,
+                            SELECT entity_code, park_date, CAST(time_slot AS TIME) AS time_slot,
                                    predicted_actual, prediction_method,
                                    '{run_date}' as forecast_made_date
                             FROM read_parquet('{forecast_path}')
@@ -255,7 +255,9 @@ def _evaluate_slots_and_entities(
                 SELECT
                     entity_code,
                     park_date::VARCHAR as park_date,
-                    time_slot,
+                    -- Archives written by older pyarrow carry TIME(isAdjustedToUTC=true),
+                    -- which DuckDB reads as TIME WITH TIME ZONE and cannot fetch to pandas.
+                    CAST(time_slot AS TIME) as time_slot,
                     predicted_actual as forecast_wait,
                     prediction_method,
                     forecast_made_date

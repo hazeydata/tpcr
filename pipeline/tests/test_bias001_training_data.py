@@ -172,3 +172,15 @@ def test_s07_uses_each_parks_own_half_life(tmp_path, monkeypatch):
     monkeypatch.setattr(s07_training, "fit_baseline", spy)
     s07_training.run(cfg, PipelineLogger("t"), as_of=RUN_DATE)
     assert used == {"AK": 180, "HS": 730}
+
+
+def test_ignored_parks_never_degrade_the_receipt():
+    # Water parks (cfg.ignore_parks) are not trained or forecast; stale BB/VB
+    # data must be reported but must not degrade s06b.
+    run_date = RUN_DATE
+    fresh = (run_date - timedelta(days=1)).isoformat()
+    max_dates = {"AK": fresh, "BB": "2009-04-19", "VB": "2026-03-12"}
+    cfg = PipelineConfig()
+    kept = {p: d for p, d in max_dates.items() if p not in cfg.ignore_parks}
+    assert s06b_training_data.stale_parks(kept, run_date) == {}
+    assert s06b_training_data.stale_parks({"UH": "2026-10-14"}, date(2026, 11, 2)) == {"UH": "2026-10-14"}

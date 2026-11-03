@@ -101,6 +101,12 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
     log.info(f"Total entities: {len(entity_list)} across {len(park_entities)} parks")
 
     unmapped = unmapped_forecast_dates(date_features, start_date, end_date)
+    dim_horizon = max(date_features) if date_features else None
+    unmapped_in_dim = [d for d in unmapped if dim_horizon is None or d <= dim_horizon]
+    # Always emitted so the run log confirms the count, including zero.
+    log.metric("unmapped_dates", len(unmapped))
+    log.metric("unmapped_dates_in_dimension", len(unmapped_in_dim))
+    log.info(f"unmapped_dates dimension_horizon={dim_horizon}")
     if unmapped:
         log.warning(
             f"{len(unmapped)} forecast dates have no calendar encoding and are skipped "
