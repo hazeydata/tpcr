@@ -70,3 +70,22 @@ hashes, target, entry_id, quote, approved_at, alt text, image bytes), tampered s
 `refused_unsigned` with 0 calls; a good signature posts on the mock; `main()` exits 1; the poster refuses a missing, private,
 non-Ed25519 or in-queue verify key; and the signing helper `x_reply_sign_approval.py` (keygen 0600, no overwrite, refuses loose
 mode / in-queue / in-git keys, refuses to sign a hash mismatch). Spec R6/R7 (AC 3d/3e): a hash mismatch is `rejected_hash_mismatch` with 0 posts and exit 1 (dry run and `--apply`); `refused_verify_key_path` (stderr, exit 1, no ledger) for a key file that is a symlink (inside or outside the queue, or pointing into it), not a regular file (dir, FIFO), group/world-writable, or inside the queue by its unresolved or resolved path (symlinked queue arg, symlinked alias dir into the queue, symlinked subdir of the queue); a symlinked parent dir resolving outside the queue is accepted; the queue-dir mode check runs before the key loads, and no X client is built for a missing or refused key. Keys are generated per test in a temp dir. 96 tests. Test fixtures use synthetic handles and post ids only.
+
+## Firecrawl v2 tests
+
+**File**: `tests/test_firecrawl_v2.py` (stdlib only; mock HTTP, no network, no Firecrawl credits)
+
+```bash
+python -m pytest tests/test_firecrawl_v2.py -q
+```
+
+The Firecrawl v1 API returns HTTP 410 from December 10, 2026, 15:00 UTC. The school-calendar scrapers
+`data/school_schedules/pipeline_v3.py`, `brave_scraper.py` and `qa_sweep.py` now call `POST https://api.firecrawl.dev/v2/scrape`
+with the same body as before (`url`, `formats: ["markdown"]`, `onlyMainContent: true`, `timeout` in ms) and read the
+same REST envelope (`success`, `data.markdown`). The tests pin the exact request (URL, method, headers, JSON body, client timeout),
+the parsing, the length caps, the `pipeline_v3` Firecrawl call counter (counts answered calls, not HTTP or network errors), and the
+error paths (HTTP 402/408/410/429/500, network error, non-JSON body, `success: false`, no key = no call): each still returns `""`
+after one attempt, as before. A repo-wide guard scans every git-tracked code or config file (by suffix, or a shebang), except
+directories named `archive`/`archives`, and fails on any Firecrawl v1 REST URL or v1 SDK client. The standalone v1 extract,
+deep-research and llmstxt endpoints are outside the v2 migration and are allowed. The guard proves its own reach with planted v1 calls.
+Historical copies under `data/school_schedules/archive/` still name v1 endpoints and are left unchanged.

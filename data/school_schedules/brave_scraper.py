@@ -117,7 +117,7 @@ def firecrawl_scrape(url: str) -> str:
         "timeout": 15000,
     }).encode()
     req = urllib.request.Request(
-        "https://api.firecrawl.dev/v1/scrape",
+        "https://api.firecrawl.dev/v2/scrape",
         data=payload,
         headers={
             "Content-Type": "application/json",
