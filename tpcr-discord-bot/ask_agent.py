@@ -136,6 +136,8 @@ date range (365+ days of forecasts) than the DuckDB tables.
 - Forecasts: `SELECT * FROM read_parquet('{data_root}/curves/forecast_parquet/all_forecasts.parquet') WHERE entity_code LIKE 'EP%' AND park_date = '2026-10-01'`
 - Fact tables (historical waits): `SELECT round(avg(wait_time_minutes),1) FROM read_parquet('{data_root}/fact_tables/parquet/*.parquet') WHERE entity_code = 'MK141' AND wait_time_type = 'POSTED' AND park_date = '2026-10-17'`
 
+Fact-table parquet columns (ONLY these exist): entity_code, park_date, observed_at, observed_at_ts, wait_time_type, wait_time_minutes.
+There is NO park_code, entity_name or short_name in the fact tables, live_waits or forecasts: filter by entity_code, or JOIN entities ON entity_code to get names/parks.
 Fact-table parquet schema: park_date is VARCHAR and may contain 'NaT'; compare it as a string (park_date = '2026-10-17') or TRY_CAST(park_date AS DATE) and exclude park_date = 'NaT'. observed_at is VARCHAR; prefer observed_at_ts (TIMESTAMPTZ).
 
 Always try the DuckDB table first (faster), then fall back to parquet once if no results.
@@ -167,12 +169,13 @@ NOTE: "Universal Orlando" or "Universal Orlando Resort" means ALL THREE parks: U
 
 ## Guidelines
 - Today's date is {today} ({today_dow}).
-- CRITICAL: When displaying dates, ALWAYS use dayname() or strftime(park_date, '%A') in your SQL to get the correct day-of-week name from the database. NEVER guess day names — LLMs frequently get them wrong for future dates.
+- CRITICAL: When displaying dates, ALWAYS use dayname() or strftime(park_date, '%A') in your SQL (on fact-table parquet, park_date is VARCHAR: use dayname(TRY_CAST(park_date AS DATE))) to get the correct day-of-week name from the database. NEVER guess day names — LLMs frequently get them wrong for future dates.
 - "Posted" wait means wait_time_type = 'POSTED' (uppercase; 'ACTUAL' is user-reported). Only the entities table uses lowercase values; compare entities.wait_time_type with LOWER().
 - If a query for the asked date returns no rows (after at most one parquet retry), run SELECT min(park_date), max(park_date) on that table and answer plainly that there is no data for that date, giving the available date range. Do not give up silently.
 - Match attractions with entity_name ILIKE '%...%' rather than equality.
 - Resolve relative dates like "last Saturday" relative to {today} ({today_dow}) and use the explicit date in queries.
-- Use the `run_query` tool to query the database. Always use read-only queries (SELECT only).
+- Use the `run_query` tool to query the database. Always use read-only queries (one SELECT/WITH statement only).
+- If run_query returns "Error: SQL error ...", fix that query (column/table names above) instead of repeating it.
 - When comparing dates, show WTI values and explain what they mean.
 - For "best day to visit" questions, query WTI and sort by lowest.
 - For ride-specific questions, join forecasts with entities.
@@ -378,14 +381,21 @@ def run_duckdb_query(sql: str, max_retries: int = 8) -> str:
                     con.close()
                 except Exception:
                     pass
-            error_str = str(e).lower()
-            # Retry on any lock, busy, or IO errors (scraper write collisions)
-            is_lock_error = any(kw in error_str for kw in ("lock", "busy", "io error", "could not set", "blocked"))
+            if _is_sql_error(e):
+                # The model's own SQL is wrong (bad column/table/syntax): retrying
+                # cannot help, so return at once with the DuckDB message so the
+                # model can correct the query. Checked before the lock test so an
+                # identifier like "blocked_untl" never earns lock retries.
+                logger.warning("run_query failed after %d attempts: %s",
+                               attempt + 1, type(e).__name__)
+                return sql_error_result(e)
+            # Retry on lock, busy, or IO errors (scraper write collisions)
+            is_lock_error = _is_lock_error(e)
             if is_lock_error and attempt < max_retries - 1:
                 time.sleep(0.5 * (attempt + 1))  # Back off: 0.5s, 1s, 1.5s, 2s, ...
                 continue
-            if attempt < max_retries - 1:
-                # Even for non-lock errors, retry once with a brief pause
+            if not is_lock_error and attempt < min(max_retries, NON_LOCK_ATTEMPTS) - 1:
+                # Non-lock errors: retry once with a brief pause
                 time.sleep(1)
                 continue
             logger.warning("run_query failed after %d attempts: %s",
@@ -396,6 +406,85 @@ def run_duckdb_query(sql: str, max_retries: int = 8) -> str:
 
 
 NO_RESULTS_MSG = "No results found."
+NON_LOCK_ATTEMPTS = 2  # a non-lock error is retried once, not max_retries times
+_SQL_ERROR_NAMES = ("BinderException", "CatalogException", "ParserException")
+_DASH_FORMS = ("-", "\\u002d", "\\x2d", "%2d", "&#45;", "&#x2d;")
+_UNDERSCORE_FORMS = ("_", "\\u005f", "\\x5f", "%5f", "&#95;", "&#x5f;")
+_SEP_FORMS = _DASH_FORMS + _UNDERSCORE_FORMS
+
+
+def _form_re(form: str) -> str:
+    return r"\\+" + re.escape(form[1:]) if form.startswith("\\") else re.escape(form)
+
+
+_DASH = "(?:" + "|".join(_form_re(f) for f in _DASH_FORMS) + ")"
+_SEP = "(?:" + "|".join(_form_re(f) for f in _SEP_FORMS) + ")"
+_WORD_START = "(?:" + "|".join("(?<=" + re.escape(f) + ")" for f in _SEP_FORMS) + "|(?<![A-Za-z0-9]))"
+_TOKEN = r"[A-Za-z0-9._~+/=\-]"
+# Bearer: no tail guard needed; both alternatives are greedy over _TOKEN, so the match
+# always ends at the first non-token character (proved equivalent over 400k random cases).
+_SECRET_RE = re.compile(
+    r"sk" + _DASH + r"ant" + _DASH + r"(?:[A-Za-z0-9_]|" + _DASH + r")+"
+    "|" + _WORD_START + "sk" + _DASH + r"(?:[A-Za-z0-9_]|" + _DASH + r"){16,}"
+    r"|\bbearer\s+(?:" + _TOKEN + r"{16,}|(?=" + _TOKEN + r"*\d)(?=" + _TOKEN + r"*[A-Za-z])" + _TOKEN + r"{12,})"
+    "|" + _WORD_START + "api" + _SEP + r"key[\"']?\s*[:=]\s*[\"']?[^\s\"',;}]+",
+    re.IGNORECASE,
+)
+_LOCK_RE = re.compile(r"\b(?:lock(?:ed|ing)?|busy|io error|could not set|blocked)\b")
+
+
+def redact(text: str, limit: int = 300) -> str:
+    """Excerpt of text with anything key-shaped replaced (safe to log / show the model)."""
+    return _SECRET_RE.sub("[REDACTED]", str(text or ""))[:limit]
+
+
+def _is_lock_error(e: Exception) -> bool:
+    """Lock/busy/IO error: duckdb IOException, or a lock word as a whole word in the text."""
+    if any(c.__name__ == "IOException" for c in type(e).__mro__):
+        return True
+    return bool(_LOCK_RE.search(str(e).lower()))
+
+
+def _is_sql_error(e: Exception) -> bool:
+    return any(c.__name__ in _SQL_ERROR_NAMES for c in type(e).__mro__)
+
+
+def sql_error_result(e: Exception) -> str:
+    """Tool result for a deterministic SQL error (model-facing, never user-facing)."""
+    first = str(e).strip().splitlines()[0] if str(e).strip() else ""
+    return f"Error: SQL error {type(e).__name__}: {redact(first)}"
+
+
+MULTI_STATEMENT_MSG = "Error: Only one SQL statement per query is allowed (remove the extra ';' statement)."
+NON_SELECT_MSG = "Error: Only SELECT queries are allowed."
+
+
+def sql_guard_error(sql: str) -> str | None:
+    """AC31: None if sql is a single SELECT/WITH statement, else the tool error to return."""
+    s = (sql or "").strip()
+    if not is_select_start(s):
+        return NON_SELECT_MSG
+    try:
+        statements = duckdb.extract_statements(s)
+        tokens = duckdb.tokenize(s)
+    except duckdb.Error as e:
+        return sql_error_result(e)
+    semicolons = sum(1 for pos, kind in tokens if kind == duckdb.token_type.operator and s[pos] == ";")
+    if len(statements) != 1 or semicolons > 1:
+        return MULTI_STATEMENT_MSG
+    if statements[0].type != duckdb.StatementType.SELECT:
+        return NON_SELECT_MSG
+    return None
+
+
+def is_select_start(sql: str) -> bool:
+    head = (sql or "").strip().upper()
+    return head.startswith("SELECT") or head.startswith("WITH")
+
+
+def is_single_select(sql: str) -> bool:
+    """Exactly one SELECT statement per DuckDB's parser; one trailing ';' is allowed, empty statements are not."""
+    return sql_guard_error(sql) is None
 
 
 def date_range_sql() -> str:
@@ -496,7 +585,8 @@ class QwenHTTPError(Exception):
     """Non-2xx response from the Qwen server."""
 
     def __init__(self, status: int, body: str = ""):
-        super().__init__(f"HTTP {status}: {body[:300]}")
+        # Defence in depth (AC24): provider bodies can echo the key; never put it in the message.
+        super().__init__(f"HTTP {status}: {redact(body, 300)}")
         self.status = status
         self.body = body
 
@@ -689,8 +779,26 @@ CLAUDE_TOOLS = [
 ]
 
 
+def claude_assistant_blocks(content) -> list[dict]:
+    """Echo a Claude reply back as plain dict blocks, dropping empty text blocks
+    (the API 400s on "text content blocks must be non-empty")."""
+    out = []
+    for b in content:
+        if b.type == "text":
+            if (getattr(b, "text", "") or "").strip():
+                out.append({"type": "text", "text": b.text})
+        elif b.type == "tool_use":
+            out.append({"type": "tool_use", "id": b.id,
+                        "name": getattr(b, "name", None) or "run_query", "input": b.input or {}})
+    return out
+
+
 async def _claude_loop(api_key: str, system_prompt: str, question: str) -> str | None:
+    # Spec R5/AC33: the SDK's import-time _setup_logging reads ANTHROPIC_LOG and can
+    # re-enable DEBUG; drop it before import and re-pin the logger after.
+    os.environ.pop("ANTHROPIC_LOG", None)
     import anthropic
+    logging.getLogger("anthropic").setLevel(logging.WARNING)
 
     client = anthropic.AsyncAnthropic(api_key=api_key, timeout=60.0, max_retries=1)
     messages = [{"role": "user", "content": question}]
@@ -702,14 +810,14 @@ async def _claude_loop(api_key: str, system_prompt: str, question: str) -> str |
         if not tool_uses:
             return "".join(b.text for b in resp.content if b.type == "text").strip(), round_num
 
-        messages.append({"role": "assistant", "content": resp.content})
+        messages.append({"role": "assistant", "content": claude_assistant_blocks(resp.content)})
         results = []
         for block in tool_uses:
             sql = (block.input or {}).get("sql", "")
             logger.info("ask claude round=%d sql=%s", round_num, sql)
-            sql_upper = sql.strip().upper()
-            if not sql_upper.startswith("SELECT") and not sql_upper.startswith("WITH"):
-                result = "Error: Only SELECT queries are allowed."
+            guard = sql_guard_error(sql)
+            if guard:
+                result = guard
             else:
                 result = await asyncio.to_thread(run_duckdb_query, sql)
             results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
@@ -766,6 +874,10 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
             if status in (401, 403):
                 logger.error("Claude /ask auth failed (%s, status %s); falling back to Qwen",
                              type(e).__name__, status)
+            elif status is not None:
+                # AC27: class name + HTTP status only, never the provider message.
+                logger.warning("Claude /ask failed (%s, status %s); falling back to Qwen",
+                               type(e).__name__, status)
             else:
                 logger.warning("Claude /ask failed (%s); falling back to Qwen", type(e).__name__)
         else:
@@ -812,9 +924,9 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
                 logger.info("ask round=%d sql=%s", round_num, sql)
 
                 # Safety: reject non-SELECT queries
-                sql_upper = sql.strip().upper()
-                if not sql_upper.startswith("SELECT") and not sql_upper.startswith("WITH"):
-                    result = "Error: Only SELECT queries are allowed."
+                guard = sql_guard_error(sql)
+                if guard:
+                    result = guard
                 else:
                     result = await asyncio.to_thread(run_duckdb_query, sql)
                     query_results.append(result)
