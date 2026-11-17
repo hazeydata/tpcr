@@ -33,14 +33,17 @@ Env for `build_day.sh`: `PY` (python with pandas + pyarrow), `PYIMG` (python wit
 The cards use Space Grotesk and Geist Mono, bundled in `fonts/` (SIL OFL 1.1). Headless Chrome silently renders a
 missing font in its default serif, so the cards never rely on installed fonts:
 - `cards.py` embeds both files as base64 data-URI `@font-face` rules (with `<meta charset="utf-8">` ahead of them), so
-  the HTML is self-contained and renders the same on every machine (`render_anim.sh` copies it to a temp dir). It
+  the HTML is self-contained and carries the same font bytes everywhere (`render_anim.sh` copies it to a temp dir);
+  pixels match only for the same Chrome build and fontconfig/OS font setup. It
   refuses to build (`REFUSING TO BUILD: font_bundle_invalid ...`) if a font file is missing or its sha256 differs.
   `sans-serif` / `monospace` fallbacks are only a safety net.
 - Font gate: before the first screenshot, `build_day.sh` renders `fonts.py probe-html` with the same Chrome and flags
   and reads it with `fonts.py check-png`. Unless both families really rendered it exits 3 with
   `font_unresolved: <families> (requested font did not load in Chrome; refusing to build a card in a fallback font)`
-  and builds no PNG or MP4. The tweet jobs then post nothing and send the Discord "card not built, staying silent
-  (...)" alert, which carries that line (`tweet_v2.build` passes the last 800 chars of stderr).
+  and builds no PNG or MP4. The tweet jobs then post nothing and send their existing staying-silent Discord alert,
+  which carries that line (`tweet_v2.build` passes the last 800 chars of stderr): the predicted job
+  (`wti_predicted_tweet.py`) sends "card not built, staying silent (<error>)", the observed job
+  (`wti_observed_tweet.py`) sends "staying silent (<error>)".
 - Updating a font: replace the file in `fonts/`, then update its sha256 (and weight range if it changed) in `fonts.py`
   `FONTS` and in `fonts/README.md`.
 

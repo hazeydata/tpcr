@@ -393,8 +393,9 @@ class BuildDayFontGate(unittest.TestCase):
         self.assertEqual(leftover, [])
 
     def test_font_unresolved_reaches_the_build_error(self):
-        # tweet_v2.build() (both tweet jobs) turns a failed build_day.sh into the Discord "card not built" reason with
-        # the last 800 chars of stderr: the font_unresolved line must be in it.
+        # tweet_v2.build() (both tweet jobs) turns a failed build_day.sh into the build error with the last 800 chars of
+        # stderr, which each job's staying-silent Discord alert carries (predicted: "card not built, staying silent (...)";
+        # observed: "staying silent (...)"): the font_unresolved line must be in it.
         sys.path.insert(0, str(ROOT / "operations" / "scripts"))
         import tweet_v2
         msg = ("font_unresolved: Space Grotesk, Geist Mono (requested font did not load in Chrome; refusing to build a card "

@@ -3,8 +3,8 @@
 
 The cards ask for 'Space Grotesk' and 'Geist Mono'. Headless Chrome silently falls back to its default serif when a
 family is not installed, so the cards never rely on system fonts: cards.py embeds the bundled files below as base64
-data-URI @font-face rules (self-contained HTML, same pixels on every machine), and build_day.sh renders probe_html()
-with the same Chrome first and refuses to build (font_unresolved, exit 3) unless both families really rendered.
+data-URI @font-face rules (self-contained HTML, same font bytes everywhere; same pixels only for the same Chrome and
+fontconfig), and build_day.sh renders probe_html() with the same Chrome first and refuses to build (font_unresolved, exit 3) unless both families really rendered.
 
 usage: fonts.py probe-html OUT.html      write the font probe page
        fonts.py check-png PNG            exit 0 if both families resolved in the probe screenshot, else 3
