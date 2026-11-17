@@ -53,6 +53,24 @@ def oct26(s):
     return s.replace("normal range, 10–35", "shared scale, 10–35")
 
 
+# TPCR-CARD-FONTS-001: cards.py embeds the bundled fonts (a <style> of data-URI @font-face rules) and adds generic
+# fallbacks, with a UTF-8 charset in front (Chrome stops sniffing the encoding after that much base64). The #12 samples
+# predate all three; this is the one place they are taken back out before comparing.
+FONT_STYLE = re.compile(r'<meta charset="utf-8"><style>(?:@font-face\{[^}]*\})+</style>')
+FONT_FALLBACKS = [("font-family:'Space Grotesk',sans-serif", "font-family:'Space Grotesk'"),
+                  (".m{font-family:'Geist Mono',monospace}", ".m{font-family:'Geist Mono'}"),
+                  ('font-family="\'Geist Mono\', monospace"', 'font-family="Geist Mono"')]
+
+
+def strip_fonts(html):
+    """Generated card HTML minus the injected charset + @font-face <style> and the generic font fallbacks (fonts.py)."""
+    html, n = FONT_STYLE.subn("", html)
+    assert n == 1, f"expected one charset + @font-face <style>, found {n}"
+    for new, old in FONT_FALLBACKS:
+        html = html.replace(new, old)
+    return html
+
+
 def alt_sections(md, prefix=""):
     out, key = {}, None
     for line in md.read_text().splitlines():
@@ -95,19 +113,29 @@ class Samples12(unittest.TestCase):
 
 def _forecast(d):
     def t(self):
-        self.assertEqual(self.got(f"F-{d}.html"), oct26((EXP / f"F-{d}.html").read_text()))
+        self.assertEqual(strip_fonts(self.got(f"F-{d}.html")), oct26((EXP / f"F-{d}.html").read_text()))
         self.assertEqual(self.got(f"F-{d}.alt.txt").strip(), oct26(self.falt[d]))
-        self.assertNotIn("oday", self.got(f"F-{d}.html"))
+        self.assertNotIn("oday", strip_fonts(self.got(f"F-{d}.html")))
     return t
 
 
 def _reply(d):
     def t(self):
-        self.assertEqual(self.got(f"R-{d}.html"), oct28((EXP / f"R-{d}.html").read_text(), d))
+        self.assertEqual(strip_fonts(self.got(f"R-{d}.html")), oct28((EXP / f"R-{d}.html").read_text(), d))
         self.assertEqual(self.got(f"R-{d}.alt.txt").strip(), oct28(self.ralt[d], d))
         self.assertIn(f'class="h">{OCT28[d]}<', self.got(f"R-{d}.html"))
     return t
 
+
+def _embeds_fonts(self):
+    for name in (f"F-{DATES[0]}.html", f"R-{DATES[0]}.html"):
+        h = self.got(name)
+        self.assertEqual(len(FONT_STYLE.findall(h)), 1, name)
+        for fam in ("Space Grotesk", "Geist Mono"):
+            self.assertIn(f"@font-face{{font-family:'{fam}';src:url(data:font/ttf;base64,", h)
+
+
+Samples12.test_cards_embed_bundled_fonts = _embeds_fonts
 
 for _d in DATES:
     setattr(Samples12, f"test_forecast_{_d.replace('-', '_')}_matches_12", _forecast(_d))

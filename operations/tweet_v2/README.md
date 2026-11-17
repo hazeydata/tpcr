@@ -15,7 +15,8 @@ For park day D:
 | File | Job |
 |---|---|
 | `cards.py` | Static card HTML + alt text + `*.meta.json` from Step 14 content (`predicted_D.json`, `observed_D.json`) and `wti.parquet` history (each park's own p25–p75 since Jan 2022). Refuses on wrong date, non-ready status or a missing park. |
-| `build_day.sh` | Runs `cards.py`, screenshots PNGs (headless Chrome), renders the MP4s, checks the last frame equals the static PNG. No network. |
+| `build_day.sh` | Runs `cards.py`, runs the font gate (see Fonts), screenshots PNGs (headless Chrome), renders the MP4s, checks the last frame equals the static PNG. No network. |
+| `fonts.py`, `fonts/` | Bundled Space Grotesk + Geist Mono (SIL OFL 1.1, provenance in `fonts/README.md`): sha256 check, data-URI `@font-face` for `cards.py`, and the font probe `build_day.sh` renders (`probe-html`, `check-png`). |
 | `render_anim.sh`, `anim_forecast.js`, `anim_reply.js` | 30 fps frames -> H.264 MP4 (about 7 s). Portable to macOS/BSD: the frame count is compared as a number (BSD `wc -l` pads with spaces); a short render fails with `missing frames: GOT of N`. Tested by `tests/test_render_anim.py` (stub Chrome/ffmpeg): an exact count passes; one frame too many, one too few after a successful render step, or a failed frame render all fail and write no MP4. |
 | `tweet_copy.py` | New-format tweet text (see Tweet text below), from `F-D.meta.json` / `R-D.meta.json`. Over 280 (X weighted) returns None -> silent. |
 | `park_status.py` | `open` / `closed` / `unknown` per park. `closed` only from the hand-filled `data/closures.csv`; `open` from `dimparkhours.csv` official rows; else `unknown`. |
@@ -27,6 +28,21 @@ Data source (no defaults; `tweet_v2.py`, `wti_observed_tweet.py` and `wti_predic
 With `TPCR_SSH_HOST` unset (the Mini, where the pipeline writes locally) there is no ssh/scp: content is read from the local `TPCR_CONTENT_DIR` and the parquet from the local `TPCR_WTI_PARQUET`.
 An unset var or a missing path stops the run with `config_missing: <NAME> is not set` / `config_missing: <NAME> path does not exist: <path>`. The old-format reply render (`tweet_v1_legacy.py`) still needs `TPCR_SSH_HOST`.
 Env for `build_day.sh`: `PY` (python with pandas + pyarrow), `PYIMG` (python with Pillow, default `PY`), `CHROME`, `FFMPEG`.
+
+## Fonts
+The cards use Space Grotesk and Geist Mono, bundled in `fonts/` (SIL OFL 1.1). Headless Chrome silently renders a
+missing font in its default serif, so the cards never rely on installed fonts:
+- `cards.py` embeds both files as base64 data-URI `@font-face` rules (with `<meta charset="utf-8">` ahead of them), so
+  the HTML is self-contained and renders the same on every machine (`render_anim.sh` copies it to a temp dir). It
+  refuses to build (`REFUSING TO BUILD: font_bundle_invalid ...`) if a font file is missing or its sha256 differs.
+  `sans-serif` / `monospace` fallbacks are only a safety net.
+- Font gate: before the first screenshot, `build_day.sh` renders `fonts.py probe-html` with the same Chrome and flags
+  and reads it with `fonts.py check-png`. Unless both families really rendered it exits 3 with
+  `font_unresolved: <families> (requested font did not load in Chrome; refusing to build a card in a fallback font)`
+  and builds no PNG or MP4. The tweet jobs then post nothing and send the Discord "card not built, staying silent
+  (...)" alert, which carries that line (`tweet_v2.build` passes the last 800 chars of stderr).
+- Updating a font: replace the file in `fonts/`, then update its sha256 (and weight range if it changed) in `fonts.py`
+  `FONTS` and in `fonts/README.md`.
 
 ## Scheduling (Mac Mini launchd)
 Two launchd jobs in `~/Library/LaunchAgents/` run the repo scripts from a separate clean checkout `~/tpcr-tweet`
@@ -209,9 +225,10 @@ Optional: `--content-dir DIR` (local `predicted_D.json`/`observed_D.json` instea
 `--state-file`, `--park-hours dimparkhours.csv`, `--closures closures.csv`.
 
 ## Tests
-`python3 -m unittest -v tests.test_tweet_v2 tests.test_tweet_guard tests.test_scorecard tests.test_tweet_format tests.test_tweet_v2_samples`
+`python3 -m unittest -v tests.test_tweet_v2 tests.test_tweet_guard tests.test_scorecard tests.test_tweet_format tests.test_tweet_v2_samples tests.test_tweet_v2_fonts`
 (stubs `requests_oauthlib`; no network; use a python with pandas + pyarrow or the sample tests skip).
 - `test_tweet_format`: the transition window, boundaries (incl. an original posted exactly at 16:00:00), tagged/untagged originals, naive clock, corrupt store, missing/corrupt config, custom `store_name`, a lookup failure inside and after the window, bad config skipping the 4 PM original (Discord alert, alert failure incl. HTTP 500/4xx logged with exit 0, stderr-only without a token, state-only unblock, observed/reply tags don't unblock, fixed config resumes the next run), old-video alt text with missing labels, old/new reply through the scripts, `post_discord` raising on non-2xx without leaking the token or body, and `safe_alert` keeping the post and state when the success or park-hours alert fails.
 - `test_tweet_v2_samples`: dry-renders every tpcr-meta#12 sample (forecast Sep 2-6, reply C Sep 2-6) from the same real data
   (`tests/fixtures/tweet_v2_samples/`) and compares: replies identical after Fred's Oct 28 on-target ruling (headline only); forecasts identical after Fred's three Oct 26 edits.
+- `test_tweet_v2_fonts`: bundle hashes, TTF family names and OFL texts; a tampered bundle refuses; the card's data URIs are the bundled bytes; with Playwright Chromium and a fonts.conf that hides installed copies, the cards resolve to the bundled fonts (CDP `CSS.getPlatformFontsForNode`) and fall back without them (negative control), and the probe passes / flags both families; `build_day.sh` with a stub Chrome fails closed on a red probe (no PNG). Chromium tests skip without playwright.
 - The three older suites run with the window moved to the past (`setUpModule`), so they test the new-format path.

@@ -3,6 +3,7 @@
 # Builds the forecast post (F-DATE.png, F-DATE-390.png, F-DATE.mp4, F-DATE.alt.txt) and, if observed WTI is given,
 # the scorecard reply (R-DATE.png, R-DATE-390.png, R-DATE.mp4, R-DATE.alt.txt). Fails loudly on missing numbers.
 # Env: PY (python with pandas+pyarrow, default python3), PYIMG (python with Pillow for the end-frame check, default $PY), CHROME (default google-chrome), FFMPEG (default ffmpeg).
+# Fails closed (exit 3, font_unresolved on stderr) if the bundled card fonts do not render in $CHROME (fonts.py probe).
 # Posts nothing and makes no network calls; operations/scripts/wti_*_tweet.py call it.
 set -euo pipefail
 H=$(cd "$(dirname "$0")" && pwd); PY=${PY:-python3}; CHROME=${CHROME:-google-chrome}; FFMPEG=${FFMPEG:-ffmpeg}
@@ -20,9 +21,15 @@ mkdir -p "$OUT"; OUT=$(cd "$OUT" && pwd)
 # All four parks closed (TPCR-TWEET-V2-CLOSED-ROW-001 R1): no card, no post.
 [ -f "$OUT/skipped_all_closed" ] && { echo "skipped_all_closed $D"; exit 0; }
 PROF=$(mktemp -d "${TMPDIR:-/tmp}/tpcr-shot-XXXXXX"); trap 'rm -rf "$PROF"' EXIT
-shot(){ timeout 90 "$CHROME" --headless=new --no-first-run --disable-extensions --no-default-browser-check --no-sandbox --disable-gpu --hide-scrollbars --window-size=1600,900 --virtual-time-budget=2000 --user-data-dir="$PROF" --screenshot="$2" "file://$1" >/dev/null 2>&1 || true
-        [ -s "$2" ] || { echo "render failed: $2" >&2; exit 1; }
+chrome_shot(){ timeout 90 "$CHROME" --headless=new --no-first-run --disable-extensions --no-default-browser-check --no-sandbox --disable-gpu --hide-scrollbars --window-size=1600,900 --virtual-time-budget=2000 --user-data-dir="$PROF" --screenshot="$2" "file://$1" >/dev/null 2>&1 || true
+        [ -s "$2" ] || { echo "render failed: $2" >&2; exit 1; }; }
+shot(){ chrome_shot "$1" "$2"
         "$FFMPEG" -y -loglevel error -i "$2" -vf scale=390:-1:flags=lanczos "${2%.png}-390.png"; }
+# Font gate (TPCR-CARD-FONTS-001): Chrome silently falls back to serif when a font does not load. Render the font probe
+# with the same Chrome and flags as the cards; unless both families resolve, exit 3 (font_unresolved) and build nothing.
+"$PY" "$H/fonts.py" probe-html "$PROF/fontprobe.html"
+chrome_shot "$PROF/fontprobe.html" "$PROF/fontprobe.png"
+"${PYIMG:-$PY}" "$H/fonts.py" check-png "$PROF/fontprobe.png" || exit $?
 for K in F R; do
   [ -f "$OUT/$K-$D.html" ] || continue
   shot "$OUT/$K-$D.html" "$OUT/$K-$D.png"
