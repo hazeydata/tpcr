@@ -10,12 +10,13 @@ import csv, json, sys, os, argparse, datetime as dt
 import pandas as pd
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import headline_copy as HC  # all fallback headline copy (closed-row R2)
+import fonts  # bundled Space Grotesk / Geist Mono (TPCR-CARD-FONTS-001)
 
 P = ["MK", "EP", "HS", "AK"]
 N = {"MK": "Magic Kingdom", "EP": "EPCOT", "HS": "Hollywood Studios", "AK": "Animal Kingdom"}
 ALT_MAX = 1000    # X media alt-text limit
-CSS = """<style>*{margin:0;box-sizing:border-box}body{width:1600px;height:900px;background:#0F1B2D;color:#E8EDF4;font-family:'Space Grotesk';padding:60px 96px;position:relative}
-.m{font-family:'Geist Mono'}.k{font-size:30px;color:#9FB0C6}.h{font-size:54px;font-weight:700;margin:4px 0 26px;white-space:nowrap}
+CSS = """<style>*{margin:0;box-sizing:border-box}body{width:1600px;height:900px;background:#0F1B2D;color:#E8EDF4;font-family:'Space Grotesk',sans-serif;padding:60px 96px;position:relative}
+.m{font-family:'Geist Mono',monospace}.k{font-size:30px;color:#9FB0C6}.h{font-size:54px;font-weight:700;margin:4px 0 26px;white-space:nowrap}
 .brand{position:absolute;top:60px;right:96px;font-size:28px;color:#9FB0C6}"""
 FCSS = CSS + """
 .r{display:grid;grid-template-columns:420px 230px 380px 1fr;align-items:center;height:118px;border-top:1px solid #22324A}
@@ -40,6 +41,17 @@ WORD = {1: "One", 2: "Two", 3: "Three", 4: "Four"}
 
 def die(msg):
     sys.exit(f"REFUSING TO BUILD: {msg}")
+
+
+def font_style():
+    """<style> with the bundled fonts as data-URI @font-face rules, so the card never depends on installed fonts
+    (Chrome would silently fall back to serif). The generic fallbacks in CSS are only a safety net; the hard gate is
+    the font probe in build_day.sh. A missing or altered font file refuses the build. The charset comes first: with
+    ~400 KB of ASCII base64 ahead of the first "·" or "–", Chrome no longer sniffs UTF-8 and renders mojibake."""
+    try:
+        return f'<meta charset="utf-8"><style>{fonts.font_face_css()}</style>'
+    except fonts.FontBundleError as e:
+        die(str(e))
 
 
 def load_day(path, D):
@@ -168,7 +180,7 @@ def forecast_html(D, fc, S, status=None):
                  f'<div style="font-size:32px;white-space:nowrap;color:{"#BD73A0" if hi else "#9FB0C6"}{";font-weight:600" if hi else ""}">{qq}</div><div>{bar}</div></div>')
     kick = d.strftime('%A, %b %-d')
     sub = '<div style="display:grid;grid-template-columns:420px 230px 380px 1fr;font-size:22px;color:#7C8CA3;margin-bottom:6px"><span></span><span class="m">WTI forecast</span><span></span><span>shared scale, 10–35</span></div>'
-    html = f'<html><head>{FCSS}</head><body><div class="k">{kick}</div><div class="h">{title or ""}</div>{sub}{rows}<div class="brand">TPCR · HazeyData</div></body></html>'
+    html = f'<html><head>{font_style()}{FCSS}</head><body><div class="k">{kick}</div><div class="h">{title or ""}</div>{sub}{rows}<div class="brand">TPCR · HazeyData</div></body></html>'
     pr = "; ".join(f"{N[p]} closed. No forecast shown" if p in cl else f"{N[p]} {fc[p]:.1f}, {qual(S,p,fc[p])} (normal range {S[p][0]:.1f}–{S[p][1]:.1f})" for p in P)
     alt = (f"{title + ': ' if title else ''}TPCR Wait Time Index (WTI) forecast, {kick}. Each park shows its forecast WTI, a one-word qualifier and a small bar "
            f"for its normal range (middle half of its days since Jan 2022) on a 10–35 scale. {pr}.")
@@ -193,10 +205,10 @@ def reply_html(D, fc, ob, status=None):
         e = gap(fc, ob, p); a, b = sorted([c0, X(e)]); lx = X(e) + (14 if e >= 0 else -14)
         rows += (f'<div style="display:grid;grid-template-columns:{G};align-items:center;height:118px;border-top:1px solid #22324A"><div style="font-size:42px;font-weight:600;white-space:nowrap">{N[p]}</div>'
                  f'<svg width="{W}" height="60" style="margin-left:20px;overflow:visible"><rect x="{a:.1f}" y="18" width="{max(b-a,3):.1f}" height="24" rx="3" fill="#BD73A0"/>'
-                 f'<text x="{lx:.1f}" y="41" font-family="Geist Mono" font-size="30" font-weight="600" fill="#E8EDF4" text-anchor="{"start" if e>=0 else "end"}">{minus(e)}</text></svg>'
+                 f'<text x="{lx:.1f}" y="41" font-family="\'Geist Mono\', monospace" font-size="30" font-weight="600" fill="#E8EDF4" text-anchor="{"start" if e>=0 else "end"}">{minus(e)}</text></svg>'
                  f'<div style="display:flex;align-items:baseline;gap:18px;white-space:nowrap"><span class="m" style="font-size:64px;font-weight:600">{ob[p]:.1f}</span><span class="m" style="font-size:28px;color:#9FB0C6">{fc[p]:.1f}</span></div></div>')
     ticks = "".join(f'<span class="m lab" style="position:absolute;left:{420+20+X(t)}px;transform:translateX(-50%)">{f"{t:+d}".replace("-","−") if t else "0"}</span>' for t in (-20, -10, 0, 10, 20))
-    html = (f'<html><head>{RCSS}</head><body><div class="k">Observed · {d.strftime("%A, %b %-d")}</div><div class="h">{T or ""}</div>{hd}'
+    html = (f'<html><head>{font_style()}{RCSS}</head><body><div class="k">Observed · {d.strftime("%A, %b %-d")}</div><div class="h">{T or ""}</div>{hd}'
             f'<div style="position:relative">{rows}<div style="position:absolute;left:{420+20+c0-1}px;top:0;bottom:0;width:2px;background:#9FB0C6"></div></div>'
             f'<div style="position:relative;height:34px;margin-top:8px">{ticks}</div><div class="lab" style="margin-left:440px;width:{W}px;text-align:center;margin-top:4px">Bar = observed − forecast</div><div class="brand">TPCR · HazeyData</div></body></html>')
     vals = "; ".join(f"{N[p]} closed" if p in cl else f"{N[p]} observed {ob[p]:.1f}, forecast {fc[p]:.1f}, gap {minus(gap(fc,ob,p))}" for p in P)
