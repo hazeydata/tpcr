@@ -2,18 +2,24 @@
 operations/scripts/tweet_v1_legacy.py and is unchanged. Values always 1 decimal. No colour-coded circles.
 A text over X's 280 weighted limit returns None and the caller stays silent."""
 import datetime as dt
+import re
 
 LIMIT = 280
 TAGS = "#WDW #DisneyWorld #WaitTimes"
 EMOJI = ("⬇️", "⬆️", "⏬", "⏫", "✅")
 LIGHT = ((0, 4351), (8192, 8205), (8208, 8223), (8242, 8247))
 COUNT = {1: "One park", 2: "Two parks", 3: "Three parks"}
+URL = re.compile(r"https?://\S+")
+URL_WEIGHT = 23
+# TPCR-DISCORD-GROWTH-001 (Fred, Nov 18 2026): OBSERVED reply only, inside the config/tweet_format.json discord_cta window.
+DISCORD_CTA = "Free daily forecasts live on our Discord: https://discord.gg/{code}"
 
 
 def weighted_len(t):
-    """X weighted count (twitter-text v3): each emoji counts 2, Latin and common punctuation 1, anything else 2.
-    No URL = 23 rule: these texts carry no URLs."""
-    n = 0
+    """X weighted count (twitter-text v3): every http(s):// URL (up to whitespace) counts 23 whatever its length
+    (t.co wrapping); each emoji counts 2, Latin and common punctuation 1, anything else 2."""
+    n = URL_WEIGHT * len(URL.findall(t))
+    t = URL.sub("", t)
     for e in EMOJI:
         n += 2 * t.count(e); t = t.replace(e, "")
     return n + sum(1 if any(a <= ord(c) <= b for a, b in LIGHT) else 2 for c in t)
@@ -78,9 +84,12 @@ def reply_line(p, v, tiers):
     return f"{mark} {p}: {v['ob']:.1f} (forecast {v['fc']:.1f})"
 
 
-def reply_text(m, tiers):
-    """m = cards.py R-DATE.meta.json. No tiers (unset in config) -> None."""
+def reply_text(m, tiers, cta=None):
+    """m = cards.py R-DATE.meta.json. No tiers (unset in config) -> None. cta = the full Discord line
+    (tweet_format.discord_cta_line) or None: appended after a blank line; if that goes over the limit the text
+    posts without it (the CTA never silences the numbers)."""
     if not m.get("graded") or not tiers:
         return None
     rows = [reply_line(p, v, tiers) for p, v in m["parks"].items()]
-    return _fit(f"WDW Crowds OBSERVED: {_day(m['date'])}\n{reply_summary(m, tiers)}\n\n" + "\n".join(rows) + "\n\nLower WTI = shorter waits.")
+    t = f"WDW Crowds OBSERVED: {_day(m['date'])}\n{reply_summary(m, tiers)}\n\n" + "\n".join(rows) + "\n\nLower WTI = shorter waits."
+    return (_fit(t + "\n\n" + cta) if cta else None) or _fit(t)

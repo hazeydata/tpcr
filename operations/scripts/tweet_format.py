@@ -12,9 +12,10 @@ CLI (Mini migration, idempotent): python3 tweet_format.py --migrate STATE_FILE [
 tags every predicted/observed tweet in tweet_state.json that has no tag, by its posted_at."""
 import json
 import os
+import re
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -53,6 +54,75 @@ def _tiers(cfg):
 
 
 REPLY_TIERS, TIERS_ERROR = _tiers(_cfg) if not CONFIG_ERROR else (None, CONFIG_ERROR)
+
+# TPCR-DISCORD-GROWTH-001 (Fred, Nov 18 2026): one Discord line on the 8:30 AM OBSERVED reply, for at most 14 posting
+# days. discord_cta = {code, first_post_date, last_post_date}; dates are America/Toronto posting dates, inclusive.
+DISCORD_CODE = re.compile(r"^[A-Za-z0-9-]{2,32}$")
+ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+DISCORD_MAX_SPAN = timedelta(days=13)  # last - first: 14 posts
+
+
+def _discord_cta(cfg):
+    """(cta, error): cta = {"code", "first", "last"} (dates as date) or None. Missing key or all null = (None, None)."""
+    raw = cfg.get("discord_cta") if isinstance(cfg, dict) else None
+    if raw is None:
+        return None, None
+    if not isinstance(raw, dict):
+        return None, f"discord_cta is {type(raw).__name__}, not an object"
+    vals = [raw.get(k) for k in ("code", "first_post_date", "last_post_date")]
+    if all(v is None for v in vals):
+        return None, None
+    code, first, last = vals
+    if any(v is None for v in vals):
+        return None, f"discord_cta partially set ({vals!r}); need code, first_post_date and last_post_date"
+    if not isinstance(code, str) or not DISCORD_CODE.match(code):
+        return None, f"discord_cta.code {code!r} invalid; need ^[A-Za-z0-9-]{{2,32}}$"
+    try:
+        if not all(isinstance(d, str) and ISO_DATE.match(d) for d in (first, last)):
+            raise ValueError("not YYYY-MM-DD")
+        f, l = date.fromisoformat(first), date.fromisoformat(last)
+    except ValueError as e:
+        return None, f"discord_cta dates ({first!r}, {last!r}) invalid ({e}); need YYYY-MM-DD"
+    if f > l:
+        return None, f"discord_cta first_post_date {first} is after last_post_date {last}"
+    if l - f > DISCORD_MAX_SPAN:
+        return None, f"discord_cta window {first}..{last} is {(l - f).days + 1} days; max 14 (last = first + 13)"
+    return {"code": code, "first": f, "last": l}, None
+
+
+def parse_discord_cta(cfg, err=None):
+    """The validated discord_cta, or None (line off). Partial/invalid: one ERROR line on stderr. Never raises."""
+    try:
+        cta, e = _discord_cta(cfg)
+    except Exception as x:  # noqa: BLE001 - never crash the import
+        cta, e = None, f"{type(x).__name__}: {x}"
+    if e:
+        print(f"ERROR tweet_format: {e}; Discord line off", file=err or sys.stderr)
+    return cta
+
+
+DISCORD_CTA = parse_discord_cta(_cfg) if not CONFIG_ERROR else None
+
+
+def discord_cta_line(today, cta=None):
+    """The exact Discord line (tweet_copy.DISCORD_CTA) when the America/Toronto date today (a date, or an aware
+    datetime converted to ET) is inside the window, else None. cta defaults to DISCORD_CTA. Never raises."""
+    try:
+        cta = DISCORD_CTA if cta is None else cta
+        if not cta:
+            return None
+        if isinstance(today, datetime):
+            today = today.astimezone(ET).date() if today.tzinfo else today.date()
+        if not cta["first"] <= today <= cta["last"]:
+            return None
+        v2 = str(Path(os.environ.get("TPCR_TWEET_V2_DIR") or Path(__file__).resolve().parents[1] / "tweet_v2"))
+        if v2 not in sys.path:
+            sys.path.insert(0, v2)
+        import tweet_copy
+        return tweet_copy.DISCORD_CTA.format(code=cta["code"])
+    except Exception as e:  # noqa: BLE001 - the CTA must never stop the reply
+        print(f"ERROR tweet_format: Discord line lookup failed ({type(e).__name__}: {e}); line off", file=sys.stderr)
+        return None
 CONFIG_REASON = "config missing/invalid: everything new"
 
 

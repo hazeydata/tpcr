@@ -1,8 +1,9 @@
 {
-  "_doc": "TPCR-TWEET-RESTYLE-CUTOVER: the ONLY place the format window and the new-format reply tiers are set. reply_tier_a/reply_tier_b: |observed - forecast| WTI cutoffs, set by Fred Oct 28 2026 to A=3.0, B=6.0 (miss <= A ✅, A < miss <= B ⬇️/⬆️, > B ⏬/⏫; unset or invalid = new-format reply skipped_bad_config). Read by operations/scripts/tweet_format.py. Times are America/New_York (EDT, UTC-4, on both dates; DST ends 02:00 Nov 1, after old_retires).",
+  "_doc": "TPCR-TWEET-RESTYLE-CUTOVER: the ONLY place the format window and the new-format reply tiers are set. reply_tier_a/reply_tier_b: |observed - forecast| WTI cutoffs, set by Fred Oct 28 2026 to A=3.0, B=6.0 (miss <= A ✅, A < miss <= B ⬇️/⬆️, > B ⏬/⏫; unset or invalid = new-format reply skipped_bad_config). Read by operations/scripts/tweet_format.py. Times are America/New_York (EDT, UTC-4, on both dates; DST ends 02:00 Nov 1, after old_retires). discord_cta (TPCR-DISCORD-GROWTH-001, Fred Nov 18 2026): appends 'Free daily forecasts live on our Discord: https://discord.gg/<code>' to the 8:30 AM OBSERVED reply only (never the FORECAST post). code = the Discord invite 'x-daily' code; first_post_date/last_post_date = America/Toronto posting dates (the day the reply goes out, not park day D), YYYY-MM-DD, inclusive, last = first + 13 days (14 posts, max). Set by the chief at the Mini deploy. All null = line off; partial or invalid = line off plus one ERROR on stderr. After last_post_date the line stops on its own.",
   "first_new_run": "2026-10-29T16:00:00-04:00",
   "old_retires": "2026-11-01T00:00:00-04:00",
   "store_name": "tweet_formats.json",
   "reply_tier_a": 3.0,
-  "reply_tier_b": 6.0
+  "reply_tier_b": 6.0,
+  "discord_cta": {"code": null, "first_post_date": null, "last_post_date": null}
 }

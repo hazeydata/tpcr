@@ -186,15 +186,22 @@ def build(D, out, history, predicted_json, observed_json=None, runner=subprocess
     return arts
 
 
-def post_text(kind, arts):
-    """New-format tweet text (tweet_copy.py) for the built card, or None = stay silent."""
+def post_text(kind, arts, today=None):
+    """New-format tweet text (tweet_copy.py) for the built card, or None = stay silent. The OBSERVED reply carries the
+    Discord line when today (America/Toronto posting date; default: now() in that zone) is inside the
+    config/tweet_format.json discord_cta window (TPCR-DISCORD-GROWTH-001). The FORECAST text never does."""
     sys.path.insert(0, str(BUILD_DAY.parent))
     import tweet_copy
     import tweet_format
     k = "F" if kind == "predicted" else "R"
     if k not in arts:
         return None
-    return tweet_copy.forecast_text(arts[k]["meta"]) if k == "F" else tweet_copy.reply_text(arts[k]["meta"], tweet_format.REPLY_TIERS)
+    if k == "F":
+        return tweet_copy.forecast_text(arts[k]["meta"])
+    if today is None and tweet_format.DISCORD_CTA:
+        from zoneinfo import ZoneInfo
+        today = now().astimezone(ZoneInfo(MINI_TZ)).date()
+    return tweet_copy.reply_text(arts[k]["meta"], tweet_format.REPLY_TIERS, cta=tweet_format.discord_cta_line(today))
 
 
 def set_alt_text(media_id, alt, auth, post):
