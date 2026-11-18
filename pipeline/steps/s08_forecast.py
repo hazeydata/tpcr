@@ -162,6 +162,8 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
                         cfg.models_dir, agg_by_entity, park_open_mins,
                         fallback_ratios, oc_by_entity,
                         recent_levels=recent_levels,
+                        as_of=as_of,
+                        recent_level_max_horizon_days=recent_level.max_horizon(cfg),
                     )
                     if result is not None and len(result) > 0:
                         park_results.append(result)
@@ -271,6 +273,8 @@ def _forecast_entity_fast(
     fallback_ratios: dict,
     oc_by_entity: dict | None,
     recent_levels: dict | None = None,
+    as_of: date | None = None,
+    recent_level_max_horizon_days: int = recent_level.DEFAULT_MAX_HORIZON,
 ) -> tuple[pd.DataFrame | None, str]:
     """Generate forecast for a single entity. O(1) lookups, no scanning.
 
@@ -288,9 +292,17 @@ def _forecast_entity_fast(
     if "day_of_week" in FEATURES_BASELINE and "day_of_week" not in df.columns:
         df["day_of_week"] = pd.to_datetime(df["park_date"]).dt.dayofweek.astype(np.float32)
 
-    # Recent level (same value for every target day: level as of the issue date).
-    # NaN when unknown/too few rows; models without the feature ignore the column.
-    df[recent_level.FEATURE] = float((recent_levels or {}).get(entity_code, np.nan))
+    # Recent level as of the issue date, fed only to target days within the horizon cap
+    # (0 <= days after as_of <= recent_level_max_horizon_days); NaN elsewhere and when
+    # unknown/too few rows. as_of defaults to the grid's first date. Models without the
+    # feature ignore the column.
+    level = float((recent_levels or {}).get(entity_code, np.nan))
+    if as_of is None and len(df) > 0:
+        as_of = pd.to_datetime(df["park_date"]).min().date()
+    df[recent_level.FEATURE] = (
+        recent_level.forecast_values(df["park_date"], level, as_of, recent_level_max_horizon_days)
+        if as_of is not None else np.nan
+    )
 
     # O(1) operating calendar filter
     if oc_by_entity is not None:
@@ -393,14 +405,23 @@ def _forecast_entity_fast(
 # =========================================================================
 
 def _load_recent_levels(cfg: PipelineConfig, log: PipelineLogger, as_of: date) -> dict:
-    """entity_code -> trailing-window mean actual_time over [as_of-window, as_of). {} if disabled."""
+    """entity_code -> trailing-window mean actual_time over [as_of-window, as_of).
+
+    {} if disabled, or if loading raises (fail-soft: warning + metric recent_level_load_failed=1).
+    """
     if not recent_level.enabled(cfg):
         return {}
     window, _, min_rows = recent_level.params(cfg)
-    levels = recent_level.load_recent_levels(
-        paths.training_data_dir(cfg), as_of, window, min_rows,
-        combined_path=paths.training_data_combined_path(cfg),
-    )
+    try:
+        levels = recent_level.load_recent_levels(
+            paths.training_data_dir(cfg), as_of, window, min_rows,
+            combined_path=paths.training_data_combined_path(cfg),
+        )
+    except Exception as e:  # fail-soft: every entity gets NaN (missing), s08 continues
+        log.warning(f"Recent level load failed ({type(e).__name__}: {e}); all entities NaN")
+        log.metric("recent_level_load_failed", 1)
+        return {}
+    log.metric("recent_level_load_failed", 0)
     log.info(f"Recent level: {len(levels)} entities with >= {min_rows} rows in [{as_of - timedelta(days=window)}, {as_of})")
     log.metric("recent_level_entities", len(levels))
     return levels

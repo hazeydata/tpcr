@@ -5,8 +5,10 @@ backtest harness. All constants come from PipelineConfig (global, no per-park va
 
 Training row on park_date d: mean of actual_time (>0, non-NaN) over the entity's
 training rows with park_date in [d - lag - window, d - lag).
-Forecast issued on as_of: same mean over [as_of - window, as_of), used for every
-target day. Missing (NaN) when fewer than min_rows qualifying rows are in the window.
+Forecast issued on as_of: same mean over [as_of - window, as_of), fed only to target
+days with 0 <= (park_date - as_of).days <= max_horizon (default 14); farther target days
+get NaN (XGBoost's missing branch) so a stale level is never pushed onto far-horizon
+forecasts. Missing (NaN) when fewer than min_rows qualifying rows are in the window.
 """
 from __future__ import annotations
 
@@ -21,6 +23,7 @@ FEATURE = "recent_level_28d"
 DEFAULT_WINDOW = 28
 DEFAULT_LAG = 7
 DEFAULT_MIN_ROWS = 50
+DEFAULT_MAX_HORIZON = 14
 
 
 def params(cfg=None) -> tuple[int, int, int]:
@@ -30,6 +33,29 @@ def params(cfg=None) -> tuple[int, int, int]:
         int(getattr(cfg, "recent_level_lag_days", DEFAULT_LAG)),
         int(getattr(cfg, "recent_level_min_rows", DEFAULT_MIN_ROWS)),
     )
+
+
+def max_horizon(cfg=None) -> int:
+    """Forecast horizon (days after the issue date) that still receives the level."""
+    return int(getattr(cfg, "recent_level_max_horizon_days", DEFAULT_MAX_HORIZON))
+
+
+def forecast_values(park_date, level: float, as_of: date,
+                    max_horizon_days: int = DEFAULT_MAX_HORIZON) -> np.ndarray:
+    """Per-row forecast feature: level where 0 <= (park_date - as_of).days <= max_horizon_days, else NaN.
+
+    Computed per unique date (forecast grids repeat each date for every time slot).
+    """
+    pdates = pd.Series(park_date).reset_index(drop=True)
+    out = np.full(len(pdates), np.nan, dtype=np.float64)
+    if len(pdates) == 0 or not np.isfinite(level):
+        return out
+    codes, uniques = pd.factorize(pdates)
+    h = (pd.to_datetime(pd.Series(uniques)).dt.normalize() - pd.Timestamp(as_of).normalize()).dt.days.to_numpy()
+    in_range = (h >= 0) & (h <= int(max_horizon_days))
+    keep = (codes >= 0) & in_range[np.clip(codes, 0, None)]
+    out[keep] = float(level)
+    return out
 
 
 def enabled(cfg=None) -> bool:

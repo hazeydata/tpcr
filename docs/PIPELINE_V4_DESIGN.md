@@ -152,17 +152,18 @@ pipeline/                           # was: pipeline_v3/
 
 **Recent-level feature (TPCR-ACCURACY-001):** a 7th baseline feature, `recent_level_28d`, appended last. It is the mean `actual_time` (> 0, non-NaN, all sources, unweighted) of the entity's own training rows, so the model can follow a ride that is running below/above its history.
 - *Training row on park_date d:* rows with park_date in [d - lag - window, d - lag). Nothing at or after d - lag (including d) is seen. Defaults window=28, lag=7.
-- *Forecast (s08):* for every target day, rows with park_date in [as_of - window, as_of), `as_of` = forecast issue date (the date s08 runs). Read from the same training data s07 uses (`entity_code, park_date, actual_time` only).
+- *Forecast (s08):* one level per entity from rows with park_date in [as_of - window, as_of), `as_of` = forecast issue date (the date s08 runs). Read from the same training data s07 uses (`entity_code, park_date, actual_time` only).
+- *Horizon cap:* the level is fed only to target days with 0 <= (park_date - as_of) <= `recent_level_max_horizon_days` (14). Target days beyond that get NaN, i.e. XGBoost's missing branch, so a stale level is never pushed onto far-horizon forecasts. Training rows never see this NaN (they are NaN only when the window is too sparse), so the far-horizon prediction follows whatever default direction XGBoost learned for missing values; there is no horizon-aware training.
 - *Missing:* fewer than `recent_level_min_rows` (50) qualifying rows in the window gives NaN (never 0); XGBoost treats it as missing (the six old features are still 0-filled).
-- *Staleness:* training always uses a fixed 7-day lag. The forecast feature is constant across the whole horizon (today .. today + `forecast_days`, default 730 days), so a target day h days out gets a level that is h days old: staler than in training for h > 7, fresher for h < 7. There is no horizon-aware training.
-- *Config (global, same for every park):* `recent_level_enabled=True`, `recent_level_window_days=28`, `recent_level_lag_days=7`, `recent_level_min_rows=50` in `PipelineConfig`. `recent_level_enabled=False` trains/forecasts exactly the old 6 features.
+- *Staleness:* training always uses a fixed 7-day lag. Within the 14-day cap a target day h days out gets a level that is h days old: staler than in training for h > 7, fresher for h < 7.
+- *Config (global, same for every park):* `recent_level_enabled=True`, `recent_level_window_days=28`, `recent_level_lag_days=7`, `recent_level_min_rows=50`, `recent_level_max_horizon_days=14` in `PipelineConfig`. `recent_level_enabled=False` trains/forecasts exactly the old 6 features.
 - *Compatibility:* s08 picks features from each model's `metadata_baseline.json`, so existing 6-feature models forecast unchanged until retrained; models without metadata and the legacy paths assume the 6-feature set. Challenger models keep the 6 features. Code: `pipeline/core/recent_level.py`.
 - *Status:* implemented; its effect on accuracy has not been measured.
 **Hyperparameters:** max_depth=10, eta=0.1, n_estimators=2000, subsample=0.8, colsample_bytree=0.8, early_stopping=20, geo_decay_halflife=730
 
 ### Step 8: Forecast
 **Script:** `step_08_forecast.py`
-**Does:** Generates predictions for all entities × all dates × all time slots. Loads `model_baseline.json` (or fallback to aggregate if no model). Features come from the model metadata; `recent_level_28d` is computed once per run as of the issue date (see Step 7).
+**Does:** Generates predictions for all entities × all dates × all time slots. Loads `model_baseline.json` (or fallback to aggregate if no model). Features come from the model metadata; `recent_level_28d` is computed once per run as of the issue date and fed only to target days within 14 days of it (NaN beyond; see Step 7). Loading is fail-soft: if reading the recent levels raises, s08 logs a warning, records metric `recent_level_load_failed=1` (0 on success), and forecasts with NaN for every entity instead of failing.
 **Inputs:** `models/{entity}/model_baseline.json`, `dimension_tables/`, `aggregates/`, `operating_calendar/`
 **Outputs:** `forecasts/all_forecasts.parquet`
 **NO POST-PROCESSING.** Raw model output only. No bias correction, no quantile mapping.

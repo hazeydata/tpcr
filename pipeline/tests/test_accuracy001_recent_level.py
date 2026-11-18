@@ -178,3 +178,60 @@ def test_six_feature_model_with_six_feature_metadata_still_forecasts(tmp_path):
     (mdir / "metadata_baseline.json").unlink()
     out, key = _forecast(cfg, _grid(), {"AK85": 50.0})
     assert key == "baseline_default" and len(out) == 12
+
+
+def test_forecast_values_horizon_cap():
+    T = START + timedelta(days=N_DAYS)
+    days = [T - timedelta(days=1), T, T + timedelta(days=14), T + timedelta(days=15), T + timedelta(days=700)]
+    out = rl.forecast_values(days, 42.0, T, 14)
+    assert np.isnan(out[0]) and out[1] == 42.0 and out[2] == 42.0
+    assert np.isnan(out[3]) and np.isnan(out[4])
+    assert np.isnan(rl.forecast_values(days, float("nan"), T, 14)).all()
+    assert PipelineConfig().recent_level_max_horizon_days == 14
+
+
+def test_s08_feeds_level_only_within_horizon(tmp_path, monkeypatch):
+    cfg = _cfg(tmp_path)
+    T = START + timedelta(days=N_DAYS)
+    assert s07_training._train_baseline_model("AK85", _frame(rows_per_day=4), cfg, 100, as_of=T)
+    grid = _grid(entity_days=1)
+    g14 = grid.assign(park_date=T + timedelta(days=14))
+    g15 = grid.assign(park_date=T + timedelta(days=15))
+    grid = pd.concat([g14, g15], ignore_index=True)
+
+    seen = []
+    real_predict = s08_forecast.xgb.XGBRegressor.predict
+
+    def capture(self, X, *a, **k):
+        seen.append(np.array(X, copy=True))
+        return real_predict(self, X, *a, **k)
+
+    monkeypatch.setattr(s08_forecast.xgb.XGBRegressor, "predict", capture)
+    out, key = s08_forecast._forecast_entity_fast(
+        "AK85", "AK", grid, cfg.models_dir, {}, {}, {"__global__": 0.7}, None,
+        recent_levels={"AK85": 77.0}, as_of=T, recent_level_max_horizon_days=14)
+    assert key == "baseline_7feat" and len(out) == 8
+    col = seen[-1][:, -1]  # recent_level_28d is the last feature
+    np.testing.assert_array_equal(col[:4], np.float32(77.0))  # as_of + 14 -> level
+    assert np.isnan(col[4:]).all()                            # as_of + 15 -> NaN
+    # as_of omitted: defaults to the grid's first date (T+14) -> both days within 14
+    s08_forecast._forecast_entity_fast(
+        "AK85", "AK", grid, cfg.models_dir, {}, {}, {"__global__": 0.7}, None,
+        recent_levels={"AK85": 77.0})
+    np.testing.assert_array_equal(seen[-1][:, -1], np.float32(77.0))
+
+
+def test_s08_loader_failure_is_fail_soft(tmp_path, monkeypatch):
+    cfg = PipelineConfig(output_base=tmp_path / "base")
+    log = PipelineLogger("t")
+    warnings, metrics = [], {}
+    monkeypatch.setattr(log, "warning", lambda msg, **k: warnings.append(msg))
+    monkeypatch.setattr(log, "metric", lambda name, value, **k: metrics.__setitem__(name, value))
+
+    def boom(*a, **k):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(rl, "load_recent_levels", boom)
+    assert s08_forecast._load_recent_levels(cfg, log, START) == {}
+    assert len(warnings) == 1 and "OSError" in warnings[0] and "disk gone" in warnings[0]
+    assert metrics.get("recent_level_load_failed") == 1

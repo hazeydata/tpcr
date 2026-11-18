@@ -10,7 +10,7 @@
 
 ## The Situation
 
-We have a working pipeline producing 64M predictions across 400+ entities at 12 parks, with MAE around 6-7 minutes. The model is XGBoost (Julia-trained, geo-decay weighted), predicting `predicted_actual` (estimated real wait time) at 5-minute intervals. Features include `mins_since_6am`, `mins_since_open`, `date_group_id_encoded`, `season_encoded`, `season_year_encoded`, and optionally `posted_time`. TPCR-ACCURACY-001 adds `recent_level_28d` (trailing 28-day mean of the entity's own actual_time, 7-day lag, leak-free) to the V4 baseline; defined in docs/PIPELINE_V4_DESIGN.md Step 7; accuracy effect not yet measured.
+We have a working pipeline producing 64M predictions across 400+ entities at 12 parks, with MAE around 6-7 minutes. The model is XGBoost (Julia-trained, geo-decay weighted), predicting `predicted_actual` (estimated real wait time) at 5-minute intervals. Features include `mins_since_6am`, `mins_since_open`, `date_group_id_encoded`, `season_encoded`, `season_year_encoded`, and optionally `posted_time`. TPCR-ACCURACY-001 adds `recent_level_28d` (trailing 28-day mean of the entity's own actual_time, 7-day lag, leak-free; forecasts feed it only to target days within 14 days of the issue date, NaN beyond) to the V4 baseline; defined in docs/PIPELINE_V4_DESIGN.md Step 7; accuracy effect not yet measured.
 
 The bias correction disaster of March 17 taught us something important: **post-processing hacks that modify predictions after the model runs are fragile and dangerous.** The path to better accuracy is through better models, better features, and better training data — not through ad-hoc adjustments layered on top.
 

@@ -58,6 +58,10 @@ class PipelineConfig:
     recent_level_window_days: int = 28  # trailing window length (days)
     recent_level_lag_days: int = 7      # training rows never see the newest `lag` days (forecast staleness)
     recent_level_min_rows: int = 50     # fewer qualifying rows in the window -> NaN (missing), never 0
+    # The feature is only fed for target days within 14 days of the issue date; beyond it the
+    # value is NaN, i.e. XGBoost's missing branch, so a stale level is never pushed onto
+    # far-horizon forecasts.
+    recent_level_max_horizon_days: int = 14
     min_training_year_per_park: dict = field(default_factory=lambda: {
         # 2014-2015 Disney actual-time API data contamination: high-frequency
         # sampling (45 obs/entity/day vs ~2 modern) with poor-quality actuals
