@@ -63,7 +63,7 @@ Two launchd jobs in `~/Library/LaunchAgents/` run the repo scripts from a separa
 - Env names the scripts read (values come from the plist or `~/.env`, never from this repo): `TWITTER_CONSUMER_KEY`,
   `TWITTER_CONSUMER_SECRET`, `TWITTER_ACCESS_TOKEN`, `TWITTER_ACCESS_TOKEN_SECRET`, `DISCORD_BOT_TOKEN`, `TPCR_SSH_HOST`,
   `TPCR_CONTENT_DIR`, `TPCR_WTI_PARQUET`, optional `TPCR_PARK_HOURS`, `TPCR_CLOSURES`, `TPCR_TWEET_V2_DIR`, `PY`, `PYIMG`,
-  `CHROME`, `FFMPEG`, `TPCR_REMOTION_DIR` (old-format reply until Nov 1), `TPCR_TWEET_FORMAT_CONFIG`, the guard's `TPCR_TWEET_CHECKOUT` / `TPCR_TWEET_PYTHON`, and the dry-run switch `TPCR_TWEET_DRY_RUN`.
+  `CHROME`, `FFMPEG`, `TPCR_REMOTION_DIR` (old-format reply until Nov 1), `TPCR_TWEET_FORMAT_CONFIG`, the guard's `TPCR_TWEET_CHECKOUT` / `TPCR_TWEET_PYTHON`, and the dry-run switch `TPCR_TWEET_DRY_RUN`, and `TPCR_DISCORD_CTA_REPLY` (observed job only; exactly `1` enables the Discord CTA reply, unset or anything else = off; see "Discord CTA reply").
 - `TPCR_TWEET_DRY_RUN` (compared as the exact string, no trimming or case folding; `--dry-run` always gives a dry run):
 
   | `TPCR_TWEET_DRY_RUN` | run |
@@ -227,10 +227,49 @@ python3 operations/scripts/wti_observed_tweet.py  --dry-run --date 2026-10-29 --
 Optional: `--content-dir DIR` (local `predicted_D.json`/`observed_D.json` instead of `TPCR_CONTENT_DIR`), `--history wti.parquet`,
 `--state-file`, `--park-hours dimparkhours.csv`, `--closures closures.csv`.
 
+## Discord CTA reply (TPCR-DISCORD-GROWTH-001)
+**Status: OFF.** The real x-daily invite code is not yet supplied (Fred supplies it via the chief); enabling is a separate approved step.
+
+What: Fred, Nov 18 2026: the Discord line is its own text-only post, threaded as a reply under the 8:30 AM OBSERVED post, for a 14-day run.
+The reply text is exactly `Free daily forecasts live on our Discord: <invite_url>` (`tweet_copy.DISCORD_CTA`; a URL weighs 23). The OBSERVED
+and FORECAST texts are unchanged, byte-identical to before, whether the feature is off or on.
+
+Gates (both required, else nothing is posted):
+- env `TPCR_DISCORD_CTA_REPLY` equals `1` (unset or anything else = off).
+- `config/tweet_format.json` `discord_cta` = `{"invite_url", "first_post_date", "last_post_date"}` (all null in the repo). `invite_url` must match
+  `^https://discord\.gg/[A-Za-z0-9-]{2,32}$` and comes only from config. Dates are America/Toronto posting dates (the day the reply goes out, not
+  park day D), inclusive, `last = first + 13` (14 posts max). All null = off; partial or invalid = off plus one `ERROR tweet_format:` line on stderr.
+- Placeholder invites are skipped with a logged reason even when the flag is on: null/missing, a code starting with `INVITE` (any case, e.g.
+  `https://discord.gg/INVITE-X-DAILY`), containing `placeholder`, `example` or `xxx`, equal to `x-daily`, or the shared untracked code `2Estr7sbP7`.
+- A posting date outside the window is skipped with a logged reason.
+
+The decision is one pure never-raising function, `tweet_format.discord_cta_reply(today, environ, cta) -> (text|None, reason)`; reasons: `off: TPCR_DISCORD_CTA_REPLY not 1`,
+`skipped: invite missing`, `skipped: placeholder invite ...`, `skipped: shared untracked invite ...`, `skipped: outside window ...`, `skipped: config invalid ...`, `on`.
+
+Flow (`wti_observed_tweet.post_discord_cta_reply`, new-format path only): after the OBSERVED post has a real id, and after `save_state`,
+`tweet_format.record` and the success Discord line, it logs `discord_cta_reply ref=<D>: <reason>` and, only when on, calls `post_tweet(text, reply_to=<OBSERVED id>)`
+once (no media, no retry), records `tweet_state.json["discord_cta_reply"][D] = {tweet_id, in_reply_to, posted_at}` (pruned after 14 days like `observed`)
+and sends one Discord success line. No reply when OBSERVED failed, was id-missing, silent, already posted, a dry run, or old format.
+
+Failure isolation: any exception or failure (API error, no id, `ID_MISSING`, requests exception, state write error, Discord alert error) is logged as
+`ERROR discord_cta_reply ref=<D>: <type>: <short message>` on stderr plus a best-effort Discord warning, and is swallowed: no raise, no exit, no retry,
+the OBSERVED post and its state are untouched and the exit status is what it would be without the feature.
+
+Dry run: no X call. Stdout prints `DRY RUN discord_cta_reply: would_post=<bool> reason=<...>`, the text, `in_reply_to=<id of the OBSERVED post, assigned when it posts>` and
+`thread: forecast <reply_to> -> OBSERVED -> Discord reply`; `dry_run.json` gains `discord_cta_reply` = `{would_post, reason, text, in_reply_to, observed_reply_to_tweet_id}`
+(`would_post` is false when the OBSERVED itself would not post). The window check uses the America/Toronto date at run time (`cta_today = tweet_v2.now()`),
+so a `--dry-run` for a past `--date` still checks today's date. The dry run cannot know the OBSERVED id, so `in_reply_to` shows the placeholder
+`'<id of the OBSERVED post, assigned when it posts>'`; the demo script shows the real threading.
+
+Offline demo (no network; installs the dry-run HTTP block, fake `post_tweet`, state in a temp dir):
+`python3 operations/scripts/discord_cta_reply_demo.py --observed-id 111 --invite-url https://discord.gg/AbCdEf12 --today 2026-11-20 --flag 1`
+prints JSON `{flag, invite_url, reason, text, in_reply_to, calls}`; `calls[0].reply.in_reply_to_tweet_id` is the OBSERVED id.
+
 ## Tests
-`python3 -m unittest -v tests.test_tweet_v2 tests.test_tweet_guard tests.test_scorecard tests.test_tweet_format tests.test_tweet_v2_samples tests.test_tweet_v2_fonts`
+`python3 -m unittest -v tests.test_tweet_v2 tests.test_tweet_guard tests.test_scorecard tests.test_tweet_format tests.test_tweet_v2_samples tests.test_tweet_v2_fonts tests.test_tweet_discord_cta`
 (stubs `requests_oauthlib`; no network; use a python with pandas + pyarrow or the sample tests skip).
 - `test_tweet_format`: the transition window, boundaries (incl. an original posted exactly at 16:00:00), tagged/untagged originals, naive clock, corrupt store, missing/corrupt config, custom `store_name`, a lookup failure inside and after the window, bad config skipping the 4 PM original (Discord alert, alert failure incl. HTTP 500/4xx logged with exit 0, stderr-only without a token, state-only unblock, observed/reply tags don't unblock, fixed config resumes the next run), old-video alt text with missing labels, old/new reply through the scripts, `post_discord` raising on non-2xx without leaking the token or body, and `safe_alert` keeping the post and state when the success or park-hours alert fails.
+- `test_tweet_discord_cta`: OBSERVED/FORECAST text byte-identical to origin/main (flag off and on); both gates, placeholder kinds, window edges (Toronto), config validation; `wti_observed_tweet.main` end to end with mocks: exactly one reply threaded under the OBSERVED id, no reply on skip or OBSERVED failure, reply failures isolated (OBSERVED posted once, exit status unchanged), dry-run manifest, and the demo script.
 - `test_tweet_v2_samples`: dry-renders every tpcr-meta#12 sample (forecast Sep 2-6, reply C Sep 2-6) from the same real data
   (`tests/fixtures/tweet_v2_samples/`) and compares: replies identical after Fred's Oct 28 on-target ruling (headline only); forecasts identical after Fred's three Oct 26 edits.
 - `test_tweet_v2_fonts`: bundle hashes, TTF family names and OFL texts; a tampered bundle refuses; the card's data URIs are the bundled bytes; with Playwright Chromium and a fonts.conf that hides installed copies, the cards resolve to the bundled fonts (CDP `CSS.getPlatformFontsForNode`) and fall back without them (negative control), and the probe passes / flags both families; `build_day.sh` with a stub Chrome fails closed on a red probe (no PNG). Chromium tests skip without playwright.

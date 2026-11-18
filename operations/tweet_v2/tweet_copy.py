@@ -2,18 +2,25 @@
 operations/scripts/tweet_v1_legacy.py and is unchanged. Values always 1 decimal. No colour-coded circles.
 A text over X's 280 weighted limit returns None and the caller stays silent."""
 import datetime as dt
+import re
 
 LIMIT = 280
 TAGS = "#WDW #DisneyWorld #WaitTimes"
 EMOJI = ("⬇️", "⬆️", "⏬", "⏫", "✅")
 LIGHT = ((0, 4351), (8192, 8205), (8208, 8223), (8242, 8247))
 COUNT = {1: "One park", 2: "Two parks", 3: "Three parks"}
+URL = re.compile(r"https?://\S+")
+URL_WEIGHT = 23
+# TPCR-DISCORD-GROWTH-001 (Fred, Nov 18 2026): text of the separate Discord reply threaded under the OBSERVED post
+# (never part of the OBSERVED or FORECAST text). tweet_format.discord_cta_reply fills invite_url from config.
+DISCORD_CTA = "Free daily forecasts live on our Discord: {invite_url}"
 
 
 def weighted_len(t):
-    """X weighted count (twitter-text v3): each emoji counts 2, Latin and common punctuation 1, anything else 2.
-    No URL = 23 rule: these texts carry no URLs."""
-    n = 0
+    """X weighted count (twitter-text v3): every http(s):// URL (up to whitespace) counts 23 whatever its length
+    (t.co wrapping); each emoji counts 2, Latin and common punctuation 1, anything else 2."""
+    n = URL_WEIGHT * len(URL.findall(t))
+    t = URL.sub("", t)
     for e in EMOJI:
         n += 2 * t.count(e); t = t.replace(e, "")
     return n + sum(1 if any(a <= ord(c) <= b for a, b in LIGHT) else 2 for c in t)
