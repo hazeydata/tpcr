@@ -88,7 +88,7 @@ Exits with an error if any script fails.
 
 ### Queue-Times.com fetcher and `run_queue_times_loop.ps1`
 
-**`src/get_wait_times_from_queue_times.py`** fetches live wait times from the queue-times.com API, maps ride IDs to TouringPlans `entity_code` via `config/queue_times_entity_mapping.csv`, deduplicates with SQLite, and **writes to `staging/queue_times/YYYY-MM/{park}_{date}.csv`** (not `fact_tables`). The **morning ETL** (S3 run) merges **yesterday's** staging into `fact_tables/clean` at the start of each run. Staging is also used for live content (e.g. Twitch/YouTube).
+**`src/get_wait_times_from_queue_times.py`** fetches live wait times from the queue-times.com API, maps ride IDs to TouringPlans `entity_code` via `config/queue_times_entity_mapping.csv`, deduplicates with SQLite, and **writes to `staging/queue_times/YYYY-MM/{park}_{date}.csv`** (not `fact_tables`). The **morning ETL** (S3 run) merges **yesterday's** staging into `fact_tables/clean` at the start of each run. Staging is also used for live content (e.g. Twitch/YouTube). UH (queue-times park 66) is mapped as of TPCR-ACCURACY-001 because the TouringPlans S3 UH stream ended 2026-10-14; this only affects NEW queue-times ingests and does not re-key rows already stored as `USH*`.
 
 - **One-shot** (single fetch and write to staging):
   ```powershell
