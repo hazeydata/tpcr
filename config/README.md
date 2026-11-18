@@ -4,7 +4,7 @@ This directory contains configuration files and templates for the Theme Park Wai
 
 ## Queue-Times Lookup
 
-**`queue_times_entity_mapping.csv`** — Master lookup from queue-times.com ride IDs to TouringPlans `entity_code`. Used by `src/get_wait_times_from_queue_times.py`. Columns: `entity_code`, `park_code`, `queue_times_id`, `queue_times_name`, `touringplans_name`.
+**`queue_times_entity_mapping.csv`** — Master lookup from queue-times.com ride IDs to TouringPlans `entity_code`. Used by `src/get_wait_times_from_queue_times.py`. Columns: `entity_code`, `park_code`, `queue_times_id`, `queue_times_name`, `touringplans_name`. UH (queue-times park 66) is mapped as of TPCR-ACCURACY-001 because the TouringPlans S3 UH stream ended 2026-10-14; this only affects NEW queue-times ingests and does not re-key rows already stored as `USH*`.
 
 ## Output Base (config.json)
 
