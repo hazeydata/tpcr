@@ -226,7 +226,9 @@ The ML models use `date_group_id`, `season`, and `season_year` as features. A mo
 > `logs/receipt_s07a_calendar_{date}.json` and keeps the previous files. The same
 > step extends `state/encoding_mappings.json` with any new `season`,
 > `season_year` or `date_group_id` labels from `dimseason.csv` /
-> `dimdategroupid.csv` (append-only, new codes = max+1 in sorted order). s03 does
+> `dimdategroupid.csv` (append-only, new codes = max+1 in sorted order). A
+> season_year label with no training rows for a model is forecast with the code of
+> the latest earlier seen same-season label (docs/PIPELINE_V4_DESIGN.md Step 8). s03 does
 > not build the calendar. In shadow mode nothing is written under the production base.
 
 **Scripts:** `src/get_closures_from_s3.py` + `src/build_operating_calendar.py`  

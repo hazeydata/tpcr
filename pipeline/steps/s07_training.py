@@ -43,6 +43,7 @@ except ImportError:
 from pipeline.config import PipelineConfig
 from pipeline.core import paths
 from pipeline.core import recent_level
+from pipeline.core.encodings import load_mappings
 from pipeline.core.logging import PipelineLogger
 from pipeline.core.park_codes import entity_to_park
 from pipeline.core.validation import ValidationError
@@ -81,6 +82,8 @@ def run(cfg: PipelineConfig, log: PipelineLogger, as_of: date | None = None) -> 
     log.info(f"Features: {baseline_features(cfg)}")
     if recent_level.enabled(cfg):
         log.info(f"Recent level: {recent_level.spec(cfg)}")  # raises on an unknown recent_level_kind
+
+    season_year_codes = _season_year_codes(cfg, log)
 
     # Look for per-park training data (preferred) or single file
     actuals_dir = paths.training_data_dir(cfg)
@@ -145,6 +148,7 @@ def run(cfg: PipelineConfig, log: PipelineLogger, as_of: date | None = None) -> 
                     result = _train_baseline_model(
                         entity_code, park_df, cfg, min_obs,
                         as_of=as_of, halflife_days=cfg.get_halflife_days(park_code),
+                        season_year_codes=season_year_codes,
                     )
                     if result is not None:
                         successful += 1
@@ -176,6 +180,34 @@ def run(cfg: PipelineConfig, log: PipelineLogger, as_of: date | None = None) -> 
     }
 
 
+def _season_year_codes(cfg: PipelineConfig, log: PipelineLogger) -> dict[int, str] | None:
+    """season_year code -> label from the encoding mappings; None (with a warning) if unreadable.
+
+    Only used when a training parquet lacks the season_year label column.
+    """
+    try:
+        mapping = load_mappings(paths.encoding_mappings_path(cfg))["season_year"]
+    except Exception as e:
+        log.warning(f"season_year mappings unreadable ({type(e).__name__}: {e}); "
+                    "season_year_labels_seen only from label columns")
+        return None
+    return {int(c): str(label) for label, c in mapping.items()}
+
+
+def season_year_labels_seen(rows: pd.DataFrame, season_year_codes: dict[int, str] | None = None) -> list[str] | None:
+    """Sorted season_year labels present in the given training rows.
+
+    Uses the season_year label column (s06b writes it); without it, maps
+    season_year_encoded through season_year_codes. None if neither is available.
+    """
+    if "season_year" in rows.columns:
+        return sorted({str(x) for x in rows["season_year"].dropna().unique()})
+    if season_year_codes is not None and "season_year_encoded" in rows.columns:
+        codes = pd.to_numeric(rows["season_year_encoded"], errors="coerce").dropna().astype(int).unique()
+        return sorted({season_year_codes[c] for c in codes if c in season_year_codes})
+    return None
+
+
 def _train_baseline_model(
     entity_code: str,
     park_df: pd.DataFrame,
@@ -183,6 +215,7 @@ def _train_baseline_model(
     min_samples: int,
     as_of: date | None = None,
     halflife_days: int | None = None,
+    season_year_codes: dict[int, str] | None = None,
 ) -> dict | None:
     """Train a single baseline XGBoost model for one entity and save it."""
     entity_df = park_df[park_df["entity_code"] == entity_code]
@@ -215,6 +248,10 @@ def _train_baseline_model(
     }
     if recent_level.FEATURE in stats["features"]:
         metadata.update(recent_level.spec(cfg))
+    # Labels the trees actually saw; s08 maps unseen labels to the latest seen same-season label.
+    seen = season_year_labels_seen(stats["train_rows"], season_year_codes)
+    if seen is not None:
+        metadata["season_year_labels_seen"] = seen
     meta_path = model_dir / "metadata_baseline.json"
     with open(meta_path, "w") as f:
         json.dump(metadata, f, indent=2, default=str)
@@ -321,8 +358,11 @@ def fit_baseline(
     pred = bst.predict(dval)
     mae = float(np.mean(np.abs(y_val - pred)))
     best_trees = getattr(bst, "best_iteration", cfg.training_rounds)
+    # Rows the trees were fit on (the validation tail only drives early stopping)
+    train_cols = [c for c in ("season_year", "season_year_encoded") if c in entity_df.columns]
     return bst, {"n_train": split, "n_val": n - split, "mae": mae,
-                 "best_trees": best_trees, "params": params, "features": features}
+                 "best_trees": best_trees, "params": params, "features": features,
+                 "train_rows": entity_df.loc[valid_mask, train_cols].iloc[:split]}
 
 
 def _scan_entity_counts(parquet_files: list[Path]) -> dict[str, int]:

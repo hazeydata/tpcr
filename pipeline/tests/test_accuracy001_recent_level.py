@@ -454,3 +454,112 @@ def test_yoy_end_to_end_metadata_and_spec_mismatch(tmp_path, monkeypatch):
         recent_level_spec=rl.spec(PipelineConfig(recent_level_kind="mean")), stats=stats)
     assert stats["recent_level_spec_mismatch"] == 1
     np.testing.assert_array_equal(seen[-1][:, -1], np.float32(30.0))
+
+
+# --- unseen season_year labels -------------------------------------------------------------
+
+SY_MAPPING = {"JERSEY_WEEK_2024": 10, "JERSEY_WEEK_2025": 11, "SUMMER_2025": 12,
+              "JERSEY_WEEK_2026": 366, "SUMMER_2026": 420, "VETERANS_DAY_2026": 435,
+              "JERSEY_WEEK_2027": 500}
+SY_SEEN = ["JERSEY_WEEK_2024", "JERSEY_WEEK_2025", "SUMMER_2025", "SUMMER_2026"]
+
+
+def test_s07_writes_sorted_season_year_labels_seen(tmp_path):
+    cfg = _cfg(tmp_path)
+    df = _frame(rows_per_day=4)
+    day = (pd.to_datetime(df["park_date"]) - pd.Timestamp(START)).dt.days
+    df["season_year"] = np.where(day < 60, "WINTER_2026", "SPRING_2026")
+    # a label only in the last rows (validation tail, never fit by the trees) is not "seen"
+    df.loc[day == N_DAYS - 1, "season_year"] = "EASTER_2026"
+    assert s07_training._train_baseline_model("AK85", df, cfg, 100, as_of=START + timedelta(days=N_DAYS))
+    meta = json.loads((cfg.models_dir / "AK85" / "metadata_baseline.json").read_text())
+    assert meta["season_year_labels_seen"] == ["SPRING_2026", "WINTER_2026"]
+    # no label column: codes mapped through the encoding mappings
+    df2 = _frame(rows_per_day=4)
+    assert s07_training._train_baseline_model("AK85", df2, cfg, 100, as_of=START + timedelta(days=N_DAYS),
+                                              season_year_codes={2: "WINTER_2026"})
+    meta = json.loads((cfg.models_dir / "AK85" / "metadata_baseline.json").read_text())
+    assert meta["season_year_labels_seen"] == ["WINTER_2026"]
+    # neither: key absent
+    assert s07_training._train_baseline_model("AK85", df2, cfg, 100, as_of=START + timedelta(days=N_DAYS))
+    meta = json.loads((cfg.models_dir / "AK85" / "metadata_baseline.json").read_text())
+    assert "season_year_labels_seen" not in meta
+
+
+def test_season_year_fallback_rule():
+    got = s08_forecast.season_year_fallback([366, 435, 500, 10, 420, 999], SY_SEEN, SY_MAPPING)
+    assert got == {366: (11, "JERSEY_WEEK_2026", "JERSEY_WEEK_2025"),
+                   500: (11, "JERSEY_WEEK_2027", "JERSEY_WEEK_2025")}
+    # no earlier seen label of the same season -> left out (unchanged)
+    assert s08_forecast.season_year_fallback([366], ["JERSEY_WEEK_2027"], SY_MAPPING) == {}
+    assert s08_forecast.season_year_fallback([435], SY_SEEN, SY_MAPPING) == {}
+
+
+def _sy_model(tmp_path, seen=SY_SEEN):
+    cfg = _cfg(tmp_path)
+    assert s07_training._train_baseline_model("AK85", _frame(rows_per_day=4), cfg, 100,
+                                              as_of=START + timedelta(days=N_DAYS))
+    meta_path = cfg.models_dir / "AK85" / "metadata_baseline.json"
+    meta = json.loads(meta_path.read_text())
+    meta.pop("season_year_labels_seen", None)
+    if seen is not None:
+        meta["season_year_labels_seen"] = seen
+    meta_path.write_text(json.dumps(meta))
+    return cfg, meta["features"].index("season_year_encoded")
+
+
+def _sy_forecast(cfg, codes, mapping, monkeypatch):
+    seen = []
+    real_predict = s08_forecast.xgb.XGBRegressor.predict
+
+    def capture(self, X, *a, **k):
+        seen.append(np.array(X, copy=True))
+        return real_predict(self, X, *a, **k)
+
+    monkeypatch.setattr(s08_forecast.xgb.XGBRegressor, "predict", capture)
+    grid = pd.concat([_grid(entity_days=1).assign(season_year_encoded=c) for c in codes], ignore_index=True)
+    stats = {}
+    out, key = s08_forecast._forecast_entity_fast(
+        "AK85", "AK", grid, cfg.models_dir, {}, {}, {"__global__": 0.7}, None,
+        stats=stats, season_year_mapping=mapping)
+    assert key == "baseline_7feat" and len(out) == 4 * len(codes)
+    return seen[-1], stats
+
+
+def test_s08_remaps_unseen_label_to_latest_earlier_same_season(tmp_path, monkeypatch):
+    cfg, j = _sy_model(tmp_path)
+    X, stats = _sy_forecast(cfg, [366, 435, 10], SY_MAPPING, monkeypatch)
+    np.testing.assert_array_equal(X[:4, j], 11)    # JERSEY_WEEK_2026 -> JERSEY_WEEK_2025
+    np.testing.assert_array_equal(X[4:8, j], 435)  # VETERANS_DAY_2026: no earlier label -> unchanged
+    np.testing.assert_array_equal(X[8:, j], 10)    # seen label -> unchanged
+    assert stats["season_year_remapped"] == [("AK85", "JERSEY_WEEK_2026", "JERSEY_WEEK_2025")]
+
+
+def test_s08_no_earlier_same_season_label_keeps_code(tmp_path, monkeypatch):
+    cfg, j = _sy_model(tmp_path, seen=["SUMMER_2026", "JERSEY_WEEK_2027"])
+    X, stats = _sy_forecast(cfg, [366], SY_MAPPING, monkeypatch)
+    np.testing.assert_array_equal(X[:, j], 366)
+    assert not stats.get("season_year_remapped")
+
+
+def test_s08_fallback_switch_off_and_old_metadata_unchanged(tmp_path, monkeypatch):
+    cfg, j = _sy_model(tmp_path)
+    # switch off -> the run passes no mapping -> unchanged
+    off = PipelineConfig(output_base=tmp_path / "base", season_year_unseen_fallback=False)
+    assert s08_forecast._season_year_mapping_for_run(off, PipelineLogger("t")) is None
+    assert PipelineConfig().season_year_unseen_fallback is True
+    X, stats = _sy_forecast(cfg, [366], None, monkeypatch)
+    np.testing.assert_array_equal(X[:, j], 366)
+    # old metadata without season_year_labels_seen -> unchanged
+    cfg, j = _sy_model(tmp_path / "old", seen=None)
+    X, stats = _sy_forecast(cfg, [366], SY_MAPPING, monkeypatch)
+    np.testing.assert_array_equal(X[:, j], 366)
+    assert not stats.get("season_year_remapped")
+
+
+def test_s08_mapping_for_run_reads_encodings(tmp_path):
+    cfg = PipelineConfig(output_base=tmp_path / "base")
+    p = s08_forecast.paths.encoding_mappings_write_path(cfg)
+    p.parent.mkdir(parents=True)
+    p.write_text(json.dumps({"date_group_id": {}, "season": {}, "season_year": SY_MAPPING}))
+    assert s08_forecast._season_year_mapping_for_run(cfg, PipelineLogger("t")) == SY_MAPPING
