@@ -82,7 +82,7 @@ def entity_days(park_df: pd.DataFrame, candidate: Candidate, days: list[date],
                 past = edf[edf["_d"] < d]
                 tgt[recent_level.FEATURE] = recent_level.recent_level_at(
                     past["park_date"], past["actual_time"], d, w, m)
-            X = baseline_matrix(tgt, cfg)[baseline_features(cfg)].values.astype(np.float32)
+            X = baseline_matrix(tgt, cfg)[baseline_features(cfg)].to_numpy(dtype=np.float32, na_value=np.nan)
             pred = np.clip(bst.predict(xgb.DMatrix(X)), 0, 300)
             rows.append({"candidate": candidate.name, "entity_code": entity, "park_date": d,
                          "pred": float(pred.mean()), "actual": float(target["actual_time"].mean())})

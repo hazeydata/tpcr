@@ -235,3 +235,31 @@ def test_s08_loader_failure_is_fail_soft(tmp_path, monkeypatch):
     assert s08_forecast._load_recent_levels(cfg, log, START) == {}
     assert len(warnings) == 1 and "OSError" in warnings[0] and "disk gone" in warnings[0]
     assert metrics.get("recent_level_load_failed") == 1
+
+
+@pytest.mark.parametrize("enabled", [True, False])
+def test_nullable_int64_feature_columns_train_and_forecast(tmp_path, enabled):
+    """s06b parquets can hold pandas nullable Int64 (with pd.NA) for mins_since_open."""
+    cfg = _cfg(tmp_path, recent_level_enabled=enabled)
+    df = _frame(rows_per_day=4)
+    msopen = pd.array(df["mins_since_open"].tolist(), dtype="Int64")
+    msopen[::7] = pd.NA
+    df["mins_since_open"] = msopen
+    df["season_year_encoded"] = pd.array(df["season_year_encoded"].tolist(), dtype="Int64")
+    df["actual_time"] = pd.array(df["actual_time"].tolist(), dtype="Float64")
+    df.loc[5, "actual_time"] = pd.NA
+    assert df["mins_since_open"].isna().any()
+
+    m = s07_training.baseline_matrix(df, cfg)
+    assert all(m[c].dtype == np.float64 for c in s07_training.BASELINE_FEATURES_V6)
+    assert m["mins_since_open"].iloc[0] == 0 and np.isnan(m["actual_time"].iloc[5])
+
+    res = s07_training._train_baseline_model("AK85", df, cfg, 100, as_of=START + timedelta(days=N_DAYS))
+    assert res is not None
+    meta = json.loads((cfg.models_dir / "AK85" / "metadata_baseline.json").read_text())
+    assert len(meta["features"]) == (7 if enabled else 6)
+
+    grid = _grid()
+    grid["season_year_encoded"] = pd.array(grid["season_year_encoded"].tolist(), dtype="Int64")
+    out, key = _forecast(cfg, grid, {"AK85": 1.0})
+    assert key == f"baseline_{7 if enabled else 6}feat" and len(out) == 12

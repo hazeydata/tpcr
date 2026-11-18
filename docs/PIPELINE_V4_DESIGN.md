@@ -159,6 +159,7 @@ pipeline/                           # was: pipeline_v3/
 - *Config (global, same for every park):* `recent_level_enabled=True`, `recent_level_window_days=28`, `recent_level_lag_days=7`, `recent_level_min_rows=50`, `recent_level_max_horizon_days=14` in `PipelineConfig`. `recent_level_enabled=False` trains/forecasts exactly the old 6 features.
 - *Compatibility:* s08 picks features from each model's `metadata_baseline.json`, so existing 6-feature models forecast unchanged until retrained; models without metadata and the legacy paths assume the 6-feature set. Challenger models keep the 6 features. Code: `pipeline/core/recent_level.py`.
 - *Status:* implemented; its effect on accuracy has not been measured.
+**Feature dtypes:** s06b parquets can store a feature as pandas nullable Int64 (seen for `mins_since_open` at EU and UH). `baseline_matrix` 0-fills the six old features and casts them to float64 (pd.NA -> 0), `actual_time` and `recent_level_28d` to float64 (pd.NA -> NaN), and the valid-row mask is computed on a float array, so such an entity trains instead of failing. s08 builds its feature matrix with `to_numpy(dtype=float32, na_value=NaN)` for the same reason.
 **Hyperparameters:** max_depth=10, eta=0.1, n_estimators=2000, subsample=0.8, colsample_bytree=0.8, early_stopping=20, geo_decay_halflife=730
 
 ### Step 8: Forecast

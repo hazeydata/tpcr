@@ -221,7 +221,10 @@ def _train_baseline_model(
 def baseline_matrix(entity_df: pd.DataFrame, cfg: PipelineConfig | None = None) -> pd.DataFrame:
     """Rows ready for the baseline features: day_of_week derived, numeric.
 
-    The six old features are NaN-free (filled with 0). recent_level_28d stays NaN when
+    The six old features are NaN-free (filled with 0) and plain float64: s06b parquets
+    can hold pandas nullable Int64 columns (e.g. mins_since_open), which to_numeric and
+    fillna keep as Int64, and whose .values is an object array. actual_time and
+    recent_level_28d are float64 with NaN for missing. recent_level_28d stays NaN when
     unknown (XGBoost handles missing natively). If the column is absent it is computed
     here from entity_df itself with the training (lagged) definition.
     """
@@ -229,16 +232,21 @@ def baseline_matrix(entity_df: pd.DataFrame, cfg: PipelineConfig | None = None) 
     if "day_of_week" not in df.columns:
         df["day_of_week"] = pd.to_datetime(df["park_date"]).dt.dayofweek.astype(np.float32)
     for col in BASELINE_FEATURES_V6:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-    df["actual_time"] = pd.to_numeric(df["actual_time"], errors="coerce")
+        df[col] = _float64(pd.to_numeric(df[col], errors="coerce").fillna(0))
+    df["actual_time"] = _float64(pd.to_numeric(df["actual_time"], errors="coerce"))
     if recent_level.enabled(cfg):
         if recent_level.FEATURE not in df.columns:
             w, lag, m = recent_level.params(cfg)
             df[recent_level.FEATURE] = recent_level.recent_level_for_rows(
                 df["park_date"], df["actual_time"], w, lag, m)
         else:
-            df[recent_level.FEATURE] = pd.to_numeric(df[recent_level.FEATURE], errors="coerce")
+            df[recent_level.FEATURE] = _float64(pd.to_numeric(df[recent_level.FEATURE], errors="coerce"))
     return df
+
+
+def _float64(s: pd.Series) -> np.ndarray:
+    """Numeric Series (numpy or pandas nullable dtype) -> float64 array, pd.NA -> NaN."""
+    return s.to_numpy(dtype=np.float64, na_value=np.nan)
 
 
 def fit_baseline(
@@ -256,10 +264,11 @@ def fit_baseline(
     features = baseline_features(cfg)
     entity_df = baseline_matrix(entity_df, cfg)
 
-    X_all = entity_df[features].values.astype(np.float32)
-    y_all = entity_df["actual_time"].values.astype(np.float32)
+    X_all = entity_df[features].to_numpy(dtype=np.float32, na_value=np.nan)
+    y_all = entity_df["actual_time"].to_numpy(dtype=np.float32, na_value=np.nan)
+    old_x = entity_df[BASELINE_FEATURES_V6].to_numpy(dtype=np.float64, na_value=np.nan)
 
-    valid_mask = ~np.isnan(y_all) & (y_all > 0) & ~np.any(np.isnan(entity_df[BASELINE_FEATURES_V6].values), axis=1)
+    valid_mask = ~np.isnan(y_all) & (y_all > 0) & ~np.any(np.isnan(old_x), axis=1)
     if valid_mask.sum() < min_samples:
         return None
 

@@ -391,7 +391,8 @@ def _forecast_entity_fast(
         return df[["entity_code", "park_date", "time_slot", "predicted_actual", "prediction_method"]], "fallback"
 
     # Run model prediction (already vectorized via numpy)
-    X = df[features].values.astype(np.float32)
+    # to_numpy with na_value: nullable (Int64/Float64) columns never become an object array
+    X = df[features].to_numpy(dtype=np.float32, na_value=np.nan)
     predictions = model.predict(X)
     predictions = np.clip(predictions, 0, 300)
     df["predicted_actual"] = np.round(predictions).astype(int)
