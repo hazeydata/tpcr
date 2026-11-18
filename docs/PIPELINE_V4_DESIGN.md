@@ -38,7 +38,7 @@
 
 ### Key Numbers
 - 431 entities with trained models (79.5% of 542)
-- 6 features: mins_since_6am, mins_since_open, date_group_id_encoded, season_encoded, season_year_encoded, day_of_week; plus `recent_level_28d` (TPCR-ACCURACY-001, see Step 7) for models trained after that change
+- 6 features: mins_since_6am, mins_since_open, date_group_id_encoded, season_encoded, season_year_encoded, day_of_week; plus `recent_level_28d` (TPCR-ACCURACY-001: recent level, default a year-over-year ratio; see Step 7) for models trained after that change
 - XGBoost: max_depth=10, eta=0.1, n_estimators=2000, early_stopping=20
 - Geo-decay half-life: 730 days
 - WDW parks: min_training_year=2016
@@ -150,21 +150,23 @@ pipeline/                           # was: pipeline_v3/
 **Outputs:** `models/{entity_code}/model_baseline.json`, `models/{entity_code}/metadata_baseline.json`
 **Features:** mins_since_6am, mins_since_open, date_group_id_encoded, season_encoded, season_year_encoded, day_of_week, recent_level_28d
 
-**Recent-level feature (TPCR-ACCURACY-001):** a 7th baseline feature, `recent_level_28d`, appended last. It is the mean `actual_time` (> 0, non-NaN, all sources, unweighted) of the entity's own training rows, so the model can follow a ride that is running below/above its history.
-- *Training row on park_date d:* rows with park_date in [d - lag - window, d - lag). Nothing at or after d - lag (including d) is seen. Defaults window=28, lag=7.
-- *Forecast (s08):* one level per entity from rows with park_date in [as_of - window, as_of), `as_of` = forecast issue date (the date s08 runs). Read from the same training data s07 uses (`entity_code, park_date, actual_time` only).
+**Recent-level feature (TPCR-ACCURACY-001):** a 7th baseline feature, `recent_level_28d`, appended last (the column name is kept for every kind; model metadata lists it), so the model can follow a ride that is running below/above its history. Building block: M[lo, hi) = mean `actual_time` (> 0, non-NaN, all sources, unweighted) of the entity's own training rows with park_date in [lo, hi), NaN if fewer than `recent_level_min_rows` qualifying rows. Defaults window W=28, lag L=7, offset O=364. `recent_level_kind` selects the definition:
+- *`yoy_ratio` (default), seasonally adjusted:* the trailing mean divided by the mean over the same window O days earlier (364 = 52 weeks keeps the day-of-week mix). The raw trailing mean is confounded with season (a high October event season pushes November up); the ratio removes the seasonal level. Training row on d: M[d-L-W, d-L) / M[d-L-W-O, d-L-O). Forecast: M[as_of-W, as_of) / M[as_of-W-O, as_of-O). NaN if either side is NaN (min_rows applies to each side) or the denominator <= 0.
+- *`mean`:* the raw trailing mean. Training row on d: M[d-L-W, d-L); forecast: M[as_of-W, as_of).
+- *Leakage:* for both kinds a training row on d reads nothing at or after d - L (including d); the forecast reads nothing at or after `as_of` (the forecast issue date, the date s08 runs).
+- *Forecast (s08):* one value per entity, read from the same training data s07 uses, three columns (`entity_code, park_date, actual_time`) and only the rows in the window(s) above (one date range for `mean`, two for `yoy_ratio`).
 - *Horizon cap:* the level is fed only to target days with 0 <= (park_date - as_of) <= `recent_level_max_horizon_days` (14). Target days beyond that get NaN, i.e. XGBoost's missing branch, so a stale level is never pushed onto far-horizon forecasts. Training rows never see this NaN (they are NaN only when the window is too sparse), so the far-horizon prediction follows whatever default direction XGBoost learned for missing values; there is no horizon-aware training.
-- *Missing:* fewer than `recent_level_min_rows` (50) qualifying rows in the window gives NaN (never 0); XGBoost treats it as missing (the six old features are still 0-filled).
+- *Missing:* fewer than `recent_level_min_rows` (50) qualifying rows in a window gives NaN (never 0); XGBoost treats it as missing (the six old features are still 0-filled).
 - *Staleness:* training always uses a fixed 7-day lag. Within the 14-day cap a target day h days out gets a level that is h days old: staler than in training for h > 7, fresher for h < 7.
-- *Config (global, same for every park):* `recent_level_enabled=True`, `recent_level_window_days=28`, `recent_level_lag_days=7`, `recent_level_min_rows=50`, `recent_level_max_horizon_days=14` in `PipelineConfig`. `recent_level_enabled=False` trains/forecasts exactly the old 6 features.
-- *Compatibility:* s08 picks features from each model's `metadata_baseline.json`, so existing 6-feature models forecast unchanged until retrained; models without metadata and the legacy paths assume the 6-feature set. Challenger models keep the 6 features. Code: `pipeline/core/recent_level.py`.
-- *Status:* implemented; its effect on accuracy has not been measured.
+- *Config (global, same for every park):* `recent_level_enabled=True`, `recent_level_kind="yoy_ratio"` (or `"mean"`; any other value raises), `recent_level_window_days=28`, `recent_level_lag_days=7`, `recent_level_min_rows=50`, `recent_level_yoy_offset_days=364`, `recent_level_max_horizon_days=14` in `PipelineConfig`. `recent_level_enabled=False` trains/forecasts exactly the old 6 features.
+- *Metadata:* a 7-feature model's `metadata_baseline.json` records `recent_level_kind`, `recent_level_window_days`, `recent_level_lag_days`, `recent_level_min_rows`, `recent_level_yoy_offset_days`.
+- *Compatibility:* s08 picks features from each model's `metadata_baseline.json`, so existing 6-feature models forecast unchanged until retrained; models without metadata and the legacy paths assume the 6-feature set. A 7-feature model whose metadata describes a different definition than the current config (kind, window, or yoy offset; metadata without `recent_level_kind` counts as `mean` with window 28) is fed NaN for the feature instead of a value on a different scale; s08 logs the count as metric `recent_level_spec_mismatch`. Challenger models keep the 6 features. Code: `pipeline/core/recent_level.py`.
 **Feature dtypes:** s06b parquets can store a feature as pandas nullable Int64 (seen for `mins_since_open` at EU and UH). `baseline_matrix` 0-fills the six old features and casts them to float64 (pd.NA -> 0), `actual_time` and `recent_level_28d` to float64 (pd.NA -> NaN), and the valid-row mask is computed on a float array, so such an entity trains instead of failing. s08 builds its feature matrix with `to_numpy(dtype=float32, na_value=NaN)` for the same reason.
 **Hyperparameters:** max_depth=10, eta=0.1, n_estimators=2000, subsample=0.8, colsample_bytree=0.8, early_stopping=20, geo_decay_halflife=730
 
 ### Step 8: Forecast
 **Script:** `step_08_forecast.py`
-**Does:** Generates predictions for all entities × all dates × all time slots. Loads `model_baseline.json` (or fallback to aggregate if no model). Features come from the model metadata; `recent_level_28d` is computed once per run as of the issue date and fed only to target days within 14 days of it (NaN beyond; see Step 7). Loading is fail-soft: if reading the recent levels raises, s08 logs a warning, records metric `recent_level_load_failed=1` (0 on success), and forecasts with NaN for every entity instead of failing.
+**Does:** Generates predictions for all entities × all dates × all time slots. Loads `model_baseline.json` (or fallback to aggregate if no model). Features come from the model metadata; `recent_level_28d` (kind `recent_level_kind`, default `yoy_ratio`) is computed once per run as of the issue date and fed only to target days within 14 days of it (NaN beyond; see Step 7). Loading is fail-soft: if reading the recent levels raises, s08 logs a warning, records metric `recent_level_load_failed=1` (0 on success), and forecasts with NaN for every entity instead of failing.
 **Inputs:** `models/{entity}/model_baseline.json`, `dimension_tables/`, `aggregates/`, `operating_calendar/`
 **Outputs:** `forecasts/all_forecasts.parquet`
 **NO POST-PROCESSING.** Raw model output only. No bias correction, no quantile mapping.

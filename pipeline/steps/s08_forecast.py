@@ -129,6 +129,8 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
     total_entities = 0
     failed_entities = 0
     method_feature_counts: dict[str, int] = {}  # Track which feature sets are used
+    forecast_stats: dict = {"recent_level_spec_mismatch": 0}
+    rl_spec = recent_level.spec(cfg) if recent_level.enabled(cfg) else None
     batch_files = []
 
     for park_code in sorted(park_entities.keys()):
@@ -164,6 +166,8 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
                         recent_levels=recent_levels,
                         as_of=as_of,
                         recent_level_max_horizon_days=recent_level.max_horizon(cfg),
+                        recent_level_spec=rl_spec,
+                        stats=forecast_stats,
                     )
                     if result is not None and len(result) > 0:
                         park_results.append(result)
@@ -213,6 +217,13 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
         log.info("Feature set usage:")
         for feat_key, count in sorted(method_feature_counts.items()):
             log.info(f"  {feat_key}: {count} entities")
+
+    if rl_spec is not None:
+        # Models whose metadata describes another recent-level definition got NaN for it
+        log.metric("recent_level_spec_mismatch", forecast_stats["recent_level_spec_mismatch"])
+        if forecast_stats["recent_level_spec_mismatch"]:
+            log.warning(f"{forecast_stats['recent_level_spec_mismatch']} models trained with a different "
+                        f"recent-level definition than {rl_spec['recent_level_kind']}: fed NaN")
 
     log.info("=" * 60)
     log.info("FORECAST COMPLETE")
@@ -275,11 +286,18 @@ def _forecast_entity_fast(
     recent_levels: dict | None = None,
     as_of: date | None = None,
     recent_level_max_horizon_days: int = recent_level.DEFAULT_MAX_HORIZON,
+    recent_level_spec: dict | None = None,
+    stats: dict | None = None,
 ) -> tuple[pd.DataFrame | None, str]:
     """Generate forecast for a single entity. O(1) lookups, no scanning.
 
     Returns (DataFrame, feature_key) where feature_key describes which
     feature set was used (for diagnostic logging).
+
+    recent_level_spec (recent_level.spec(cfg)): when given, a baseline model that uses
+    recent_level_28d but whose metadata describes a different definition (kind, window,
+    yoy offset; no kind key = "mean") is fed NaN for it; counted in
+    stats["recent_level_spec_mismatch"].
     """
 
     df = time_grid.copy()
@@ -351,6 +369,13 @@ def _forecast_entity_fast(
 
         # Read features from metadata instead of assuming
         meta_features = _get_model_features(entity_dir)
+        base_meta = _read_metadata(entity_dir, "metadata_baseline.json") if model_path == baseline_path else None
+        if (recent_level_spec is not None and base_meta is not None
+                and recent_level.FEATURE in (base_meta.get("features") or [])
+                and not recent_level.model_spec_matches(base_meta, recent_level_spec)):
+            df[recent_level.FEATURE] = np.nan
+            if stats is not None:
+                stats["recent_level_spec_mismatch"] = stats.get("recent_level_spec_mismatch", 0) + 1
         if meta_features is not None:
             missing = [f for f in meta_features if f not in df.columns]
             if missing:
@@ -406,24 +431,32 @@ def _forecast_entity_fast(
 # =========================================================================
 
 def _load_recent_levels(cfg: PipelineConfig, log: PipelineLogger, as_of: date) -> dict:
-    """entity_code -> trailing-window mean actual_time over [as_of-window, as_of).
+    """entity_code -> forecast-time recent level at as_of (cfg.recent_level_kind).
 
+    "yoy_ratio": mean over [as_of-window, as_of) / mean over [as_of-window-offset, as_of-offset);
+    "mean": mean over [as_of-window, as_of).
     {} if disabled, or if loading raises (fail-soft: warning + metric recent_level_load_failed=1).
     """
     if not recent_level.enabled(cfg):
         return {}
     window, _, min_rows = recent_level.params(cfg)
     try:
+        kind = recent_level.kind(cfg)
+        offset = recent_level.yoy_offset(cfg)
         levels = recent_level.load_recent_levels(
             paths.training_data_dir(cfg), as_of, window, min_rows,
             combined_path=paths.training_data_combined_path(cfg),
+            kind=kind, offset=offset,
         )
     except Exception as e:  # fail-soft: every entity gets NaN (missing), s08 continues
         log.warning(f"Recent level load failed ({type(e).__name__}: {e}); all entities NaN")
         log.metric("recent_level_load_failed", 1)
         return {}
     log.metric("recent_level_load_failed", 0)
-    log.info(f"Recent level: {len(levels)} entities with >= {min_rows} rows in [{as_of - timedelta(days=window)}, {as_of})")
+    log.info(f"Recent level ({kind}): {len(levels)} entities with >= {min_rows} rows in "
+             f"[{as_of - timedelta(days=window)}, {as_of})"
+             + (f" and [{as_of - timedelta(days=window + offset)}, {as_of - timedelta(days=offset)})"
+                if kind == recent_level.KIND_YOY else ""))
     log.metric("recent_level_entities", len(levels))
     return levels
 

@@ -56,7 +56,7 @@ BASELINE_FEATURES = [
     "season_encoded",
     "season_year_encoded",
     "day_of_week",
-    recent_level.FEATURE,  # TPCR-ACCURACY-001: trailing 28-day mean, lag 7 (NaN allowed)
+    recent_level.FEATURE,  # TPCR-ACCURACY-001: recent level (cfg.recent_level_kind, lag 7; NaN allowed)
 ]
 
 # The six pre-recent-level features (cfg.recent_level_enabled=False; challenger models)
@@ -79,6 +79,8 @@ def run(cfg: PipelineConfig, log: PipelineLogger, as_of: date | None = None) -> 
     log.info("STEP 7: MODEL TRAINING (baseline, one model per entity)")
     log.info("=" * 60)
     log.info(f"Features: {baseline_features(cfg)}")
+    if recent_level.enabled(cfg):
+        log.info(f"Recent level: {recent_level.spec(cfg)}")  # raises on an unknown recent_level_kind
 
     # Look for per-park training data (preferred) or single file
     actuals_dir = paths.training_data_dir(cfg)
@@ -211,6 +213,8 @@ def _train_baseline_model(
         "backend": "Python xgboost",
         "hyperparameters": stats["params"],
     }
+    if recent_level.FEATURE in stats["features"]:
+        metadata.update(recent_level.spec(cfg))
     meta_path = model_dir / "metadata_baseline.json"
     with open(meta_path, "w") as f:
         json.dump(metadata, f, indent=2, default=str)
@@ -236,9 +240,7 @@ def baseline_matrix(entity_df: pd.DataFrame, cfg: PipelineConfig | None = None) 
     df["actual_time"] = _float64(pd.to_numeric(df["actual_time"], errors="coerce"))
     if recent_level.enabled(cfg):
         if recent_level.FEATURE not in df.columns:
-            w, lag, m = recent_level.params(cfg)
-            df[recent_level.FEATURE] = recent_level.recent_level_for_rows(
-                df["park_date"], df["actual_time"], w, lag, m)
+            df[recent_level.FEATURE] = recent_level.feature_for_rows(df["park_date"], df["actual_time"], cfg)
         else:
             df[recent_level.FEATURE] = _float64(pd.to_numeric(df[recent_level.FEATURE], errors="coerce"))
     return df
