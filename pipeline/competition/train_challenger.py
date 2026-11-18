@@ -33,7 +33,7 @@ from pipeline.competition.registry import load_registry
 
 
 # Import baseline features from s07_training
-from pipeline.steps.s07_training import BASELINE_FEATURES
+from pipeline.steps.s07_training import BASELINE_FEATURES_V6 as BASELINE_FEATURES  # challengers keep the 6 pre-recent-level features
 
 
 def apply_inverse_freq_weighting(weights: np.ndarray, is_synth: np.ndarray) -> np.ndarray:

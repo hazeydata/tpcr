@@ -42,6 +42,7 @@ except ImportError:
 
 from pipeline.config import PipelineConfig
 from pipeline.core import paths
+from pipeline.core import recent_level
 from pipeline.core.logging import PipelineLogger
 from pipeline.core.park_codes import entity_to_park
 from pipeline.core.validation import ValidationError
@@ -55,7 +56,16 @@ BASELINE_FEATURES = [
     "season_encoded",
     "season_year_encoded",
     "day_of_week",
+    recent_level.FEATURE,  # TPCR-ACCURACY-001: trailing 28-day mean, lag 7 (NaN allowed)
 ]
+
+# The six pre-recent-level features (cfg.recent_level_enabled=False; challenger models)
+BASELINE_FEATURES_V6 = [f for f in BASELINE_FEATURES if f != recent_level.FEATURE]
+
+
+def baseline_features(cfg: PipelineConfig | None = None) -> list[str]:
+    """Feature list for the baseline model under cfg (7 with recent level, else the old 6)."""
+    return list(BASELINE_FEATURES) if recent_level.enabled(cfg) else list(BASELINE_FEATURES_V6)
 
 
 def run(cfg: PipelineConfig, log: PipelineLogger, as_of: date | None = None) -> dict:
@@ -68,7 +78,7 @@ def run(cfg: PipelineConfig, log: PipelineLogger, as_of: date | None = None) -> 
     log.info("=" * 60)
     log.info("STEP 7: MODEL TRAINING (baseline, one model per entity)")
     log.info("=" * 60)
-    log.info(f"Features: {BASELINE_FEATURES}")
+    log.info(f"Features: {baseline_features(cfg)}")
 
     # Look for per-park training data (preferred) or single file
     actuals_dir = paths.training_data_dir(cfg)
@@ -195,7 +205,7 @@ def _train_baseline_model(
         "n_total": stats["n_train"] + stats["n_val"],
         "mae": round(stats["mae"], 3),
         "best_trees": stats["best_trees"],
-        "features": BASELINE_FEATURES,
+        "features": stats["features"],
         "uses_geo_decay_weights": True,
         "geo_decay_halflife_days": halflife_days,
         "backend": "Python xgboost",
@@ -208,14 +218,26 @@ def _train_baseline_model(
     return {"mae": stats["mae"], "n_samples": stats["n_train"], "best_trees": stats["best_trees"]}
 
 
-def baseline_matrix(entity_df: pd.DataFrame) -> pd.DataFrame:
-    """Rows ready for the baseline features: day_of_week derived, numeric, NaN-free."""
+def baseline_matrix(entity_df: pd.DataFrame, cfg: PipelineConfig | None = None) -> pd.DataFrame:
+    """Rows ready for the baseline features: day_of_week derived, numeric.
+
+    The six old features are NaN-free (filled with 0). recent_level_28d stays NaN when
+    unknown (XGBoost handles missing natively). If the column is absent it is computed
+    here from entity_df itself with the training (lagged) definition.
+    """
     df = entity_df.reset_index(drop=True).copy()
     if "day_of_week" not in df.columns:
         df["day_of_week"] = pd.to_datetime(df["park_date"]).dt.dayofweek.astype(np.float32)
-    for col in BASELINE_FEATURES:
+    for col in BASELINE_FEATURES_V6:
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
     df["actual_time"] = pd.to_numeric(df["actual_time"], errors="coerce")
+    if recent_level.enabled(cfg):
+        if recent_level.FEATURE not in df.columns:
+            w, lag, m = recent_level.params(cfg)
+            df[recent_level.FEATURE] = recent_level.recent_level_for_rows(
+                df["park_date"], df["actual_time"], w, lag, m)
+        else:
+            df[recent_level.FEATURE] = pd.to_numeric(df[recent_level.FEATURE], errors="coerce")
     return df
 
 
@@ -229,14 +251,15 @@ def fit_baseline(
     """Fit the baseline model with geo-decay weights relative to as_of. None if too little data."""
     if len(entity_df) < min_samples:
         return None
-    if any(f not in entity_df.columns for f in BASELINE_FEATURES if f != "day_of_week"):
+    if any(f not in entity_df.columns for f in BASELINE_FEATURES_V6 if f != "day_of_week"):
         return None
-    entity_df = baseline_matrix(entity_df)
+    features = baseline_features(cfg)
+    entity_df = baseline_matrix(entity_df, cfg)
 
-    X_all = entity_df[BASELINE_FEATURES].values.astype(np.float32)
+    X_all = entity_df[features].values.astype(np.float32)
     y_all = entity_df["actual_time"].values.astype(np.float32)
 
-    valid_mask = ~np.isnan(y_all) & (y_all > 0) & ~np.any(np.isnan(X_all), axis=1)
+    valid_mask = ~np.isnan(y_all) & (y_all > 0) & ~np.any(np.isnan(entity_df[BASELINE_FEATURES_V6].values), axis=1)
     if valid_mask.sum() < min_samples:
         return None
 
@@ -288,7 +311,7 @@ def fit_baseline(
     mae = float(np.mean(np.abs(y_val - pred)))
     best_trees = getattr(bst, "best_iteration", cfg.training_rounds)
     return bst, {"n_train": split, "n_val": n - split, "mae": mae,
-                 "best_trees": best_trees, "params": params}
+                 "best_trees": best_trees, "params": params, "features": features}
 
 
 def _scan_entity_counts(parquet_files: list[Path]) -> dict[str, int]:

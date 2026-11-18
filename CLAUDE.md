@@ -29,7 +29,8 @@ df = con.execute(f"""
 
 - `pipeline/pipeline.py` — **Main pipeline entry point** (V4, runs daily at 6 AM ET)
 - `pipeline/steps/s06b_training_data.py` — Rebuilds per-park actuals training data + extends encoding_mappings.json (before s07)
-- `pipeline/steps/s07_training.py` — Per-entity XGBoost training (per-park geo-decay half-life: `geo_decay_halflife_days_per_park`)
+- `pipeline/steps/s07_training.py` — Per-entity XGBoost training (per-park geo-decay half-life: `geo_decay_halflife_days_per_park`; 7th feature `recent_level_28d`, config `recent_level_*`, off-switch `recent_level_enabled`)
+- `pipeline/core/recent_level.py` — Shared leak-free recent-level feature (train: window [d-35, d-7); forecast: [as_of-28, as_of); NaN if < 50 rows)
 - `pipeline/steps/s07a_calendar.py` — Refreshes closures, dimentity, operating calendar, encodings (fail-soft, before s08)
 - `pipeline/backtest/decay_grid.py` — Half-life x min_training_year back-test (TPCR-BIAS-001 fix 4)
 - `pipeline/steps/s14_content.py` — Content generation + quality gate for tweets

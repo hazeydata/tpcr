@@ -40,6 +40,7 @@ except ImportError:
 
 from pipeline.config import PipelineConfig
 from pipeline.core import paths
+from pipeline.core import recent_level
 from pipeline.core.encodings import load_mappings, lookup
 from pipeline.core.db import read_connection
 from pipeline.core.logging import PipelineLogger
@@ -51,7 +52,10 @@ FEATURES_BASELINE = [
     "mins_since_6am", "mins_since_open",
     "date_group_id_encoded", "season_encoded", "season_year_encoded",
     "day_of_week",
+    recent_level.FEATURE,  # TPCR-ACCURACY-001 (NaN allowed; XGBoost treats as missing)
 ]
+# Pre-recent-level 6-feature set: old models, legacy model paths, challengers
+FEATURES_BASELINE_V6 = [f for f in FEATURES_BASELINE if f != recent_level.FEATURE]
 FEATURES_LITE = ["mins_since_6am", "mins_since_open"]
 FEATURES_LEGACY_V2 = [
     "posted_time", "mins_since_6am", "mins_since_open",
@@ -78,6 +82,7 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
     log.info("=" * 60)
 
     start_date = date.today()  # Include today — users ask about "today" and need predicted values
+    as_of = start_date  # forecast issue date: the recent-level feature sees only data < as_of
     end_date = start_date + timedelta(days=cfg.forecast_days)
     log.info(f"Forecast range: {start_date} to {end_date} ({cfg.forecast_days} days)")
 
@@ -89,6 +94,7 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
         entity_list = _load_entity_list(cfg, log)
         oc_by_entity = _load_operating_calendar_indexed(cfg, log)
         fallback_ratios = _load_fallback_ratios(cfg, log)
+        recent_levels = _load_recent_levels(cfg, log, as_of)
 
     # Group entities by park
     park_entities: dict[str, list[str]] = {}
@@ -155,6 +161,7 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
                         entity_code, park_code, time_grid,
                         cfg.models_dir, agg_by_entity, park_open_mins,
                         fallback_ratios, oc_by_entity,
+                        recent_levels=recent_levels,
                     )
                     if result is not None and len(result) > 0:
                         park_results.append(result)
@@ -263,6 +270,7 @@ def _forecast_entity_fast(
     park_open_mins: dict,
     fallback_ratios: dict,
     oc_by_entity: dict | None,
+    recent_levels: dict | None = None,
 ) -> tuple[pd.DataFrame | None, str]:
     """Generate forecast for a single entity. O(1) lookups, no scanning.
 
@@ -279,6 +287,10 @@ def _forecast_entity_fast(
     # baseline if day_of_week were missing after retrain.)
     if "day_of_week" in FEATURES_BASELINE and "day_of_week" not in df.columns:
         df["day_of_week"] = pd.to_datetime(df["park_date"]).dt.dayofweek.astype(np.float32)
+
+    # Recent level (same value for every target day: level as of the issue date).
+    # NaN when unknown/too few rows; models without the feature ignore the column.
+    df[recent_level.FEATURE] = float((recent_levels or {}).get(entity_code, np.nan))
 
     # O(1) operating calendar filter
     if oc_by_entity is not None:
@@ -330,13 +342,15 @@ def _forecast_entity_fast(
         if meta_features is not None:
             missing = [f for f in meta_features if f not in df.columns]
             if missing:
-                features = FEATURES_BASELINE
+                # Match the model's width: never feed 6 columns to a 7-feature model or vice versa
+                n_model = int(getattr(model, "n_features_in_", len(FEATURES_BASELINE_V6)))
+                features = FEATURES_BASELINE[:n_model] if n_model in (6, 7) else FEATURES_BASELINE_V6
                 feat_key = "baseline_fallback"
             else:
                 features = meta_features
                 feat_key = f"baseline_{len(features)}feat"
         else:
-            features = FEATURES_BASELINE
+            features = FEATURES_BASELINE_V6  # no metadata: assume a pre-recent-level model
             feat_key = "baseline_default"
         method = "model_baseline"
 
@@ -345,7 +359,7 @@ def _forecast_entity_fast(
         model.load_model(str(actuals_path))
         meta = _read_metadata(entity_dir, "metadata_julia_actuals.json")
         is_lite = meta and (meta.get("model_label") == "XGBOOST_ACTUALS_LITE" or meta.get("version") == "actuals_lite")
-        features = FEATURES_LITE if is_lite else FEATURES_BASELINE
+        features = FEATURES_LITE if is_lite else FEATURES_BASELINE_V6
         method = "model_legacy_actuals"
         feat_key = "legacy_actuals_lite" if is_lite else "legacy_actuals"
 
@@ -377,6 +391,20 @@ def _forecast_entity_fast(
 # =========================================================================
 # Data loading helpers — PRE-INDEXED
 # =========================================================================
+
+def _load_recent_levels(cfg: PipelineConfig, log: PipelineLogger, as_of: date) -> dict:
+    """entity_code -> trailing-window mean actual_time over [as_of-window, as_of). {} if disabled."""
+    if not recent_level.enabled(cfg):
+        return {}
+    window, _, min_rows = recent_level.params(cfg)
+    levels = recent_level.load_recent_levels(
+        paths.training_data_dir(cfg), as_of, window, min_rows,
+        combined_path=paths.training_data_combined_path(cfg),
+    )
+    log.info(f"Recent level: {len(levels)} entities with >= {min_rows} rows in [{as_of - timedelta(days=window)}, {as_of})")
+    log.metric("recent_level_entities", len(levels))
+    return levels
+
 
 def _load_date_features(cfg: PipelineConfig, log: PipelineLogger) -> dict:
     """Encoded calendar features per date; dates with an unmapped label are omitted."""

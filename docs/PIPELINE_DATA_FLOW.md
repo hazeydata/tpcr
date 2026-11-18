@@ -939,6 +939,7 @@ Fred reviewed all open questions. Resolved decisions:
 
 - **ETL → Parquet directly:** Why produce CSVs then convert? Future refactor: ETL should output parquet directly, eliminating Step 1b.
 - **Posted aggregates review:** Are these still needed? They feed the forecast step's "expected posted time" for entities without models. If we move to synthetic-actuals-based training, this step may change.
+- *(Update, TPCR-ACCURACY-001: the V4 baseline now also has `day_of_week` and `recent_level_28d`; see docs/PIPELINE_V4_DESIGN.md Step 7.)*
 - **"Actuals-First" method:** With synthetic actuals, we're dropping POSTED as a training feature. The POSTED→ACTUAL relationship is already captured by the conversion model (separation of concerns). Forecast models will train on temporal features only (mins_since_6am, mins_since_open, date_group_id, season, season_year), predicting actual wait times directly. POSTED times exist solely to feed the conversion model. This is a significant architectural upgrade — A/B comparison required before replacing production models.
 - **Accuracy eval ground truth:** Include synthetic actuals as "observations" in accuracy evaluation, not just raw ACTUAL. This dramatically increases evaluation coverage.
 - **Park hours donor filtering:** Exclude outlier hours from donor pool (e.g., MK closing at 4 PM for corporate events). Reject openings after 9:30 AM, closings before 5 PM where abnormal. Consider minimum frequency filter.

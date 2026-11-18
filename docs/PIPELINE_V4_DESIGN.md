@@ -38,7 +38,7 @@
 
 ### Key Numbers
 - 431 entities with trained models (79.5% of 542)
-- 5 features: mins_since_6am, mins_since_open, date_group_id_encoded, season_encoded, season_year_encoded
+- 6 features: mins_since_6am, mins_since_open, date_group_id_encoded, season_encoded, season_year_encoded, day_of_week; plus `recent_level_28d` (TPCR-ACCURACY-001, see Step 7) for models trained after that change
 - XGBoost: max_depth=10, eta=0.1, n_estimators=2000, early_stopping=20
 - Geo-decay half-life: 730 days
 - WDW parks: min_training_year=2016
@@ -148,12 +148,21 @@ pipeline/                           # was: pipeline_v3/
 **Does:** Trains one XGBoost model per entity using real actuals (weighted 10×) + synthetic actuals (weighted 1×). Geo-decay weighting. Per-park min_training_year cutoff. Saves as `model_baseline.json`.
 **Inputs:** `synthetic_actuals/`, `fact_tables/parquet/`, `dimension_tables/`, `state/encoding_mappings.json`
 **Outputs:** `models/{entity_code}/model_baseline.json`, `models/{entity_code}/metadata_baseline.json`
-**Features:** mins_since_6am, mins_since_open, date_group_id_encoded, season_encoded, season_year_encoded
+**Features:** mins_since_6am, mins_since_open, date_group_id_encoded, season_encoded, season_year_encoded, day_of_week, recent_level_28d
+
+**Recent-level feature (TPCR-ACCURACY-001):** a 7th baseline feature, `recent_level_28d`, appended last. It is the mean `actual_time` (> 0, non-NaN, all sources, unweighted) of the entity's own training rows, so the model can follow a ride that is running below/above its history.
+- *Training row on park_date d:* rows with park_date in [d - lag - window, d - lag). Nothing at or after d - lag (including d) is seen. Defaults window=28, lag=7.
+- *Forecast (s08):* for every target day, rows with park_date in [as_of - window, as_of), `as_of` = forecast issue date (the date s08 runs). Read from the same training data s07 uses (`entity_code, park_date, actual_time` only).
+- *Missing:* fewer than `recent_level_min_rows` (50) qualifying rows in the window gives NaN (never 0); XGBoost treats it as missing (the six old features are still 0-filled).
+- *Staleness:* training uses a 7-day lag so the feature is about as stale as at forecast time (forecasts are issued up to ~2 weeks ahead). The forecast feature is constant across the horizon 1..N, so far-horizon rows get a level that is as old as the horizon; there is no horizon-aware training.
+- *Config (global, same for every park):* `recent_level_enabled=True`, `recent_level_window_days=28`, `recent_level_lag_days=7`, `recent_level_min_rows=50` in `PipelineConfig`. `recent_level_enabled=False` trains/forecasts exactly the old 6 features.
+- *Compatibility:* s08 picks features from each model's `metadata_baseline.json`, so existing 6-feature models forecast unchanged until retrained; models without metadata and the legacy paths assume the 6-feature set. Challenger models keep the 6 features. Code: `pipeline/core/recent_level.py`.
+- *Status:* implemented; its effect on accuracy has not been measured.
 **Hyperparameters:** max_depth=10, eta=0.1, n_estimators=2000, subsample=0.8, colsample_bytree=0.8, early_stopping=20, geo_decay_halflife=730
 
 ### Step 8: Forecast
 **Script:** `step_08_forecast.py`
-**Does:** Generates predictions for all entities × all dates × all time slots. Loads `model_baseline.json` (or fallback to aggregate if no model).
+**Does:** Generates predictions for all entities × all dates × all time slots. Loads `model_baseline.json` (or fallback to aggregate if no model). Features come from the model metadata; `recent_level_28d` is computed once per run as of the issue date (see Step 7).
 **Inputs:** `models/{entity}/model_baseline.json`, `dimension_tables/`, `aggregates/`, `operating_calendar/`
 **Outputs:** `forecasts/all_forecasts.parquet`
 **NO POST-PROCESSING.** Raw model output only. No bias correction, no quantile mapping.
