@@ -11,8 +11,9 @@ LIGHT = ((0, 4351), (8192, 8205), (8208, 8223), (8242, 8247))
 COUNT = {1: "One park", 2: "Two parks", 3: "Three parks"}
 URL = re.compile(r"https?://\S+")
 URL_WEIGHT = 23
-# TPCR-DISCORD-GROWTH-001 (Fred, Nov 18 2026): OBSERVED reply only, inside the config/tweet_format.json discord_cta window.
-DISCORD_CTA = "Free daily forecasts live on our Discord: https://discord.gg/{code}"
+# TPCR-DISCORD-GROWTH-001 (Fred, Nov 18 2026): text of the separate Discord reply threaded under the OBSERVED post
+# (never part of the OBSERVED or FORECAST text). tweet_format.discord_cta_reply fills invite_url from config.
+DISCORD_CTA = "Free daily forecasts live on our Discord: {invite_url}"
 
 
 def weighted_len(t):
@@ -84,12 +85,9 @@ def reply_line(p, v, tiers):
     return f"{mark} {p}: {v['ob']:.1f} (forecast {v['fc']:.1f})"
 
 
-def reply_text(m, tiers, cta=None):
-    """m = cards.py R-DATE.meta.json. No tiers (unset in config) -> None. cta = the full Discord line
-    (tweet_format.discord_cta_line) or None: appended after a blank line; if that goes over the limit the text
-    posts without it (the CTA never silences the numbers)."""
+def reply_text(m, tiers):
+    """m = cards.py R-DATE.meta.json. No tiers (unset in config) -> None."""
     if not m.get("graded") or not tiers:
         return None
     rows = [reply_line(p, v, tiers) for p, v in m["parks"].items()]
-    t = f"WDW Crowds OBSERVED: {_day(m['date'])}\n{reply_summary(m, tiers)}\n\n" + "\n".join(rows) + "\n\nLower WTI = shorter waits."
-    return (_fit(t + "\n\n" + cta) if cta else None) or _fit(t)
+    return _fit(f"WDW Crowds OBSERVED: {_day(m['date'])}\n{reply_summary(m, tiers)}\n\n" + "\n".join(rows) + "\n\nLower WTI = shorter waits.")

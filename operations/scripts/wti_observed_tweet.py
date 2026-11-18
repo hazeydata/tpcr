@@ -16,6 +16,11 @@ reference_date. For example, the observed tweet for March 30 replies to
 the predicted tweet for March 30 (which was posted on March 29 at 4 PM).
 
 Looks up the predicted tweet_id from tweet_state.json["predicted"][reference_date].
+
+TPCR-DISCORD-GROWTH-001 (Fred, Nov 18 2026): after a successful new-format OBSERVED post, an optional SEPARATE
+text-only Discord CTA reply is threaded under it (post_discord_cta_reply). Off unless env TPCR_DISCORD_CTA_REPLY=1 and
+config/tweet_format.json discord_cta holds a real invite and today's America/Toronto date inside its window. It is
+failure-isolated: it never changes the OBSERVED post, its state, or this script's exit status.
 """
 
 import json
@@ -25,6 +30,7 @@ import sys
 import time
 from datetime import date, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import requests
 from requests_oauthlib import OAuth1
@@ -270,6 +276,76 @@ def posted_without_id(reference_date, reply_to):
     return None
 
 
+CTA_IN_REPLY_TO = "<id of the OBSERVED post, assigned when it posts>"
+
+
+def cta_today():
+    """The America/Toronto posting date now (the discord_cta window is in these dates)."""
+    return tweet_v2.now().astimezone(ZoneInfo(tweet_v2.MINI_TZ)).date()
+
+
+def discord_cta_dry(observed_posts, reply_to):
+    """Dry-run view of the Discord CTA reply: (manifest object, printable lines). Never raises, no network."""
+    text, reason = tweet_format.discord_cta_reply(cta_today())
+    would = bool(text and observed_posts)
+    info = {"would_post": would, "reason": reason if observed_posts or not text else f"{reason}; OBSERVED would not post",
+            "text": text, "in_reply_to": CTA_IN_REPLY_TO, "observed_reply_to_tweet_id": reply_to}
+    lines = [f"DRY RUN discord_cta_reply: would_post={would} reason={info['reason']}"]
+    if text:
+        lines += [text, f"in_reply_to={CTA_IN_REPLY_TO}", f"thread: forecast {reply_to} -> OBSERVED -> Discord reply"]
+    return info, lines
+
+
+def post_discord_cta_reply(observed_id, reference_date):
+    """TPCR-DISCORD-GROWTH-001: after the OBSERVED post succeeded (real id), post the Discord line as its own
+    text-only reply under it, when tweet_format.discord_cta_reply says on. Failure-isolated: ANY problem is logged
+    (stderr ERROR + best-effort Discord warning) and swallowed. Never raises, never exits, never retries, never touches
+    the OBSERVED post or its state."""
+    try:
+        today = cta_today()
+        text, reason = tweet_format.discord_cta_reply(today)
+        if not text:
+            print(f"discord_cta_reply ref={reference_date}: {reason}")
+            return
+        tweet_id = post_tweet(text, reply_to=observed_id)
+        if not tweet_id or tweet_id is tweet_v2.ID_MISSING:
+            raise RuntimeError("X returned no tweet id" if tweet_id else "post failed (API error or no response)")
+        print(f"discord_cta_reply ref={reference_date}: posted {tweet_id} in reply to {observed_id}")
+        _save_cta_state(tweet_id, observed_id, reference_date)
+        post_discord(f":speech_balloon: **WTI Observed Discord CTA reply posted** — ref={reference_date}\n"
+                     + tweet_v2.status_url(tweet_id))
+    except Exception as exc:  # noqa: BLE001 - must never touch the OBSERVED run's outcome; no secrets: type + short msg
+        msg = f"{type(exc).__name__}: {str(exc)[:200]}"
+        try:
+            print(f"ERROR discord_cta_reply ref={reference_date}: {msg}", file=sys.stderr)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            post_discord(f":warning: **WTI Observed Discord CTA reply** — ref={reference_date}: {msg}"[:1900])
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _save_cta_state(tweet_id, observed_id, reference_date):
+    """tweet_state.json["discord_cta_reply"][D] = {tweet_id, in_reply_to, posted_at}; pruned > 14 days like save_state."""
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with tweet_note.locked(STATE_FILE):
+        state = {}
+        if STATE_FILE.exists():
+            try:
+                state = json.loads(STATE_FILE.read_text())
+            except json.JSONDecodeError:
+                pass
+        state.setdefault("discord_cta_reply", {})[reference_date] = {
+            "tweet_id": tweet_id, "in_reply_to": observed_id,
+            "posted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        cutoff = (date.today() - timedelta(days=14)).isoformat()
+        state["discord_cta_reply"] = {k: v for k, v in state["discord_cta_reply"].items()
+                                      if k >= cutoff or k == reference_date}
+        tweet_note._save(STATE_FILE, state)
+
+
 def reply_old_format(reference_date, content, reply_to, how, fmt_why, dry, args, state_file, guard):
     """Old-format reply (pre-v2 video + text, now with alt text) to an old-format original. Overlap window only."""
     print(f"OLD FORMAT reply for ref={reference_date} to {reply_to} ({fmt_why})")
@@ -409,8 +485,10 @@ def main(argv=None):
         print(f"\nTweet ({len(tweet_text or '')} chars, ref={reference_date}, reply_to={reply_to}):\n{tweet_text}\n")
 
         if dry:
+            cta_info, cta_lines = discord_cta_dry(bool(r and reply_to), reply_to)
+            print("\n".join(cta_lines))
             tweet_v2.write_manifest(work, {
-                "would_post": bool(r and reply_to),
+                "would_post": bool(r and reply_to), "discord_cta_reply": cta_info,
                 "mode": "dry-run", "kind": "observed", "reference_date": reference_date,
                 "posts_at": f"{(date.fromisoformat(reference_date) + timedelta(days=1)).isoformat()} 08:30 America/New_York",
                 "reply_to_tweet_id": reply_to, "reply_to_lookup": how, "state_file": str(state_file),
@@ -448,6 +526,7 @@ def main(argv=None):
             f"Replied to predicted tweet: {reply_to}\n"
             f"{tweet_v2.status_url(tweet_id)}"
         )
+        post_discord_cta_reply(tweet_id, reference_date)  # TPCR-DISCORD-GROWTH-001: isolated, never raises
         print("Done.")
     finally:
         tweet_v2.cleanup(tmp)

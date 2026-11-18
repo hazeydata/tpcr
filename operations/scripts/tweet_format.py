@@ -9,7 +9,10 @@ Store: tweet_formats.json next to tweet_state.json, {"<tweet_id>": {"format": "o
 (its tweet_state posted_at vs FIRST_NEW_RUN; unknown = old inside the window, new after it).
 
 CLI (Mini migration, idempotent): python3 tweet_format.py --migrate STATE_FILE [--dry-run]
-tags every predicted/observed tweet in tweet_state.json that has no tag, by its posted_at."""
+tags every predicted/observed tweet in tweet_state.json that has no tag, by its posted_at.
+
+TPCR-DISCORD-GROWTH-001: also owns discord_cta_reply(), the pure never-raising gate (env flag + config window + invite
+checks) for the separate Discord reply threaded under the OBSERVED post. Off by default."""
 import json
 import os
 import re
@@ -55,28 +58,34 @@ def _tiers(cfg):
 
 REPLY_TIERS, TIERS_ERROR = _tiers(_cfg) if not CONFIG_ERROR else (None, CONFIG_ERROR)
 
-# TPCR-DISCORD-GROWTH-001 (Fred, Nov 18 2026): one Discord line on the 8:30 AM OBSERVED reply, for at most 14 posting
-# days. discord_cta = {code, first_post_date, last_post_date}; dates are America/Toronto posting dates, inclusive.
-DISCORD_CODE = re.compile(r"^[A-Za-z0-9-]{2,32}$")
+# TPCR-DISCORD-GROWTH-001 (Fred, Nov 18 2026): the Discord CTA is its OWN text-only post, threaded as a reply under the
+# 8:30 AM OBSERVED post, for at most 14 posting days. The OBSERVED text is never touched.
+# discord_cta = {invite_url, first_post_date, last_post_date}; dates are America/Toronto posting dates, inclusive.
+# Two gates, both required: env TPCR_DISCORD_CTA_REPLY == "1" AND a valid, non-placeholder config window.
+DISCORD_FLAG = "TPCR_DISCORD_CTA_REPLY"
+DISCORD_URL = re.compile(r"^https://discord\.gg/[A-Za-z0-9-]{2,32}$")
 ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 DISCORD_MAX_SPAN = timedelta(days=13)  # last - first: 14 posts
+SHARED_INVITE = "2Estr7sbP7"  # the shared untracked invite; the plan says never reuse it on new placements
+CTA_KEYS = ("invite_url", "first_post_date", "last_post_date")
 
 
 def _discord_cta(cfg):
-    """(cta, error): cta = {"code", "first", "last"} (dates as date) or None. Missing key or all null = (None, None)."""
+    """(cta, error): cta = {"invite_url", "first", "last"} (dates as date) or None. Missing key or all null = (None, None).
+    A null invite_url with both dates set parses (invite_url None); discord_cta_reply then skips it as 'invite missing'."""
     raw = cfg.get("discord_cta") if isinstance(cfg, dict) else None
     if raw is None:
         return None, None
     if not isinstance(raw, dict):
         return None, f"discord_cta is {type(raw).__name__}, not an object"
-    vals = [raw.get(k) for k in ("code", "first_post_date", "last_post_date")]
+    vals = [raw.get(k) for k in CTA_KEYS]
     if all(v is None for v in vals):
         return None, None
-    code, first, last = vals
-    if any(v is None for v in vals):
-        return None, f"discord_cta partially set ({vals!r}); need code, first_post_date and last_post_date"
-    if not isinstance(code, str) or not DISCORD_CODE.match(code):
-        return None, f"discord_cta.code {code!r} invalid; need ^[A-Za-z0-9-]{{2,32}}$"
+    url, first, last = vals
+    if first is None or last is None:
+        return None, f"discord_cta partially set ({vals!r}); need first_post_date and last_post_date (and invite_url)"
+    if url is not None and (not isinstance(url, str) or not DISCORD_URL.match(url)):
+        return None, f"discord_cta.invite_url {url!r} invalid; need ^https://discord\\.gg/[A-Za-z0-9-]{{2,32}}$"
     try:
         if not all(isinstance(d, str) and ISO_DATE.match(d) for d in (first, last)):
             raise ValueError("not YYYY-MM-DD")
@@ -87,42 +96,81 @@ def _discord_cta(cfg):
         return None, f"discord_cta first_post_date {first} is after last_post_date {last}"
     if l - f > DISCORD_MAX_SPAN:
         return None, f"discord_cta window {first}..{last} is {(l - f).days + 1} days; max 14 (last = first + 13)"
-    return {"code": code, "first": f, "last": l}, None
+    return {"invite_url": url, "first": f, "last": l}, None
 
 
-def parse_discord_cta(cfg, err=None):
-    """The validated discord_cta, or None (line off). Partial/invalid: one ERROR line on stderr. Never raises."""
+def parse_discord_cta_checked(cfg, err=None):
+    """(cta, error). Partial/invalid: cta None, error set, one ERROR line on stderr. Never raises."""
     try:
         cta, e = _discord_cta(cfg)
     except Exception as x:  # noqa: BLE001 - never crash the import
         cta, e = None, f"{type(x).__name__}: {x}"
     if e:
-        print(f"ERROR tweet_format: {e}; Discord line off", file=err or sys.stderr)
-    return cta
+        print(f"ERROR tweet_format: {e}; Discord CTA reply off", file=err or sys.stderr)
+    return cta, e
 
 
-DISCORD_CTA = parse_discord_cta(_cfg) if not CONFIG_ERROR else None
+def parse_discord_cta(cfg, err=None):
+    """The validated discord_cta, or None (reply off). Partial/invalid: one ERROR line on stderr. Never raises."""
+    return parse_discord_cta_checked(cfg, err)[0]
 
 
-def discord_cta_line(today, cta=None):
-    """The exact Discord line (tweet_copy.DISCORD_CTA) when the America/Toronto date today (a date, or an aware
-    datetime converted to ET) is inside the window, else None. cta defaults to DISCORD_CTA. Never raises."""
+DISCORD_CTA, DISCORD_CTA_ERROR = parse_discord_cta_checked(_cfg) if not CONFIG_ERROR else (None, None)
+
+
+def placeholder_reason(url):
+    """Why an invite URL is a placeholder / not allowed, or None for a real-looking one."""
+    code = url.rsplit("/", 1)[-1]
+    low = code.lower()
+    if low.startswith("invite"):
+        return f"placeholder invite (code {code!r} starts with INVITE)"
+    for bad in ("placeholder", "example", "xxx"):
+        if bad in low:
+            return f"placeholder invite (code {code!r} contains {bad!r})"
+    if low == "x-daily":
+        return "placeholder invite (code 'x-daily' is the plan name, not a real code)"
+    if code == SHARED_INVITE:
+        return "shared untracked invite code must not be reused on new placements"
+    return None
+
+
+def discord_cta_reply(today, environ=os.environ, cta=None):
+    """(text, reason): text = the exact Discord reply text when every gate passes, else None; reason is always a
+    short string (logged by the caller). today = the America/Toronto posting date (a date, or an aware datetime
+    converted to that zone). cta: the parsed config (default DISCORD_CTA). Pure; never raises."""
     try:
+        if environ.get(DISCORD_FLAG) != "1":
+            return None, f"off: {DISCORD_FLAG} not 1"
         cta = DISCORD_CTA if cta is None else cta
         if not cta:
-            return None
+            if DISCORD_CTA_ERROR:
+                return None, f"skipped: config invalid ({DISCORD_CTA_ERROR})"
+            return None, "skipped: config discord_cta not set"
+        url = cta.get("invite_url")
+        if not url:
+            return None, "skipped: invite missing (discord_cta.invite_url not set)"
+        if not isinstance(url, str) or not DISCORD_URL.match(url):
+            return None, f"skipped: config invalid (invite_url {url!r})"
+        why = placeholder_reason(url)
+        if why:
+            return None, f"skipped: {why}"
         if isinstance(today, datetime):
             today = today.astimezone(ET).date() if today.tzinfo else today.date()
         if not cta["first"] <= today <= cta["last"]:
-            return None
+            return None, f"skipped: outside window (today {today}, window {cta['first']}..{cta['last']})"
         v2 = str(Path(os.environ.get("TPCR_TWEET_V2_DIR") or Path(__file__).resolve().parents[1] / "tweet_v2"))
         if v2 not in sys.path:
             sys.path.insert(0, v2)
         import tweet_copy
-        return tweet_copy.DISCORD_CTA.format(code=cta["code"])
-    except Exception as e:  # noqa: BLE001 - the CTA must never stop the reply
-        print(f"ERROR tweet_format: Discord line lookup failed ({type(e).__name__}: {e}); line off", file=sys.stderr)
-        return None
+        text = tweet_copy.DISCORD_CTA.format(invite_url=url)
+        n = tweet_copy.weighted_len(text)
+        if n > tweet_copy.LIMIT:
+            return None, f"skipped: reply text {n} over {tweet_copy.LIMIT}"
+        return text, "on"
+    except Exception as e:  # noqa: BLE001 - the CTA must never stop anything
+        return None, f"skipped: config invalid ({type(e).__name__}: {e})"
+
+
 CONFIG_REASON = "config missing/invalid: everything new"
 
 
