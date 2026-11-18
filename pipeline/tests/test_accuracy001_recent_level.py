@@ -12,6 +12,7 @@ from pipeline.config import PipelineConfig
 from pipeline.core import recent_level as rl
 from pipeline.core.logging import PipelineLogger
 from pipeline.steps import s07_training, s08_forecast
+from pipeline.steps.s08_forecast import _forecast_entity_fast as forecast_entity
 
 START = date(2026, 1, 1)
 N_DAYS = 120
@@ -132,7 +133,7 @@ def _grid(entity_days=3):
 
 
 def _forecast(cfg, grid, levels=None):
-    return s08_forecast._forecast_entity_fast("AK85", "AK", grid, cfg.models_dir, {}, {},
+    return forecast_entity("AK85", "AK", grid, cfg.models_dir, {}, {},
                                               {"__global__": 0.7}, None, recent_levels=levels)
 
 
@@ -208,7 +209,7 @@ def test_s08_feeds_level_only_within_horizon(tmp_path, monkeypatch):
         return real_predict(self, X, *a, **k)
 
     monkeypatch.setattr(s08_forecast.xgb.XGBRegressor, "predict", capture)
-    out, key = s08_forecast._forecast_entity_fast(
+    out, key = forecast_entity(
         "AK85", "AK", grid, cfg.models_dir, {}, {}, {"__global__": 0.7}, None,
         recent_levels={"AK85": 77.0}, as_of=T, recent_level_max_horizon_days=14)
     assert key == "baseline_7feat" and len(out) == 8
@@ -216,7 +217,7 @@ def test_s08_feeds_level_only_within_horizon(tmp_path, monkeypatch):
     np.testing.assert_array_equal(col[:4], np.float32(77.0))  # as_of + 14 -> level
     assert np.isnan(col[4:]).all()                            # as_of + 15 -> NaN
     # as_of omitted: defaults to the grid's first date (T+14) -> both days within 14
-    s08_forecast._forecast_entity_fast(
+    forecast_entity(
         "AK85", "AK", grid, cfg.models_dir, {}, {}, {"__global__": 0.7}, None,
         recent_levels={"AK85": 77.0})
     np.testing.assert_array_equal(seen[-1][:, -1], np.float32(77.0))
@@ -436,7 +437,7 @@ def test_yoy_end_to_end_metadata_and_spec_mismatch(tmp_path, monkeypatch):
     grid = _grid(entity_days=1).assign(park_date=T)
     stats = {}
     args = ("AK85", "AK", grid, cfg.models_dir, {}, {}, {"__global__": 0.7}, None)
-    out, key = s08_forecast._forecast_entity_fast(*args, recent_levels={"AK85": 1.1}, as_of=T,
+    out, key = forecast_entity(*args, recent_levels={"AK85": 1.1}, as_of=T,
                                                   recent_level_spec=rl.spec(cfg), stats=stats)
     assert key == "baseline_7feat" and stats.get("recent_level_spec_mismatch", 0) == 0
     np.testing.assert_array_equal(seen[-1][:, -1], np.float32(1.1))
@@ -444,12 +445,12 @@ def test_yoy_end_to_end_metadata_and_spec_mismatch(tmp_path, monkeypatch):
     for k in rl.spec(cfg):
         meta.pop(k)
     meta_path.write_text(json.dumps(meta))
-    out, key = s08_forecast._forecast_entity_fast(*args, recent_levels={"AK85": 1.1}, as_of=T,
+    out, key = forecast_entity(*args, recent_levels={"AK85": 1.1}, as_of=T,
                                                   recent_level_spec=rl.spec(cfg), stats=stats)
     assert len(out) == 4 and stats["recent_level_spec_mismatch"] == 1
     assert np.isnan(seen[-1][:, -1]).all()
     # ... and its level under kind "mean" with the same metadata
-    out, key = s08_forecast._forecast_entity_fast(
+    out, key = forecast_entity(
         *args, recent_levels={"AK85": 30.0}, as_of=T,
         recent_level_spec=rl.spec(PipelineConfig(recent_level_kind="mean")), stats=stats)
     assert stats["recent_level_spec_mismatch"] == 1
@@ -519,7 +520,7 @@ def _sy_forecast(cfg, codes, mapping, monkeypatch):
     monkeypatch.setattr(s08_forecast.xgb.XGBRegressor, "predict", capture)
     grid = pd.concat([_grid(entity_days=1).assign(season_year_encoded=c) for c in codes], ignore_index=True)
     stats = {}
-    out, key = s08_forecast._forecast_entity_fast(
+    out, key = forecast_entity(
         "AK85", "AK", grid, cfg.models_dir, {}, {}, {"__global__": 0.7}, None,
         stats=stats, season_year_mapping=mapping)
     assert key == "baseline_7feat" and len(out) == 4 * len(codes)
