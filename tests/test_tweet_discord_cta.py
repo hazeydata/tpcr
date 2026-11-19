@@ -213,7 +213,7 @@ class Decision(unittest.TestCase):
 
 
 def re_kind(reason):
-    for k in ("INVITE", "'placeholder'", "'example'", "'xxx'", "x-daily", "shared untracked"):
+    for k in ("INVITE", "'placeholder'", "'example'", "'xxx'", "x-daily"):
         if k in reason:
             return k
     return reason
