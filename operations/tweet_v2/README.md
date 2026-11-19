@@ -228,7 +228,7 @@ Optional: `--content-dir DIR` (local `predicted_D.json`/`observed_D.json` instea
 `--state-file`, `--park-hours dimparkhours.csv`, `--closures closures.csv`.
 
 ## Discord CTA reply (TPCR-DISCORD-GROWTH-001)
-**Status: OFF.** The real x-daily invite code is not yet supplied (Fred supplies it via the chief); enabling is a separate approved step.
+**Status: OFF.** Enabling is a separate approved step. `https://discord.gg/2Estr7sbP7` (Fred Nov 19 2026, never expires) is a valid `invite_url`, set in the Mini config at enable; the committed config stays all-null.
 
 What: Fred, Nov 18 2026: the Discord line is its own text-only post, threaded as a reply under the 8:30 AM OBSERVED post, for a 14-day run.
 The reply text is exactly `Free daily forecasts live on our Discord: <invite_url>` (`tweet_copy.DISCORD_CTA`; a URL weighs 23). The OBSERVED
@@ -240,11 +240,11 @@ Gates (both required, else nothing is posted):
   `^https://discord\.gg/[A-Za-z0-9-]{2,32}$` and comes only from config. Dates are America/Toronto posting dates (the day the reply goes out, not
   park day D), inclusive, `last = first + 13` (14 posts max). All null = off; partial or invalid = off plus one `ERROR tweet_format:` line on stderr.
 - Placeholder invites are skipped with a logged reason even when the flag is on: null/missing, a code starting with `INVITE` (any case, e.g.
-  `https://discord.gg/INVITE-X-DAILY`), containing `placeholder`, `example` or `xxx`, equal to `x-daily`, or the shared untracked code `2Estr7sbP7`.
+  `https://discord.gg/INVITE-X-DAILY`), containing `placeholder`, `example` or `xxx`, or equal to `x-daily`.
 - A posting date outside the window is skipped with a logged reason.
 
 The decision is one pure never-raising function, `tweet_format.discord_cta_reply(today, environ, cta) -> (text|None, reason)`; reasons: `off: TPCR_DISCORD_CTA_REPLY not 1`,
-`skipped: invite missing`, `skipped: placeholder invite ...`, `skipped: shared untracked invite ...`, `skipped: outside window ...`, `skipped: config invalid ...`, `on`.
+`skipped: invite missing`, `skipped: placeholder invite ...`, `skipped: outside window ...`, `skipped: config invalid ...`, `on`.
 
 Flow (`wti_observed_tweet.post_discord_cta_reply`, new-format path only): after the OBSERVED post has a real id, and after `save_state`,
 `tweet_format.record` and the success Discord line, it logs `discord_cta_reply ref=<D>: <reason>` and, only when on, calls `post_tweet(text, reply_to=<OBSERVED id>)`

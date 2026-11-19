@@ -141,7 +141,7 @@ class Decision(unittest.TestCase):
     def test_placeholders_distinct_reasons(self):
         bad = ["https://discord.gg/INVITE-X-DAILY", "https://discord.gg/invite-abc", "https://discord.gg/my-placeholder",
                "https://discord.gg/Example1", "https://discord.gg/abxxxcd", "https://discord.gg/x-daily",
-               "https://discord.gg/X-Daily", "https://discord.gg/2Estr7sbP7"]
+               "https://discord.gg/X-Daily"]
         reasons = []
         for u in bad:
             text, reason = tf.discord_cta_reply(IN_WINDOW, ON, cta(url=u))
@@ -153,8 +153,12 @@ class Decision(unittest.TestCase):
         self.assertIn("'example'", reasons[3])
         self.assertIn("'xxx'", reasons[4])
         self.assertIn("x-daily", reasons[5])
-        self.assertIn("shared untracked invite", reasons[7])
         self.assertGreaterEqual(len({re_kind(r) for r in reasons}), 5)
+
+    def test_general_invite_allowed(self):
+        text, reason = tf.discord_cta_reply(IN_WINDOW, ON, cta(url="https://discord.gg/2Estr7sbP7"))
+        self.assertEqual(reason, "on")
+        self.assertEqual(text, "Free daily forecasts live on our Discord: https://discord.gg/2Estr7sbP7")
 
     def test_window_inclusive_toronto(self):
         c = cta()
@@ -378,7 +382,7 @@ class Main(unittest.TestCase):
     def test_placeholders(self):
         for u, why in (("https://discord.gg/INVITE-X-DAILY", "placeholder invite"), ("https://discord.gg/placeholder1", "placeholder invite"),
                        ("https://discord.gg/example", "placeholder invite"), ("https://discord.gg/xxxxxx", "placeholder invite"),
-                       ("https://discord.gg/x-daily", "placeholder invite"), ("https://discord.gg/2Estr7sbP7", "shared untracked")):
+                       ("https://discord.gg/x-daily", "placeholder invite")):
             self.setUp()
             self.check_skipped(cta(url=u), why)
 

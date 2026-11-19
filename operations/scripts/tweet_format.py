@@ -66,7 +66,8 @@ DISCORD_FLAG = "TPCR_DISCORD_CTA_REPLY"
 DISCORD_URL = re.compile(r"^https://discord\.gg/[A-Za-z0-9-]{2,32}$")
 ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 DISCORD_MAX_SPAN = timedelta(days=13)  # last - first: 14 posts
-SHARED_INVITE = "2Estr7sbP7"  # the shared untracked invite; the plan says never reuse it on new placements
+# Fred, Nov 19 2026, supplied https://discord.gg/2Estr7sbP7 (never expires) for this placement; it is a valid invite_url.
+# Swapping the invite later is a config change only.
 CTA_KEYS = ("invite_url", "first_post_date", "last_post_date")
 
 
@@ -129,8 +130,6 @@ def placeholder_reason(url):
             return f"placeholder invite (code {code!r} contains {bad!r})"
     if low == "x-daily":
         return "placeholder invite (code 'x-daily' is the plan name, not a real code)"
-    if code == SHARED_INVITE:
-        return "shared untracked invite code must not be reused on new placements"
     return None
 
 
