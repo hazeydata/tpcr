@@ -46,6 +46,12 @@ def convert_month_to_parquet(args):
         
         # Parse timestamp and add useful columns
         combined["observed_at_ts"] = pd.to_datetime(combined["observed_at"], utc=True, errors="coerce")
+        # Unparseable/blank observed_at -> NaT; never write park_date "NaT" (TPCR-ACCURACY-001)
+        nat = combined["observed_at_ts"].isna()
+        n_nat = int(nat.sum())
+        if n_nat:
+            logging.getLogger(__name__).warning(f"  {month_dir.name}: nat_park_date_dropped n={n_nat}")
+            combined = combined[~nat].copy()
         combined["park_date"] = combined["observed_at_ts"].dt.date.astype(str)
         
         # Derive park_code from entity_code

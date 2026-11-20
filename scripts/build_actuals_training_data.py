@@ -216,6 +216,38 @@ def build_actuals_training_data(
     ),
     """
 
+    # TPCR-ACCURACY-001: fact parquet park_date is VARCHAR and may hold "NaT"
+    # (or NULL/garbage). Read every source through a CTE that drops such rows and
+    # nulls the column itself, so no later cast can throw whatever filter order
+    # DuckDB picks. park_date keeps its source type (output schema unchanged).
+    def _clean_source(name: str, pattern: str) -> str:
+        return f"""
+    {name} AS (
+        SELECT * REPLACE (
+            CASE WHEN TRY_CAST(park_date AS DATE) IS NOT NULL THEN park_date END AS park_date
+        )
+        FROM read_parquet('{pattern}')
+        WHERE TRY_CAST(park_date AS DATE) IS NOT NULL
+    ),
+    """
+
+    facts_pattern = f"{parquet_str}/*.parquet"
+    clean_sources = _clean_source("facts_clean", facts_pattern) + _clean_source("synth_clean", synth_pattern)
+
+    nat_dropped: dict[str, dict[str, int]] = {}
+    for source, pattern in (("facts", facts_pattern), ("synthetic", synth_pattern)):
+        rows = con.execute(f"""
+            SELECT entity_code, COUNT(*) AS n
+            FROM read_parquet('{pattern}')
+            WHERE TRY_CAST(park_date AS DATE) IS NULL
+            GROUP BY entity_code ORDER BY entity_code NULLS FIRST
+        """).fetchall()
+        counts = {("<null>" if e is None else str(e)): int(n) for e, n in rows}
+        for entity, n in counts.items():
+            logger.warning(f"nat_park_date_dropped source={source} entity={entity} n={n}")
+        logger.warning(f"nat_park_date_dropped source={source} total={sum(counts.values())}")
+        nat_dropped[source] = counts
+
     # OOM-safe: chunk by park (per data-access-pattern: >30M rows)
     entities = sorted(
         r[0] for r in con.execute(
@@ -261,6 +293,7 @@ def build_actuals_training_data(
             WITH {operating_filter}
             {valid_entities}
             {parkhours_cte}
+            {clean_sources}
             synthetic AS (
                 SELECT
                     s.entity_code,
@@ -274,7 +307,7 @@ def build_actuals_training_data(
                     EXTRACT(HOUR FROM CAST(s.observed_at AS TIMESTAMP)) as hour_of_day,
                     (EXTRACT(HOUR FROM CAST(s.observed_at AS TIMESTAMP)) - 6) * 60 + EXTRACT(MINUTE FROM CAST(s.observed_at AS TIMESTAMP)) as mins_since_6am,
                     {mins_since_open_synth} as mins_since_open
-                FROM read_parquet('{synth_pattern}') s
+                FROM synth_clean s
                 INNER JOIN valid_entities ve ON s.entity_code = ve.entity_code
                 LEFT JOIN read_csv('{dg_path}', AUTO_DETECT=TRUE) dg ON s.park_date = dg.park_date
                 LEFT JOIN read_csv('{season_path_str}', AUTO_DETECT=TRUE) se ON s.park_date = se.park_date
@@ -298,7 +331,7 @@ def build_actuals_training_data(
                     EXTRACT(HOUR FROM a.observed_at_ts) as hour_of_day,
                     (EXTRACT(HOUR FROM a.observed_at_ts) - 6) * 60 + EXTRACT(MINUTE FROM a.observed_at_ts) as mins_since_6am,
                     {mins_since_open_actual} as mins_since_open
-                FROM read_parquet('{parquet_str}/*.parquet') a
+                FROM facts_clean a
                 INNER JOIN valid_entities ve ON a.entity_code = ve.entity_code
                 LEFT JOIN read_csv('{dg_path}', AUTO_DETECT=TRUE) dg ON a.park_date = dg.park_date
                 LEFT JOIN read_csv('{season_path_str}', AUTO_DETECT=TRUE) se ON a.park_date = se.park_date
@@ -406,6 +439,7 @@ def build_actuals_training_data(
         "seconds": round(elapsed, 1),
         "peak_rss_mb": _peak_rss_mb(),
         "by_park": by_park,
+        "nat_park_date_dropped": nat_dropped,
         "output_dir": str(output_dir_parks),
     }
 
