@@ -63,11 +63,13 @@ REPLY_TIERS, TIERS_ERROR = _tiers(_cfg) if not CONFIG_ERROR else (None, CONFIG_E
 # discord_cta = {invite_url, first_post_date, last_post_date}; dates are America/Toronto posting dates, inclusive.
 # Two gates, both required: env TPCR_DISCORD_CTA_REPLY == "1" AND a valid, non-placeholder config window.
 DISCORD_FLAG = "TPCR_DISCORD_CTA_REPLY"
-DISCORD_URL = re.compile(r"^https://discord\.gg/[A-Za-z0-9-]{2,32}$")
+DISCORD_URL = re.compile(  # \Z, not $: "$" would accept a trailing newline
+    r"^(?:https://discord\.gg/[A-Za-z0-9-]{2,32}|https://hazeydata\.ai/theme-park-crowd-report/discord)\Z")
 ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 DISCORD_MAX_SPAN = timedelta(days=13)  # last - first: 14 posts
 # Fred, Nov 19 2026, supplied https://discord.gg/2Estr7sbP7 (never expires) for this placement; it is a valid invite_url.
-# Swapping the invite later is a config change only.
+# The share page URL https://hazeydata.ai/theme-park-crowd-report/discord (Fred, Nov 20 2026 9:10 AM ET approved building it;
+# TPCR-DISCORD-ICON-2026-11-20) is also accepted; swapping between the two allowed values is a config change on the Mini.
 CTA_KEYS = ("invite_url", "first_post_date", "last_post_date")
 
 
@@ -86,7 +88,7 @@ def _discord_cta(cfg):
     if first is None or last is None:
         return None, f"discord_cta partially set ({vals!r}); need first_post_date and last_post_date (and invite_url)"
     if url is not None and (not isinstance(url, str) or not DISCORD_URL.match(url)):
-        return None, f"discord_cta.invite_url {url!r} invalid; need ^https://discord\\.gg/[A-Za-z0-9-]{{2,32}}$"
+        return None, f"discord_cta.invite_url {url!r} invalid; need https://discord.gg/<code> ([A-Za-z0-9-]{{2,32}}) or https://hazeydata.ai/theme-park-crowd-report/discord (exact)"
     try:
         if not all(isinstance(d, str) and ISO_DATE.match(d) for d in (first, last)):
             raise ValueError("not YYYY-MM-DD")

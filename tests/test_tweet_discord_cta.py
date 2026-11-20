@@ -28,6 +28,7 @@ import tweet_v2  # noqa: E402
 import wti_observed_tweet as wot  # noqa: E402
 
 URL = "https://discord.gg/AbCdEf12"
+SHARE = "https://hazeydata.ai/theme-park-crowd-report/discord"
 TEXT = f"Free daily forecasts live on our Discord: {URL}"
 FLAG = "TPCR_DISCORD_CTA_REPLY"
 ON = {FLAG: "1"}
@@ -159,6 +160,35 @@ class Decision(unittest.TestCase):
         text, reason = tf.discord_cta_reply(IN_WINDOW, ON, cta(url="https://discord.gg/2Estr7sbP7"))
         self.assertEqual(reason, "on")
         self.assertEqual(text, "Free daily forecasts live on our Discord: https://discord.gg/2Estr7sbP7")
+
+    def test_share_url_allowed(self):
+        c = cta(url=SHARE)
+        self.assertEqual(c["invite_url"], SHARE)
+        text, reason = tf.discord_cta_reply(IN_WINDOW, ON, c)
+        self.assertEqual(reason, "on")
+        self.assertEqual(text, "Free daily forecasts live on our Discord: https://hazeydata.ai/theme-park-crowd-report/discord")
+        self.assertIsNone(tf.placeholder_reason(SHARE))
+
+    def test_share_url_lookalikes_rejected(self):
+        base = "https://hazeydata.ai/theme-park-crowd-report/discord"
+        bad = ["http://hazeydata.ai/theme-park-crowd-report/discord", base + "/", base + ".html",
+               "https://hazeydata.ai/theme-park-crowd-report/", "https://hazeydata.ai/discord",
+               "https://www.hazeydata.ai/theme-park-crowd-report/discord",
+               "https://hazeydata.ai.evil.com/theme-park-crowd-report/discord",
+               "https://evilhazeydata.ai/theme-park-crowd-report/discord",
+               "https://HAZEYDATA.AI/theme-park-crowd-report/discord", base + "?utm=x", base + "#frag",
+               base + " ", base + "\n", "https://discord.gg/2Estr7sbP7\n"]
+        for u in bad:
+            self.assertIsNone(tf.DISCORD_URL.match(u), u)
+            err = io.StringIO()  # parse call site
+            c, e = tf.parse_discord_cta_checked(
+                {"discord_cta": {"invite_url": u, "first_post_date": FIRST, "last_post_date": LAST}}, err=err)
+            self.assertIsNone(c, u)
+            self.assertIsNotNone(e, u)
+            text, reason = tf.discord_cta_reply(  # reply call site, parse bypassed
+                IN_WINDOW, ON, {"invite_url": u, "first": date(2026, 11, 19), "last": date(2026, 12, 2)})
+            self.assertIsNone(text, u)
+            self.assertTrue(reason.startswith("skipped: config invalid"), (u, reason))
 
     def test_window_inclusive_toronto(self):
         c = cta()
