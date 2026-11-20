@@ -39,7 +39,7 @@ from pipeline.steps.s08_forecast import (
     _load_operating_calendar_indexed,
     _load_fallback_ratios,
     _generate_park_time_grid,
-    FEATURES_BASELINE
+    FEATURES_BASELINE_V6 as FEATURES_BASELINE,  # challengers keep the 6 pre-recent-level features
 )
 
 

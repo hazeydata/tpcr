@@ -53,6 +53,23 @@ class PipelineConfig:
     geo_decay_halflife_days: int = 730
     geo_decay_halflife_days_per_park: dict = field(default_factory=dict)
     min_training_year: int = 0  # Global default: no cutoff
+    # TPCR-ACCURACY-001: recent-level feature (column recent_level_28d) from the entity's own actual_time.
+    recent_level_enabled: bool = True   # False -> train/forecast exactly the old 6 baseline features
+    # "yoy_ratio": trailing-window mean / mean of the same window recent_level_yoy_offset_days
+    # earlier (seasonally adjusted). "mean": the raw trailing-window mean.
+    recent_level_kind: str = "yoy_ratio"
+    recent_level_yoy_offset_days: int = 364  # 52 weeks: same day-of-week mix in both windows
+    recent_level_window_days: int = 28  # trailing window length (days)
+    recent_level_lag_days: int = 7      # training rows never see the newest `lag` days (forecast staleness)
+    recent_level_min_rows: int = 50     # fewer qualifying rows in the window -> NaN (missing), never 0
+    # The feature is only fed for target days within 14 days of the issue date; beyond it the
+    # value is NaN, i.e. XGBoost's missing branch, so a stale level is never pushed onto
+    # far-horizon forecasts.
+    recent_level_max_horizon_days: int = 14
+    # s08: a target day whose season_year label has no training rows for the model
+    # (metadata season_year_labels_seen) uses the code of the latest earlier seen
+    # label of the same season. False -> original codes.
+    season_year_unseen_fallback: bool = True
     min_training_year_per_park: dict = field(default_factory=lambda: {
         # 2014-2015 Disney actual-time API data contamination: high-frequency
         # sampling (45 obs/entity/day vs ~2 modern) with poor-quality actuals

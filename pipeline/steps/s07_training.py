@@ -42,6 +42,8 @@ except ImportError:
 
 from pipeline.config import PipelineConfig
 from pipeline.core import paths
+from pipeline.core import recent_level
+from pipeline.core.encodings import load_mappings
 from pipeline.core.logging import PipelineLogger
 from pipeline.core.park_codes import entity_to_park
 from pipeline.core.validation import ValidationError
@@ -55,7 +57,16 @@ BASELINE_FEATURES = [
     "season_encoded",
     "season_year_encoded",
     "day_of_week",
+    recent_level.FEATURE,  # TPCR-ACCURACY-001: recent level (cfg.recent_level_kind, lag 7; NaN allowed)
 ]
+
+# The six pre-recent-level features (cfg.recent_level_enabled=False; challenger models)
+BASELINE_FEATURES_V6 = [f for f in BASELINE_FEATURES if f != recent_level.FEATURE]
+
+
+def baseline_features(cfg: PipelineConfig | None = None) -> list[str]:
+    """Feature list for the baseline model under cfg (7 with recent level, else the old 6)."""
+    return list(BASELINE_FEATURES) if recent_level.enabled(cfg) else list(BASELINE_FEATURES_V6)
 
 
 def run(cfg: PipelineConfig, log: PipelineLogger, as_of: date | None = None) -> dict:
@@ -68,7 +79,11 @@ def run(cfg: PipelineConfig, log: PipelineLogger, as_of: date | None = None) -> 
     log.info("=" * 60)
     log.info("STEP 7: MODEL TRAINING (baseline, one model per entity)")
     log.info("=" * 60)
-    log.info(f"Features: {BASELINE_FEATURES}")
+    log.info(f"Features: {baseline_features(cfg)}")
+    if recent_level.enabled(cfg):
+        log.info(f"Recent level: {recent_level.spec(cfg)}")  # raises on an unknown recent_level_kind
+
+    season_year_codes = _season_year_codes(cfg, log)
 
     # Look for per-park training data (preferred) or single file
     actuals_dir = paths.training_data_dir(cfg)
@@ -133,6 +148,7 @@ def run(cfg: PipelineConfig, log: PipelineLogger, as_of: date | None = None) -> 
                     result = _train_baseline_model(
                         entity_code, park_df, cfg, min_obs,
                         as_of=as_of, halflife_days=cfg.get_halflife_days(park_code),
+                        season_year_codes=season_year_codes,
                     )
                     if result is not None:
                         successful += 1
@@ -164,6 +180,34 @@ def run(cfg: PipelineConfig, log: PipelineLogger, as_of: date | None = None) -> 
     }
 
 
+def _season_year_codes(cfg: PipelineConfig, log: PipelineLogger) -> dict[int, str] | None:
+    """season_year code -> label from the encoding mappings; None (with a warning) if unreadable.
+
+    Only used when a training parquet lacks the season_year label column.
+    """
+    try:
+        mapping = load_mappings(paths.encoding_mappings_path(cfg))["season_year"]
+    except Exception as e:
+        log.warning(f"season_year mappings unreadable ({type(e).__name__}: {e}); "
+                    "season_year_labels_seen only from label columns")
+        return None
+    return {int(c): str(label) for label, c in mapping.items()}
+
+
+def season_year_labels_seen(rows: pd.DataFrame, season_year_codes: dict[int, str] | None = None) -> list[str] | None:
+    """Sorted season_year labels present in the given training rows.
+
+    Uses the season_year label column (s06b writes it); without it, maps
+    season_year_encoded through season_year_codes. None if neither is available.
+    """
+    if "season_year" in rows.columns:
+        return sorted({str(x) for x in rows["season_year"].dropna().unique()})
+    if season_year_codes is not None and "season_year_encoded" in rows.columns:
+        codes = pd.to_numeric(rows["season_year_encoded"], errors="coerce").dropna().astype(int).unique()
+        return sorted({season_year_codes[c] for c in codes if c in season_year_codes})
+    return None
+
+
 def _train_baseline_model(
     entity_code: str,
     park_df: pd.DataFrame,
@@ -171,6 +215,7 @@ def _train_baseline_model(
     min_samples: int,
     as_of: date | None = None,
     halflife_days: int | None = None,
+    season_year_codes: dict[int, str] | None = None,
 ) -> dict | None:
     """Train a single baseline XGBoost model for one entity and save it."""
     entity_df = park_df[park_df["entity_code"] == entity_code]
@@ -195,12 +240,18 @@ def _train_baseline_model(
         "n_total": stats["n_train"] + stats["n_val"],
         "mae": round(stats["mae"], 3),
         "best_trees": stats["best_trees"],
-        "features": BASELINE_FEATURES,
+        "features": stats["features"],
         "uses_geo_decay_weights": True,
         "geo_decay_halflife_days": halflife_days,
         "backend": "Python xgboost",
         "hyperparameters": stats["params"],
     }
+    if recent_level.FEATURE in stats["features"]:
+        metadata.update(recent_level.spec(cfg))
+    # Labels the trees actually saw; s08 maps unseen labels to the latest seen same-season label.
+    seen = season_year_labels_seen(stats["train_rows"], season_year_codes)
+    if seen is not None:
+        metadata["season_year_labels_seen"] = seen
     meta_path = model_dir / "metadata_baseline.json"
     with open(meta_path, "w") as f:
         json.dump(metadata, f, indent=2, default=str)
@@ -208,15 +259,33 @@ def _train_baseline_model(
     return {"mae": stats["mae"], "n_samples": stats["n_train"], "best_trees": stats["best_trees"]}
 
 
-def baseline_matrix(entity_df: pd.DataFrame) -> pd.DataFrame:
-    """Rows ready for the baseline features: day_of_week derived, numeric, NaN-free."""
+def baseline_matrix(entity_df: pd.DataFrame, cfg: PipelineConfig | None = None) -> pd.DataFrame:
+    """Rows ready for the baseline features: day_of_week derived, numeric.
+
+    The six old features are NaN-free (filled with 0) and plain float64: s06b parquets
+    can hold pandas nullable Int64 columns (e.g. mins_since_open), which to_numeric and
+    fillna keep as Int64, and whose .values is an object array. actual_time and
+    recent_level_28d are float64 with NaN for missing. recent_level_28d stays NaN when
+    unknown (XGBoost handles missing natively). If the column is absent it is computed
+    here from entity_df itself with the training (lagged) definition.
+    """
     df = entity_df.reset_index(drop=True).copy()
     if "day_of_week" not in df.columns:
         df["day_of_week"] = pd.to_datetime(df["park_date"]).dt.dayofweek.astype(np.float32)
-    for col in BASELINE_FEATURES:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
-    df["actual_time"] = pd.to_numeric(df["actual_time"], errors="coerce")
+    for col in BASELINE_FEATURES_V6:
+        df[col] = _float64(pd.to_numeric(df[col], errors="coerce").fillna(0))
+    df["actual_time"] = _float64(pd.to_numeric(df["actual_time"], errors="coerce"))
+    if recent_level.enabled(cfg):
+        if recent_level.FEATURE not in df.columns:
+            df[recent_level.FEATURE] = recent_level.feature_for_rows(df["park_date"], df["actual_time"], cfg)
+        else:
+            df[recent_level.FEATURE] = _float64(pd.to_numeric(df[recent_level.FEATURE], errors="coerce"))
     return df
+
+
+def _float64(s: pd.Series) -> np.ndarray:
+    """Numeric Series (numpy or pandas nullable dtype) -> float64 array, pd.NA -> NaN."""
+    return s.to_numpy(dtype=np.float64, na_value=np.nan)
 
 
 def fit_baseline(
@@ -229,14 +298,16 @@ def fit_baseline(
     """Fit the baseline model with geo-decay weights relative to as_of. None if too little data."""
     if len(entity_df) < min_samples:
         return None
-    if any(f not in entity_df.columns for f in BASELINE_FEATURES if f != "day_of_week"):
+    if any(f not in entity_df.columns for f in BASELINE_FEATURES_V6 if f != "day_of_week"):
         return None
-    entity_df = baseline_matrix(entity_df)
+    features = baseline_features(cfg)
+    entity_df = baseline_matrix(entity_df, cfg)
 
-    X_all = entity_df[BASELINE_FEATURES].values.astype(np.float32)
-    y_all = entity_df["actual_time"].values.astype(np.float32)
+    X_all = entity_df[features].to_numpy(dtype=np.float32, na_value=np.nan)
+    y_all = entity_df["actual_time"].to_numpy(dtype=np.float32, na_value=np.nan)
+    old_x = entity_df[BASELINE_FEATURES_V6].to_numpy(dtype=np.float64, na_value=np.nan)
 
-    valid_mask = ~np.isnan(y_all) & (y_all > 0) & ~np.any(np.isnan(X_all), axis=1)
+    valid_mask = ~np.isnan(y_all) & (y_all > 0) & ~np.any(np.isnan(old_x), axis=1)
     if valid_mask.sum() < min_samples:
         return None
 
@@ -287,8 +358,11 @@ def fit_baseline(
     pred = bst.predict(dval)
     mae = float(np.mean(np.abs(y_val - pred)))
     best_trees = getattr(bst, "best_iteration", cfg.training_rounds)
+    # Rows the trees were fit on (the validation tail only drives early stopping)
+    train_cols = [c for c in ("season_year", "season_year_encoded") if c in entity_df.columns]
     return bst, {"n_train": split, "n_val": n - split, "mae": mae,
-                 "best_trees": best_trees, "params": params}
+                 "best_trees": best_trees, "params": params, "features": features,
+                 "train_rows": entity_df.loc[valid_mask, train_cols].iloc[:split]}
 
 
 def _scan_entity_counts(parquet_files: list[Path]) -> dict[str, int]:

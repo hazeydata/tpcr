@@ -30,7 +30,8 @@ import pandas as pd
 import xgboost as xgb
 
 from pipeline.config import PipelineConfig
-from pipeline.steps.s07_training import BASELINE_FEATURES, baseline_matrix, fit_baseline
+from pipeline.core import recent_level
+from pipeline.steps.s07_training import baseline_features, baseline_matrix, fit_baseline
 
 BIAS_RIDES = ("AK85", "AK86")
 WATCH_RIDES = ("AK85", "AK86", "HS112", "HS103", "HS20")
@@ -74,7 +75,13 @@ def entity_days(park_df: pd.DataFrame, candidate: Candidate, days: list[date],
             if fitted is None:
                 continue
             bst, _ = fitted
-            X = baseline_matrix(target.drop(columns="_d"))[BASELINE_FEATURES].values.astype(np.float32)
+            tgt = target.drop(columns="_d").copy()
+            if recent_level.enabled(cfg):
+                # Forecast-time semantics: issued on d, sees only rows with park_date < d.
+                past = edf[edf["_d"] < d]
+                tgt[recent_level.FEATURE] = recent_level.feature_at(
+                    past["park_date"], past["actual_time"], d, cfg)
+            X = baseline_matrix(tgt, cfg)[baseline_features(cfg)].to_numpy(dtype=np.float32, na_value=np.nan)
             pred = np.clip(bst.predict(xgb.DMatrix(X)), 0, 300)
             rows.append({"candidate": candidate.name, "entity_code": entity, "park_date": d,
                          "pred": float(pred.mean()), "actual": float(target["actual_time"].mean())})
