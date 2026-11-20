@@ -479,7 +479,8 @@ def derive_park_date(observed_at: pd.Series, tz: ZoneInfo) -> pd.Series:
     park_dt = dt_local.copy()
     if mask.any():
         park_dt.loc[mask] = dt_local[mask] - timedelta(days=1)
-    return park_dt.dt.date.astype(str)
+    # NaT -> NaN (not the string "NaT") so callers' dropna(subset=["park_date"]) works
+    return park_dt.dt.strftime("%Y-%m-%d")
 
 
 # =============================================================================

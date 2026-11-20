@@ -20,11 +20,20 @@ state/encoding_mappings.json (refreshed by s06b/s07a; the same mapping the
 training data used). A forecast date whose labels are missing or unmapped is
 left out and counted in the receipt as degraded; it is never encoded as 0.
 The operating calendar and dimentity prefer this run's s07a copies.
+
+Unseen season_year labels (cfg.season_year_unseen_fallback, default off; True enables it): new
+labels get the next free code, so a label with no training rows (e.g.
+JERSEY_WEEK_2026) is a code the trees never split on. For a baseline model whose
+metadata lists season_year_labels_seen, such a target day's season_year_encoded
+is replaced with the code of the seen label of the same season (label minus its
+trailing _YYYY) with the greatest year below the target's year; with none, the
+code is kept. Models without that metadata key are unchanged.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -40,6 +49,7 @@ except ImportError:
 
 from pipeline.config import PipelineConfig
 from pipeline.core import paths
+from pipeline.core import recent_level
 from pipeline.core.encodings import load_mappings, lookup
 from pipeline.core.db import read_connection
 from pipeline.core.logging import PipelineLogger
@@ -51,7 +61,10 @@ FEATURES_BASELINE = [
     "mins_since_6am", "mins_since_open",
     "date_group_id_encoded", "season_encoded", "season_year_encoded",
     "day_of_week",
+    recent_level.FEATURE,  # TPCR-ACCURACY-001 (NaN allowed; XGBoost treats as missing)
 ]
+# Pre-recent-level 6-feature set: old models, legacy model paths, challengers
+FEATURES_BASELINE_V6 = [f for f in FEATURES_BASELINE if f != recent_level.FEATURE]
 FEATURES_LITE = ["mins_since_6am", "mins_since_open"]
 FEATURES_LEGACY_V2 = [
     "posted_time", "mins_since_6am", "mins_since_open",
@@ -78,6 +91,7 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
     log.info("=" * 60)
 
     start_date = date.today()  # Include today — users ask about "today" and need predicted values
+    as_of = start_date  # forecast issue date: the recent-level feature sees only data < as_of
     end_date = start_date + timedelta(days=cfg.forecast_days)
     log.info(f"Forecast range: {start_date} to {end_date} ({cfg.forecast_days} days)")
 
@@ -89,6 +103,8 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
         entity_list = _load_entity_list(cfg, log)
         oc_by_entity = _load_operating_calendar_indexed(cfg, log)
         fallback_ratios = _load_fallback_ratios(cfg, log)
+        recent_levels = _load_recent_levels(cfg, log, as_of)
+        season_year_mapping = _season_year_mapping_for_run(cfg, log)
 
     # Group entities by park
     park_entities: dict[str, list[str]] = {}
@@ -101,6 +117,12 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
     log.info(f"Total entities: {len(entity_list)} across {len(park_entities)} parks")
 
     unmapped = unmapped_forecast_dates(date_features, start_date, end_date)
+    dim_horizon = max(date_features) if date_features else None
+    unmapped_in_dim = [d for d in unmapped if dim_horizon is None or d <= dim_horizon]
+    # Always emitted so the run log confirms the count, including zero.
+    log.metric("unmapped_dates", len(unmapped))
+    log.metric("unmapped_dates_in_dimension", len(unmapped_in_dim))
+    log.info(f"unmapped_dates dimension_horizon={dim_horizon}")
     if unmapped:
         log.warning(
             f"{len(unmapped)} forecast dates have no calendar encoding and are skipped "
@@ -117,6 +139,8 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
     total_entities = 0
     failed_entities = 0
     method_feature_counts: dict[str, int] = {}  # Track which feature sets are used
+    forecast_stats: dict = {"recent_level_spec_mismatch": 0, "season_year_remapped": []}
+    rl_spec = recent_level.spec(cfg) if recent_level.enabled(cfg) else None
     batch_files = []
 
     for park_code in sorted(park_entities.keys()):
@@ -149,6 +173,12 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
                         entity_code, park_code, time_grid,
                         cfg.models_dir, agg_by_entity, park_open_mins,
                         fallback_ratios, oc_by_entity,
+                        recent_levels=recent_levels,
+                        as_of=as_of,
+                        recent_level_max_horizon_days=recent_level.max_horizon(cfg),
+                        recent_level_spec=rl_spec,
+                        stats=forecast_stats,
+                        season_year_mapping=season_year_mapping,
                     )
                     if result is not None and len(result) > 0:
                         park_results.append(result)
@@ -198,6 +228,20 @@ def run(cfg: PipelineConfig, log: PipelineLogger) -> dict:
         log.info("Feature set usage:")
         for feat_key, count in sorted(method_feature_counts.items()):
             log.info(f"  {feat_key}: {count} entities")
+
+    if rl_spec is not None:
+        # Models whose metadata describes another recent-level definition got NaN for it
+        log.metric("recent_level_spec_mismatch", forecast_stats["recent_level_spec_mismatch"])
+        if forecast_stats["recent_level_spec_mismatch"]:
+            log.warning(f"{forecast_stats['recent_level_spec_mismatch']} models trained with a different "
+                        f"recent-level definition than {rl_spec['recent_level_kind']}: fed NaN")
+
+    remapped = forecast_stats["season_year_remapped"]
+    log.metric("season_year_unseen_remapped", len(remapped))  # (entity, label) pairs, incl. zero
+    if remapped:
+        pairs = sorted({(lbl, to) for _, lbl, to in remapped})
+        log.info(f"season_year unseen-label fallback: {len(remapped)} (entity, label) pairs remapped; "
+                 + ", ".join(f"{lbl}->{to}" for lbl, to in pairs[:20]) + (" ..." if len(pairs) > 20 else ""))
 
     log.info("=" * 60)
     log.info("FORECAST COMPLETE")
@@ -257,11 +301,27 @@ def _forecast_entity_fast(
     park_open_mins: dict,
     fallback_ratios: dict,
     oc_by_entity: dict | None,
+    recent_levels: dict | None = None,
+    as_of: date | None = None,
+    recent_level_max_horizon_days: int = recent_level.DEFAULT_MAX_HORIZON,
+    recent_level_spec: dict | None = None,
+    stats: dict | None = None,
+    season_year_mapping: dict | None = None,
 ) -> tuple[pd.DataFrame | None, str]:
     """Generate forecast for a single entity. O(1) lookups, no scanning.
 
     Returns (DataFrame, feature_key) where feature_key describes which
     feature set was used (for diagnostic logging).
+
+    recent_level_spec (recent_level.spec(cfg)): when given, a baseline model that uses
+    recent_level_28d but whose metadata describes a different definition (kind, window,
+    yoy offset; no kind key = "mean") is fed NaN for it; counted in
+    stats["recent_level_spec_mismatch"].
+
+    season_year_mapping (label -> code; None = fallback off): for a baseline model whose
+    metadata has season_year_labels_seen, unseen target labels are remapped with
+    season_year_fallback; each (entity, label, to_label) is appended to
+    stats["season_year_remapped"].
     """
 
     df = time_grid.copy()
@@ -273,6 +333,18 @@ def _forecast_entity_fast(
     # baseline if day_of_week were missing after retrain.)
     if "day_of_week" in FEATURES_BASELINE and "day_of_week" not in df.columns:
         df["day_of_week"] = pd.to_datetime(df["park_date"]).dt.dayofweek.astype(np.float32)
+
+    # Recent level as of the issue date, fed only to target days within the horizon cap
+    # (0 <= days after as_of <= recent_level_max_horizon_days); NaN elsewhere and when
+    # unknown/too few rows. as_of defaults to the grid's first date. Models without the
+    # feature ignore the column.
+    level = float((recent_levels or {}).get(entity_code, np.nan))
+    if as_of is None and len(df) > 0:
+        as_of = pd.to_datetime(df["park_date"]).min().date()
+    df[recent_level.FEATURE] = (
+        recent_level.forecast_values(df["park_date"], level, as_of, recent_level_max_horizon_days)
+        if as_of is not None else np.nan
+    )
 
     # O(1) operating calendar filter
     if oc_by_entity is not None:
@@ -321,16 +393,36 @@ def _forecast_entity_fast(
 
         # Read features from metadata instead of assuming
         meta_features = _get_model_features(entity_dir)
+        base_meta = _read_metadata(entity_dir, "metadata_baseline.json") if model_path == baseline_path else None
+        if (recent_level_spec is not None and base_meta is not None
+                and recent_level.FEATURE in (base_meta.get("features") or [])
+                and not recent_level.model_spec_matches(base_meta, recent_level_spec)):
+            df[recent_level.FEATURE] = np.nan
+            if stats is not None:
+                stats["recent_level_spec_mismatch"] = stats.get("recent_level_spec_mismatch", 0) + 1
+        seen_labels = (base_meta or {}).get("season_year_labels_seen")
+        if season_year_mapping is not None and seen_labels is not None and "season_year_encoded" in df.columns:
+            remap = season_year_fallback(df["season_year_encoded"].dropna().unique(), seen_labels,
+                                         season_year_mapping)
+            if remap:
+                col = df["season_year_encoded"]
+                df["season_year_encoded"] = col.where(~col.isin(list(remap)),
+                                                      col.map({c: r[0] for c, r in remap.items()}))
+                if stats is not None:
+                    stats.setdefault("season_year_remapped", []).extend(
+                        (entity_code, lbl, to) for _, lbl, to in remap.values())
         if meta_features is not None:
             missing = [f for f in meta_features if f not in df.columns]
             if missing:
-                features = FEATURES_BASELINE
+                # Match the model's width: never feed 6 columns to a 7-feature model or vice versa
+                n_model = int(getattr(model, "n_features_in_", len(FEATURES_BASELINE_V6)))
+                features = FEATURES_BASELINE[:n_model] if n_model in (6, 7) else FEATURES_BASELINE_V6
                 feat_key = "baseline_fallback"
             else:
                 features = meta_features
                 feat_key = f"baseline_{len(features)}feat"
         else:
-            features = FEATURES_BASELINE
+            features = FEATURES_BASELINE_V6  # no metadata: assume a pre-recent-level model
             feat_key = "baseline_default"
         method = "model_baseline"
 
@@ -339,7 +431,7 @@ def _forecast_entity_fast(
         model.load_model(str(actuals_path))
         meta = _read_metadata(entity_dir, "metadata_julia_actuals.json")
         is_lite = meta and (meta.get("model_label") == "XGBOOST_ACTUALS_LITE" or meta.get("version") == "actuals_lite")
-        features = FEATURES_LITE if is_lite else FEATURES_BASELINE
+        features = FEATURES_LITE if is_lite else FEATURES_BASELINE_V6
         method = "model_legacy_actuals"
         feat_key = "legacy_actuals_lite" if is_lite else "legacy_actuals"
 
@@ -359,7 +451,8 @@ def _forecast_entity_fast(
         return df[["entity_code", "park_date", "time_slot", "predicted_actual", "prediction_method"]], "fallback"
 
     # Run model prediction (already vectorized via numpy)
-    X = df[features].values.astype(np.float32)
+    # to_numpy with na_value: nullable (Int64/Float64) columns never become an object array
+    X = df[features].to_numpy(dtype=np.float32, na_value=np.nan)
     predictions = model.predict(X)
     predictions = np.clip(predictions, 0, 300)
     df["predicted_actual"] = np.round(predictions).astype(int)
@@ -371,6 +464,81 @@ def _forecast_entity_fast(
 # =========================================================================
 # Data loading helpers — PRE-INDEXED
 # =========================================================================
+
+_SEASON_YEAR = re.compile(r"^(.*)_(\d{4})$")
+
+
+def season_year_fallback(codes, seen_labels, mapping: dict) -> dict[int, tuple[int, str, str]]:
+    """Unseen season_year codes -> (code, label, to_label) of the latest earlier seen same-season label.
+
+    codes: season_year codes present on the target days. seen_labels: the model's
+    season_year_labels_seen. mapping: label -> code (encoding mappings). A code whose
+    label is seen, is unknown, has no trailing _YYYY, or has no seen same-season label
+    with a smaller year is left out (kept as is).
+    """
+    seen = {str(x) for x in seen_labels}
+    by_season: dict[str, list[tuple[int, str]]] = {}
+    for label in seen:
+        m = _SEASON_YEAR.match(label)
+        if m and label in mapping:
+            by_season.setdefault(m.group(1), []).append((int(m.group(2)), label))
+    inverse = {int(c): str(label) for label, c in mapping.items()}
+    out: dict[int, tuple[int, str, str]] = {}
+    for c in codes:
+        label = inverse.get(int(c))
+        if label is None or label in seen:
+            continue
+        m = _SEASON_YEAR.match(label)
+        if not m:
+            continue
+        earlier = [(y, lbl) for y, lbl in by_season.get(m.group(1), []) if y < int(m.group(2))]
+        if earlier:
+            to = max(earlier)[1]
+            out[int(c)] = (int(mapping[to]), label, to)
+    return out
+
+
+def _season_year_mapping_for_run(cfg: PipelineConfig, log: PipelineLogger) -> dict | None:
+    """season_year label -> code for the unseen-label fallback; None if off or unreadable."""
+    if not getattr(cfg, "season_year_unseen_fallback", True):
+        return None
+    try:
+        return dict(load_mappings(paths.encoding_mappings_path(cfg))["season_year"])
+    except Exception as e:  # fail-soft: forecast with the original codes
+        log.warning(f"season_year unseen-label fallback off: mappings unreadable ({type(e).__name__}: {e})")
+        return None
+
+
+def _load_recent_levels(cfg: PipelineConfig, log: PipelineLogger, as_of: date) -> dict:
+    """entity_code -> forecast-time recent level at as_of (cfg.recent_level_kind).
+
+    "yoy_ratio": mean over [as_of-window, as_of) / mean over [as_of-window-offset, as_of-offset);
+    "mean": mean over [as_of-window, as_of).
+    {} if disabled, or if loading raises (fail-soft: warning + metric recent_level_load_failed=1).
+    """
+    if not recent_level.enabled(cfg):
+        return {}
+    window, _, min_rows = recent_level.params(cfg)
+    try:
+        kind = recent_level.kind(cfg)
+        offset = recent_level.yoy_offset(cfg)
+        levels = recent_level.load_recent_levels(
+            paths.training_data_dir(cfg), as_of, window, min_rows,
+            combined_path=paths.training_data_combined_path(cfg),
+            kind=kind, offset=offset,
+        )
+    except Exception as e:  # fail-soft: every entity gets NaN (missing), s08 continues
+        log.warning(f"Recent level load failed ({type(e).__name__}: {e}); all entities NaN")
+        log.metric("recent_level_load_failed", 1)
+        return {}
+    log.metric("recent_level_load_failed", 0)
+    log.info(f"Recent level ({kind}): {len(levels)} entities with >= {min_rows} rows in "
+             f"[{as_of - timedelta(days=window)}, {as_of})"
+             + (f" and [{as_of - timedelta(days=window + offset)}, {as_of - timedelta(days=offset)})"
+                if kind == recent_level.KIND_YOY else ""))
+    log.metric("recent_level_entities", len(levels))
+    return levels
+
 
 def _load_date_features(cfg: PipelineConfig, log: PipelineLogger) -> dict:
     """Encoded calendar features per date; dates with an unmapped label are omitted."""

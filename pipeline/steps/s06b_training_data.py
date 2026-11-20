@@ -12,7 +12,8 @@ renamed into place only after every park built; on any failure the step raises
 and the previous complete files stay, so s07 never sees a partial file.
 
 Receipt (logs/receipt_s06b_training_data_<date>.json and the step metrics):
-status ok, or degraded when a park's max park_date is older than run_date - 2.
+status ok, or degraded when a non-ignored park's max park_date is older than
+run_date - 2 (cfg.ignore_parks are reported but never degrade the receipt).
 """
 
 from __future__ import annotations
@@ -68,7 +69,10 @@ def run(cfg: PipelineConfig, log: PipelineLogger, run_date: date | None = None) 
     )
 
     max_dates = {p: s["max_park_date"] for p, s in built["by_park"].items()}
-    stale = stale_parks(max_dates, run_date)
+    # Ignored parks (water parks: cfg.ignore_parks) are not trained or forecast,
+    # so their freshness must not degrade the receipt; they are listed separately.
+    ignored = {p: d for p, d in max_dates.items() if p in cfg.ignore_parks}
+    stale = stale_parks({p: d for p, d in max_dates.items() if p not in cfg.ignore_parks}, run_date)
     receipt = {
         "step": STEP,
         "status": "degraded" if stale else "ok",
@@ -78,6 +82,8 @@ def run(cfg: PipelineConfig, log: PipelineLogger, run_date: date | None = None) 
         "rows_by_park": {p: s["rows"] for p, s in built["by_park"].items()},
         "real_rows_by_park": {p: s["real_rows"] for p, s in built["by_park"].items()},
         "max_park_date_by_park": max_dates,
+        "stale_parks": stale,
+        "ignored_parks_max_park_date": ignored,
         "seconds_by_park": {p: s["seconds"] for p, s in built["by_park"].items()},
         "peak_rss_mb_by_park": {p: s["peak_rss_mb"] for p, s in built["by_park"].items()},
         "reason": (

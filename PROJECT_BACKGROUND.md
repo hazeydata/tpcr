@@ -11,7 +11,7 @@ Theme Park Crowd Report (TPCR) is a daily ML pipeline that produces Wait Time In
 ## Tech stack
 
 - **Storage:** DuckDB (primary data store). Parquet for forecasts/facts.
-- **Models:** XGBoost, per-entity. Baseline features: mins_since_6am, mins_since_open, date_group_id_encoded, season_encoded, season_year_encoded.
+- **Models:** XGBoost, per-entity. Baseline features: mins_since_6am, mins_since_open, date_group_id_encoded, season_encoded, season_year_encoded, day_of_week, plus `recent_level_28d` (TPCR-ACCURACY-001, see docs/PIPELINE_V4_DESIGN.md Step 7): by default (`recent_level_kind="yoy_ratio"`) the entity's own trailing 28-day mean actual_time divided by the mean over the same window 364 days earlier, lag 7, leak-free; `"mean"` uses the raw trailing mean; forecast-fed only up to 14 days after the issue date. At forecast time a season_year label the model never trained on uses the code of its latest earlier seen same-season label (`season_year_unseen_fallback`, off by default: `season_year_unseen_fallback=False`).
 - **Pipeline:** Python, 13 steps, runs 6 AM ET daily via cron on wilma-server.
 - **Tweet rendering:** Remotion.
 - **Infra:** GitHub Actions, Clawdbot/OpenClaw, systemd.

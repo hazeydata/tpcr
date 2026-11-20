@@ -189,6 +189,7 @@ The master orchestrator is **`scripts/run_daily_pipeline.sh`**. Here's the full 
 - **Output:** `fact_tables/parquet/YYYY-MM.parquet` (~202 monthly files, 611 MB total)
 - **Added columns:** `observed_at_ts` (UTC timestamp), `park_date` (date), `park_code`
 - **Key detail:** All downstream steps read parquet, never CSVs. This conversion is what makes the pipeline fast.
+- **Invalid timestamps (TPCR-ACCURACY-001):** rows whose `observed_at` is blank or unparseable (`observed_at_ts` NaT) are dropped before `park_date` is derived, with a logged `YYYY-MM: nat_park_date_dropped n=<N>` warning. Older code wrote the literal string `"NaT"` into the VARCHAR `park_date` column (pandas < 3), so existing monthly files can still contain such rows (e.g. one all-null row from `tds_2026-07-25` in `2026-07.parquet`).
 
 ---
 
@@ -226,7 +227,9 @@ The ML models use `date_group_id`, `season`, and `season_year` as features. A mo
 > `logs/receipt_s07a_calendar_{date}.json` and keeps the previous files. The same
 > step extends `state/encoding_mappings.json` with any new `season`,
 > `season_year` or `date_group_id` labels from `dimseason.csv` /
-> `dimdategroupid.csv` (append-only, new codes = max+1 in sorted order). s03 does
+> `dimdategroupid.csv` (append-only, new codes = max+1 in sorted order). A
+> season_year label with no training rows for a model is forecast with the code of
+> the latest earlier seen same-season label (docs/PIPELINE_V4_DESIGN.md Step 8). s03 does
 > not build the calendar. In shadow mode nothing is written under the production base.
 
 **Scripts:** `src/get_closures_from_s3.py` + `src/build_operating_calendar.py`  
@@ -939,6 +942,7 @@ Fred reviewed all open questions. Resolved decisions:
 
 - **ETL → Parquet directly:** Why produce CSVs then convert? Future refactor: ETL should output parquet directly, eliminating Step 1b.
 - **Posted aggregates review:** Are these still needed? They feed the forecast step's "expected posted time" for entities without models. If we move to synthetic-actuals-based training, this step may change.
+- *(Update, TPCR-ACCURACY-001: the V4 baseline now also has `day_of_week` and `recent_level_28d`, by default the trailing 28-day mean actual_time divided by the same window 364 days earlier (`recent_level_kind="yoy_ratio"`, or `"mean"`); see docs/PIPELINE_V4_DESIGN.md Step 7.)*
 - **"Actuals-First" method:** With synthetic actuals, we're dropping POSTED as a training feature. The POSTED→ACTUAL relationship is already captured by the conversion model (separation of concerns). Forecast models will train on temporal features only (mins_since_6am, mins_since_open, date_group_id, season, season_year), predicting actual wait times directly. POSTED times exist solely to feed the conversion model. This is a significant architectural upgrade — A/B comparison required before replacing production models.
 - **Accuracy eval ground truth:** Include synthetic actuals as "observations" in accuracy evaluation, not just raw ACTUAL. This dramatically increases evaluation coverage.
 - **Park hours donor filtering:** Exclude outlier hours from donor pool (e.g., MK closing at 4 PM for corporate events). Reject openings after 9:30 AM, closings before 5 PM where abnormal. Consider minimum frequency filter.
@@ -986,7 +990,7 @@ Fred reviewed all open questions. Resolved decisions:
 | Pipeline output base | `/home/wilma/hazeydata/pipeline/` (aliased as `{output_base}`) |
 | Fact tables (fast) | `{output_base}/fact_tables/parquet/*.parquet` |
 | Matched pairs | `{output_base}/matched_pairs/all_pairs_v2.parquet` |
-| Actuals training data | `{write_base}/matched_pairs/actuals_training_v2/{park}.parquet` (built daily by s06b; legacy combined `actuals_training_v2.parquet` still written) |
+| Actuals training data | `{write_base}/matched_pairs/actuals_training_v2/{park}.parquet` (built daily by s06b; legacy combined `actuals_training_v2.parquet` still written). Fact and synthetic rows whose `park_date` doesn't cast to DATE (`"NaT"`, NULL, garbage) are dropped before the query; each build logs `nat_park_date_dropped source=<facts|synthetic> entity=<E or <null>> n=<N>` plus a `total=<N>` line, and the receipt carries `nat_park_date_dropped` |
 | Encoding mappings | `{write_base}/state/encoding_mappings.json` (training and s08 both read this; unknown labels never encode as 0) |
 | Step receipts | `{write_base}/logs/receipt_{step}_{date}.json` (s06b, s07a) |
 | Models | `{output_base}/models/{entity}/model_julia_v2.json` or `model_julia_actuals.json` |
