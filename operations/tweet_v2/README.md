@@ -228,7 +228,7 @@ Optional: `--content-dir DIR` (local `predicted_D.json`/`observed_D.json` instea
 `--state-file`, `--park-hours dimparkhours.csv`, `--closures closures.csv`.
 
 ## Discord CTA reply (TPCR-DISCORD-GROWTH-001)
-**Status: OFF.** Enabling is a separate approved step. `https://discord.gg/2Estr7sbP7` (Fred Nov 19 2026, never expires) is a valid `invite_url`, set in the Mini config at enable; the committed config stays all-null.
+**Status: OFF.** Enabling is a separate approved step. `https://discord.gg/2Estr7sbP7` (Fred Nov 19 2026, never expires) is a valid `invite_url`, set in the Mini config at enable. So is the share page `https://hazeydata.ai/theme-park-crowd-report/discord` (TPCR-DISCORD-ICON-2026-11-20; forwards to the invite and carries og:image, so X shows a card instead of the grey placeholder a bare discord.gg link gets); swapping between the two is a Mini config change; the committed config stays all-null.
 
 What: Fred, Nov 18 2026: the Discord line is its own text-only post, threaded as a reply under the 8:30 AM OBSERVED post, for a 14-day run.
 The reply text is exactly `Free daily forecasts live on our Discord: <invite_url>` (`tweet_copy.DISCORD_CTA`; a URL weighs 23). The OBSERVED
@@ -236,8 +236,8 @@ and FORECAST texts are unchanged, byte-identical to before, whether the feature 
 
 Gates (both required, else nothing is posted):
 - env `TPCR_DISCORD_CTA_REPLY` equals `1` (unset or anything else = off).
-- `config/tweet_format.json` `discord_cta` = `{"invite_url", "first_post_date", "last_post_date"}` (all null in the repo). `invite_url` must match
-  `^https://discord\.gg/[A-Za-z0-9-]{2,32}$` and comes only from config. Dates are America/Toronto posting dates (the day the reply goes out, not
+- `config/tweet_format.json` `discord_cta` = `{"invite_url", "first_post_date", "last_post_date"}` (all null in the repo). `invite_url` must be exactly
+  `https://discord.gg/<code>` (code `[A-Za-z0-9-]{2,32}`) or `https://hazeydata.ai/theme-park-crowd-report/discord` (https only, no query, fragment, trailing slash or newline) and comes only from config. Dates are America/Toronto posting dates (the day the reply goes out, not
   park day D), inclusive, `last = first + 13` (14 posts max). All null = off; partial or invalid = off plus one `ERROR tweet_format:` line on stderr.
 - Placeholder invites are skipped with a logged reason even when the flag is on: null/missing, a code starting with `INVITE` (any case, e.g.
   `https://discord.gg/INVITE-X-DAILY`), containing `placeholder`, `example` or `xxx`, or equal to `x-daily`.
