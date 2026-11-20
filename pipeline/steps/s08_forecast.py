@@ -21,7 +21,7 @@ training data used). A forecast date whose labels are missing or unmapped is
 left out and counted in the receipt as degraded; it is never encoded as 0.
 The operating calendar and dimentity prefer this run's s07a copies.
 
-Unseen season_year labels (cfg.season_year_unseen_fallback, default on): new
+Unseen season_year labels (cfg.season_year_unseen_fallback, default off; True enables it): new
 labels get the next free code, so a label with no training rows (e.g.
 JERSEY_WEEK_2026) is a code the trees never split on. For a baseline model whose
 metadata lists season_year_labels_seen, such a target day's season_year_encoded

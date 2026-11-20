@@ -548,7 +548,7 @@ def test_s08_fallback_switch_off_and_old_metadata_unchanged(tmp_path, monkeypatc
     # switch off -> the run passes no mapping -> unchanged
     off = PipelineConfig(output_base=tmp_path / "base", season_year_unseen_fallback=False)
     assert s08_forecast._season_year_mapping_for_run(off, PipelineLogger("t")) is None
-    assert PipelineConfig().season_year_unseen_fallback is True
+    assert PipelineConfig().season_year_unseen_fallback is False
     X, stats = _sy_forecast(cfg, [366], None, monkeypatch)
     np.testing.assert_array_equal(X[:, j], 366)
     # old metadata without season_year_labels_seen -> unchanged
@@ -559,7 +559,7 @@ def test_s08_fallback_switch_off_and_old_metadata_unchanged(tmp_path, monkeypatc
 
 
 def test_s08_mapping_for_run_reads_encodings(tmp_path):
-    cfg = PipelineConfig(output_base=tmp_path / "base")
+    cfg = PipelineConfig(output_base=tmp_path / "base", season_year_unseen_fallback=True)
     p = s08_forecast.paths.encoding_mappings_write_path(cfg)
     p.parent.mkdir(parents=True)
     p.write_text(json.dumps({"date_group_id": {}, "season": {}, "season_year": SY_MAPPING}))

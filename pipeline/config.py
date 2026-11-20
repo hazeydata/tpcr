@@ -68,8 +68,9 @@ class PipelineConfig:
     recent_level_max_horizon_days: int = 14
     # s08: a target day whose season_year label has no training rows for the model
     # (metadata season_year_labels_seen) uses the code of the latest earlier seen
-    # label of the same season. False -> original codes.
-    season_year_unseen_fallback: bool = True
+    # label of the same season. Default off (TPCR-ACCURACY-001 "rl" deploy variant:
+    # recent level on, fallback off): False -> original codes; True enables the fallback.
+    season_year_unseen_fallback: bool = False
     min_training_year_per_park: dict = field(default_factory=lambda: {
         # 2014-2015 Disney actual-time API data contamination: high-frequency
         # sampling (45 obs/entity/day vs ~2 modern) with poor-quality actuals
