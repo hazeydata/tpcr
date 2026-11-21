@@ -167,6 +167,51 @@ def test_wti_line_needs_wti_context():
     assert "normal" not in out
 
 
+def test_comparative_average_wording():
+    for phrase in ("quieter than average", "less crowded than usual", "busier than typical", "heavier than usual"):
+        out = aa.enforce_wording(f"MK WTI: Tuesday 11/24 is 15.8, {phrase}.", "q", MK)
+        assert phrase not in out and "normal" in out and "15.8" in out
+    out = aa.enforce_wording("MK WTI: Tuesday 11/24 is 15.8, quieter than average.", "q", MK)
+    assert out == "MK WTI: Tuesday 11/24 is 15.8, normal."
+    out = aa.enforce_wording("MK WTI: Sat 11/28 is 15.8 and Sun 11/29 is 22.0, busier than usual.", "q", MK)
+    assert "busier than usual" not in out and "15.8" in out and "22.0" in out
+
+
+def test_comparative_than_normal_value_backed():
+    out = aa.enforce_wording("MK WTI: Saturday hit 20.7, busier than normal.", "q", MK)
+    assert out == "MK WTI: Saturday hit 20.7, busier than normal."
+    out = aa.enforce_wording("MK WTI: Saturday hit 12.0, quieter than normal.", "q", MK)
+    assert "quieter than normal" in out
+    out = aa.enforce_wording("MK WTI: Tuesday 11/24 at 15.8 is quieter than normal.", "q", MK)
+    assert "quieter than normal" not in out and "15.8" in out and "normal" in out
+    out = aa.enforce_wording("MK WTI: Tuesday at 15.8 is busier than normal.", "q", MK)
+    assert "busier than normal" not in out and "15.8" in out
+    out = aa.enforce_wording("WTI: Saturday hit 20.7, busier than normal.", "q", {})
+    assert "busier than normal" not in out and "20.7" in out
+
+
+DATA = "MK WTI forecast:\n• Sat 11/21: 17.0\n• Fri 11/27: 17.4\n"
+
+
+def test_forward_month_holiday_dropped():
+    for sent in ("Expect crowds to pick up in December.", "Christmas week is when it gets busy.",
+                 "Spring break crowds arrive later."):
+        out = aa.enforce_wording(DATA + sent, "q", MK, TODAY)
+        assert sent not in out and "17.4" in out and "17.0" in out
+    out = aa.enforce_wording("Expect crowds to pick up in December.", "q", MK, TODAY)
+    assert out == ""
+    out = aa.enforce_wording("MK WTI is 17.0 today. Expect crowds to pick up in December.", "q", MK, TODAY)
+    assert out == "MK WTI is 17.0 today."
+
+
+def test_month_holiday_in_horizon_or_past_kept():
+    for sent in ("Last December was busy.", "Back in December it hit 25.0.", "In December 2025 it hit 25.0.",
+                 "Thanksgiving Day is Thu 11/26: 17.7 so plan around it.", "November has been mild."):
+        out = aa.enforce_wording(DATA + sent, "q", MK, TODAY)
+        assert sent in out, sent
+    assert "Nov 22" in aa.enforce_wording(DATA + "Nov 22 looks fine.", "q", MK, TODAY)
+
+
 # ---------------------------------------------------------------- end to end
 
 class FrozenDate(dt.date):

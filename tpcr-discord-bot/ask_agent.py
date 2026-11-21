@@ -320,8 +320,15 @@ def _park_mentions(text: str) -> list[tuple[int, str]]:
     return sorted(out)
 
 
-_BAN = (r"(?:(?:well|far)\s+)?(?:below|above)[ -](?:average|avg)\b|typical\s+day\b|(?:great|best)\s+days?\s+to\s+visit\b")
-_BAN_SPAN = re.compile(rf"(?:\b(?:a|an|the)\s+)?(?:{_BAN})(?:\s*(?:[—–,-]|\band\b)\s*(?:{_BAN}))*", re.I)
+_CMP_UP = r"busier|heavier|more\s+crowded"
+_CMP_DOWN = r"quieter|lighter|calmer|less\s+crowded"
+_BAN = (r"(?:(?:well|far)\s+)?(?:below|above)[ -](?:average|avg)\b|typical\s+day\b|(?:great|best)\s+days?\s+to\s+visit\b"
+        r"|(?:quieter|busier|lighter|heavier|calmer|slower|less\s+crowded|more\s+crowded|less\s+busy)\s+than\s+(?:average|usual|typical)\b")
+# "busier than normal" etc.: kept only when a WTI value in the same sentence backs it (see fix_ban)
+_CMP_NORMAL = rf"(?:{_CMP_UP}|{_CMP_DOWN})\s+than\s+normal\b"
+_CMP_NORMAL_RE = re.compile(rf"(?:(?P<up>{_CMP_UP})|(?:{_CMP_DOWN}))\s+than\s+normal\b", re.I)
+_BAN_ALL = rf"{_BAN}|{_CMP_NORMAL}"
+_BAN_SPAN = re.compile(rf"(?:\b(?:a|an|the)\s+)?(?:{_BAN_ALL})(?:\s*(?:[—–,-]|\band\b)\s*(?:{_BAN_ALL}))*", re.I)
 _LABELISH = rf"(?:{_BAN}|(?:below|above)\s+normal|normal)"
 _GENERALIZE = re.compile(
     r"\b(?:typically|usually|historically|traditionally|tends?\s+to|every\s+year|each\s+year|as\s+always"
@@ -358,6 +365,69 @@ def _is_later(md: tuple[int, int], latest: tuple[int, int]) -> bool:
     return 0 < delta <= 180
 
 
+# ---- forward-looking month / holiday claims
+
+def _nth_weekday(year: int, month: int, weekday: int, n: int) -> date:
+    first = date(year, month, 1)
+    return first + timedelta(days=(weekday - first.weekday()) % 7 + 7 * (n - 1))
+
+
+def _last_weekday(year: int, month: int, weekday: int) -> date:
+    last = date(year + (month == 12), month % 12 + 1, 1) - timedelta(days=1)
+    return last - timedelta(days=(last.weekday() - weekday) % 7)
+
+
+_MONTH_WORD = re.compile(
+    r"\b(?:(January|February|March|April|May|June|July|August|September|October|November|December"
+    r"|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sept?|Oct|Nov|Dec))\b\.?(?!\s*\d{1,2}\b)")
+_EVENTS = [
+    (re.compile(r"\bChristmas\b", re.I), lambda y: date(y, 12, 25)),
+    (re.compile(r"\bNew\s+Year(?:['’]s)?\b", re.I), lambda y: date(y, 1, 1)),
+    (re.compile(r"\bholiday\s+season\b|\bthe\s+holidays\b", re.I), lambda y: date(y, 12, 20)),
+    (re.compile(r"\bspring\s+break\b", re.I), lambda y: date(y, 3, 1)),
+    (re.compile(r"\bEaster\b", re.I), lambda y: date(y, 3, 22)),
+    (re.compile(r"\bsummer\b", re.I), lambda y: date(y, 6, 1)),
+    (re.compile(r"\bHalloween\b", re.I), lambda y: date(y, 10, 31)),
+    (re.compile(r"\bFourth\s+of\s+July\b|\bJuly\s+4(?:th)?\b", re.I), lambda y: date(y, 7, 4)),
+    (re.compile(r"\bMemorial\s+Day\b", re.I), lambda y: _last_weekday(y, 5, 0)),
+    (re.compile(r"\bLabor\s+Day\b", re.I), lambda y: _nth_weekday(y, 9, 0, 1)),
+    (re.compile(r"\bMLK\s+Day\b", re.I), lambda y: _nth_weekday(y, 1, 0, 3)),
+    (re.compile(r"\bPresidents['’]?\s+Day\b", re.I), lambda y: _nth_weekday(y, 2, 0, 3)),
+    (re.compile(r"\bThanksgiving\b", re.I), lambda y: _nth_weekday(y, 11, 3, 4)),
+]
+_PAST_BEFORE = re.compile(r"(?:\blast|\bthis\s+past|\bback\s+in)\s+$", re.I)
+_YEAR_AFTER = re.compile(r"^[\s,]*(\d{4})\b")
+
+
+def _beyond_horizon(sentence: str, horizon: date) -> bool:
+    """True when the sentence names a month/holiday whose next occurrence is after horizon (within 300 days)."""
+    hits = []  # (start, end, year -> date)
+    for m in _MONTH_WORD.finditer(sentence):
+        mo = _MONTHS[m.group(1)[:3].lower()]
+        hits.append((m.start(), m.end(), lambda y, mo=mo: date(y, mo, 1)))
+    for rx, fn in _EVENTS:
+        for m in rx.finditer(sentence):
+            hits.append((m.start(), m.end(), fn))
+    for start, end, fn in hits:
+        if _PAST_BEFORE.search(sentence[:start]):
+            continue
+        ym = _YEAR_AFTER.match(sentence[end:])
+        if ym and int(ym.group(1)) < horizon.year:
+            continue
+        for y in (horizon.year, horizon.year + 1):
+            d = fn(y)
+            if d > horizon:
+                if (d - horizon).days <= 300:
+                    return True
+                break
+    return False
+
+
+def _resolve_md(md: tuple[int, int], today: date) -> date:
+    cands = [date(y, *md) for y in (today.year - 1, today.year, today.year + 1)]
+    return min(cands, key=lambda d: abs((d - today).days))
+
+
 def _sentence_values(sentence: str) -> list[float]:
     s = re.sub(r"\d{1,2}/\d{1,2}(?:/\d{2,4})?|\d{1,2}:\d{2}", " ", sentence)
     s = _UNIT_NUM.sub(" ", s)  # ride minutes / percentages are not WTI values
@@ -377,11 +447,12 @@ def _tidy(s: str) -> str:
     return re.sub(r"[ \t]{2,}", " ", s).strip() if s.strip() else ""
 
 
-def enforce_wording(answer: str, question: str, bands: dict) -> str:
+def enforce_wording(answer: str, question: str, bands: dict, today: date | None = None) -> str:
     """Rewrite banned crowd-level phrases to computed band labels and drop seasonal/beyond-data sentences.
 
     Never changes a digit: only inserts/replaces label words and removes whole sentences.
     """
+    today = today or date.today()
     q_parks = {p for _, p in _park_mentions(question)}
     q_park = next(iter(q_parks)) if len(q_parks) == 1 else None
     mentions = _park_mentions(answer)
@@ -409,6 +480,7 @@ def enforce_wording(answer: str, question: str, bands: dict) -> str:
         first = data_dates[0]
         latest = max(data_dates, key=lambda md: (date(2000, *md) - date(2000, *first)).days % 366)
 
+    horizon = _resolve_md(latest, today) if latest else today
     n_label = n_ban = n_drop = 0
 
     def fix_ban(sentence: str, band, allow_replace: bool) -> str:
@@ -421,8 +493,27 @@ def enforce_wording(answer: str, question: str, bands: dict) -> str:
             labels = {band_label(v, band) for v in vals}
             if len(labels) == 1:
                 repl = labels.pop()
+
+        def backed(m) -> bool:  # lone "busier/quieter than normal" with a value on that side of the band
+            c = _CMP_NORMAL_RE.fullmatch(re.sub(r"^(?:a|an|the)\s+", "", m.group(0), flags=re.I))
+            if not (band and c):
+                return False
+            return any(v > band[1] for v in vals) if c.group("up") else any(v < band[0] for v in vals)
+
+        changed = False
+
+        def sub(m) -> str:
+            nonlocal changed
+            if backed(m):
+                return m.group(0)
+            changed = True
+            return repl
+
+        new = _BAN_SPAN.sub(sub, sentence)
+        if not changed:
+            return sentence
         n_ban += 1
-        return _tidy(_BAN_SPAN.sub(lambda m: repl, sentence)) if repl else _tidy(_BAN_SPAN.sub("", sentence))
+        return _tidy(new)
 
     out: list[str] = []
     for i, ln in enumerate(lines):
@@ -449,6 +540,8 @@ def enforce_wording(answer: str, question: str, bands: dict) -> str:
             drop = bool(_GENERALIZE.search(body))
             if not drop and latest:
                 drop = any(_is_later(md, latest) for md in _md_dates(body))
+            if not drop:
+                drop = _beyond_horizon(body, horizon)
             if drop:
                 removed = True
                 n_drop += 1
@@ -966,7 +1059,7 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
         if not text:
             return text
         try:
-            fixed = enforce_wording(text, question, bands)
+            fixed = enforce_wording(text, question, bands, today)
         except Exception as e:
             logger.warning("enforce_wording failed (%s)", type(e).__name__)
             return text
