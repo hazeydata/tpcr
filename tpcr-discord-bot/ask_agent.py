@@ -12,7 +12,7 @@ import os
 import re
 import duckdb
 import httpx
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -156,14 +156,7 @@ NOTE: "Universal Orlando" or "Universal Orlando Resort" means ALL THREE parks: U
 - TDL = Tokyo Disneyland
 - TDS = Tokyo DisneySea
 
-## WTI Interpretation
-- ≤12: Well below average — best day to visit
-- 13-18: Below average — great day to visit
-- 19-25: Typical day — moderate waits
-- 26-34: Above average — plan strategically
-- 35-42: Well above average — arrive early
-- 43-50: Very high — consider another day
-- 50+: Extreme — plan carefully or reschedule
+__WTI_BANDS__
 
 ## Guidelines
 - Today's date is {today} ({today_dow}).
@@ -173,8 +166,8 @@ NOTE: "Universal Orlando" or "Universal Orlando Resort" means ALL THREE parks: U
 - Match attractions with entity_name ILIKE '%...%' rather than equality.
 - Resolve relative dates like "last Saturday" relative to {today} ({today_dow}) and use the explicit date in queries.
 - Use the `run_query` tool to query the database. Always use read-only queries (SELECT only).
-- When comparing dates, show WTI values and explain what they mean.
-- For "best day to visit" questions, query WTI and sort by lowest.
+- When comparing dates, show WTI values and label each against that park's normal band (see WTI Normal Bands).
+- For questions about which day to pick, query WTI and sort by lowest.
 - For ride-specific questions, join forecasts with entities.
 - Keep answers concise and helpful — these are Discord messages (max ~1800 chars).
 - Use emoji sparingly for readability.
@@ -239,6 +232,238 @@ def data_path(*parts: str) -> str:
     if not root:
         raise RuntimeError(f"{DATA_ROOT_ENV} is not set; set it to the pipeline root (e.g. ~/hazeydata/pipeline on the Mini)")
     return os.path.join(str(root), *parts)
+
+
+# ---------------------------------------------------------------- WTI normal bands
+
+_BANDS_CACHE: dict = {}
+
+
+def normal_bands(as_of: date) -> dict[str, tuple[float, float]]:
+    """Per-park normal band: p25-p75 of historical WTI, 2022-01-01 .. day before as_of.
+
+    Same definition as operations/tweet_v2/cards.py boxes(); keep them in sync (parity test).
+    Parks with < 365 history days are skipped. Never raises: returns {} on any error.
+    """
+    try:
+        path = data_path("wti", "wti.parquet")
+        key = (path, os.stat(path).st_mtime_ns, as_of)
+        if key in _BANDS_CACHE:
+            return _BANDS_CACHE[key]
+        last = (as_of - timedelta(days=1)).isoformat()
+        con = duckdb.connect()
+        try:
+            rows = con.execute(
+                "SELECT park_code, quantile_cont(wti, 0.25), quantile_cont(wti, 0.75) "
+                "FROM read_parquet(?) WHERE source = 'historical' "
+                "AND CAST(park_date AS DATE) >= DATE '2022-01-01' AND CAST(park_date AS DATE) <= CAST(? AS DATE) "
+                "GROUP BY park_code HAVING count(*) >= 365 ORDER BY park_code",
+                [path, last],
+            ).fetchall()
+        finally:
+            con.close()
+        bands = {p: (float(lo), float(hi)) for p, lo, hi in rows if lo is not None and hi is not None}
+        _BANDS_CACHE.clear()
+        _BANDS_CACHE[key] = bands
+        return bands
+    except Exception as e:
+        logger.warning("normal_bands failed (%s)", type(e).__name__)
+        return {}
+
+
+def band_label(value: float, band: tuple[float, float]) -> str:
+    """Same comparison as cards.qual()."""
+    return "above normal" if value > band[1] else "below normal" if value < band[0] else "normal"
+
+
+def wti_bands_section(bands: dict) -> str:
+    if not bands:
+        return ("## WTI Normal Bands\n"
+                "Normal bands are unavailable right now. Do not label crowd levels at all; just give the numbers.")
+    lines = "\n".join(f"- {p} {lo:.1f}–{hi:.1f}" for p, (lo, hi) in sorted(bands.items()))
+    return (
+        "## WTI Normal Bands\n"
+        "Each park's normal band is the middle half (25th–75th percentile) of that park's WTI days since Jan 1 2022:\n"
+        f"{lines}\n"
+        "Rules for describing WTI:\n"
+        "- Label a WTI value ONLY as \"below normal\", \"normal\" or \"above normal\" against THAT park's band above.\n"
+        "- NEVER use \"below average\", \"above average\", \"typical day\", \"great day to visit\", \"best day to visit\" or similar.\n"
+        "- Never call an in-band (normal) value quiet, low or great.\n"
+        "- No seasonal, holiday or \"typically/usually/historically\" claims, and no statements about dates beyond "
+        "the data you queried and show."
+    )
+
+
+def build_system_prompt(today: date) -> str:
+    prompt = SCHEMA_CONTEXT.format(today=today.isoformat(), today_dow=today.strftime("%A"),
+                                   duckdb_path=_duckdb_path(), data_root=data_path())
+    return prompt.replace("__WTI_BANDS__", wti_bands_section(normal_bands(today)))
+
+
+# ---------------------------------------------------------------- deterministic wording guard
+
+_PARK_NAMES = re.compile(
+    r"\b(?:(Tokyo\s+DisneySea)|(Tokyo\s+Disneyland)|(Universal\s+Studios\s+Hollywood)|(Universal\s+Studios\s+Florida)"
+    r"|(Magic\s+Kingdom)|(EPCOT)|(Hollywood\s+Studios)|(Animal\s+Kingdom)|(?<!Tokyo\s)(Disneyland)"
+    r"|(California\s+Adventure)|(Islands\s+of\s+Adventure)|(Epic\s+Universe))\b", re.I)
+_PARK_NAME_CODES = ("TDS", "TDL", "UH", "UF", "MK", "EP", "HS", "AK", "DL", "CA", "IA", "EU")
+_PARK_CODES = re.compile(r"\b(MK|EP|HS|AK|DL|EU|IA|UF|UH|TDL|TDS|DCA|USF|IOA)\b")
+_CODE_ALIAS = {"DCA": "CA", "USF": "UF", "IOA": "IA"}
+
+
+def _park_mentions(text: str) -> list[tuple[int, str]]:
+    out = []
+    for m in _PARK_NAMES.finditer(text):
+        out.append((m.start(), _PARK_NAME_CODES[m.lastindex - 1]))
+    for m in _PARK_CODES.finditer(text):
+        out.append((m.start(), _CODE_ALIAS.get(m.group(1), m.group(1))))
+    return sorted(out)
+
+
+_BAN = (r"(?:(?:well|far)\s+)?(?:below|above)[ -](?:average|avg)\b|typical\s+day\b|(?:great|best)\s+days?\s+to\s+visit\b")
+_BAN_SPAN = re.compile(rf"(?:\b(?:a|an|the)\s+)?(?:{_BAN})(?:\s*(?:[—–,-]|\band\b)\s*(?:{_BAN}))*", re.I)
+_LABELISH = rf"(?:{_BAN}|(?:below|above)\s+normal|normal)"
+_GENERALIZE = re.compile(
+    r"\b(?:typically|usually|historically|traditionally|tends?\s+to|every\s+year|each\s+year|as\s+always"
+    r"|normally\s+(?:spike|surge|peak|rise|busy)|crowds\s+normally|seasonal(?:ly)?)\b", re.I)
+
+_WD = r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*\.?"
+_MON = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?"
+_DATE = rf"(?:\d{{1,2}}/\d{{1,2}}|{_MON}\s+\d{{1,2}})"
+_DATA_LINE = re.compile(
+    rf"^(?P<pre>\s*(?:[-•*·]\s+)?\**\s*(?:{_WD},?\s*(?:{_DATE})?|{_DATE})\**\s*[:\-–—]\s*\**\s*)"
+    r"(?P<val>\d+(?:\.\d+)?)(?P<close>\**)(?P<tail>.*)$", re.I)
+_UNIT = re.compile(r"^\s*(?:%|(?:mins?|minutes?|m|hours?|hrs?|h)\b)", re.I)
+_UNIT_NUM = re.compile(
+    r"\d+(?:\.\d+)?(?:\s*[–-]\s*\d+(?:\.\d+)?)?\s*(?:%|(?:mins?|minutes?|m|hours?|hrs?|h)\b)", re.I)
+_WTI_CONTEXT = re.compile(r"\bWTI\b|wait\s+time\s+index|crowd", re.I)
+_MD = re.compile(rf"\b(?:(\d{{1,2}})/(\d{{1,2}})|({_MON})\s+(\d{{1,2}}))\b", re.I)
+_MONTHS = {m: i + 1 for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"])}
+
+
+def _md_dates(text: str) -> list[tuple[int, int]]:
+    out = []
+    for m in _MD.finditer(text):
+        mo, d = (int(m.group(1)), int(m.group(2))) if m.group(1) else (_MONTHS.get(m.group(3)[:3].lower()), int(m.group(4)))
+        try:
+            date(2000, mo, d)
+        except (TypeError, ValueError):
+            continue
+        out.append((mo, d))
+    return out
+
+
+def _is_later(md: tuple[int, int], latest: tuple[int, int]) -> bool:
+    delta = (date(2000, *md) - date(2000, *latest)).days % 366
+    return 0 < delta <= 180
+
+
+def _sentence_values(sentence: str) -> list[float]:
+    s = re.sub(r"\d{1,2}/\d{1,2}(?:/\d{2,4})?|\d{1,2}:\d{2}", " ", sentence)
+    s = _UNIT_NUM.sub(" ", s)  # ride minutes / percentages are not WTI values
+    vals = []
+    for m in re.finditer(r"(\d+(?:\.\d+)?)\s*[–-]\s*(\d+(?:\.\d+)?)", s):
+        vals += [float(m.group(1)), float(m.group(2))]
+    s = re.sub(r"\d+(?:\.\d+)?\s*[–-]\s*\d+(?:\.\d+)?", " ", s)
+    return vals + [float(x) for x in re.findall(r"\d+\.\d+", s)]
+
+
+def _tidy(s: str) -> str:
+    s = re.sub(r'""|“”', "", s)
+    s = re.sub(r"\(\s*\)", "", s)
+    s = re.sub(r"\s+([.,;!?])", r"\1", s)
+    s = re.sub(r"([,;])\s*(?=[.!?])", "", s)
+    s = re.sub(r"\s*[—–,-]\s*$", "", s)
+    return re.sub(r"[ \t]{2,}", " ", s).strip() if s.strip() else ""
+
+
+def enforce_wording(answer: str, question: str, bands: dict) -> str:
+    """Rewrite banned crowd-level phrases to computed band labels and drop seasonal/beyond-data sentences.
+
+    Never changes a digit: only inserts/replaces label words and removes whole sentences.
+    """
+    q_parks = {p for _, p in _park_mentions(question)}
+    q_park = next(iter(q_parks)) if len(q_parks) == 1 else None
+    mentions = _park_mentions(answer)
+    lines = answer.split("\n")
+    starts, pos = [], 0
+    for ln in lines:
+        starts.append(pos)
+        pos += len(ln) + 1
+
+    def park_for(i: int) -> str | None:
+        end = starts[i] + len(lines[i])
+        seen = [p for at, p in mentions if at < end]
+        return seen[-1] if seen else q_park
+
+    wti_ctx = bool(_WTI_CONTEXT.search(answer))
+
+    def is_data(ln: str) -> bool:
+        m = _DATA_LINE.match(ln)
+        return bool(m) and wti_ctx and not _UNIT.match(m.group("tail"))
+
+    data = [is_data(ln) for ln in lines]
+    data_dates = [d for ln, is_d in zip(lines, data) if is_d for d in _md_dates(ln)]
+    latest = None
+    if data_dates:
+        first = data_dates[0]
+        latest = max(data_dates, key=lambda md: (date(2000, *md) - date(2000, *first)).days % 366)
+
+    n_label = n_ban = n_drop = 0
+
+    def fix_ban(sentence: str, band, allow_replace: bool) -> str:
+        nonlocal n_ban
+        if not _BAN_SPAN.search(sentence):
+            return sentence
+        repl = ""
+        vals = _sentence_values(sentence)
+        if allow_replace and band and vals:
+            labels = {band_label(v, band) for v in vals}
+            if len(labels) == 1:
+                repl = labels.pop()
+        n_ban += 1
+        return _tidy(_BAN_SPAN.sub(lambda m: repl, sentence)) if repl else _tidy(_BAN_SPAN.sub("", sentence))
+
+    out: list[str] = []
+    for i, ln in enumerate(lines):
+        park = park_for(i)
+        band = bands.get(park) if park else None
+        if data[i]:
+            m = _DATA_LINE.match(ln)
+            tail = m.group("tail")
+            if band:
+                tail = re.sub(rf"^\s*\((?![^()]*\d)[^()]*\b(?:below|above|average|avg|normal|typical|great|best|quiet|busy|busier|quieter|low|high)\b[^()]*\)", "", tail, flags=re.I)
+                tail = re.sub(rf"^\s*(?:[—–,-]\s*)?{_LABELISH}(?:\s*(?:[—–,-]|\band\b)\s*{_LABELISH})*", "", tail, flags=re.I)
+                label = band_label(float(m.group("val")), band)
+                tail = f" ({label})" + (tail if not tail or tail[0].isspace() else " " + tail)
+                n_label += 1
+            new = m.group("pre") + m.group("val") + m.group("close") + tail
+            out.append(fix_ban(new, band, False))
+            continue
+        pieces = re.findall(r".*?(?:[.!?]+[”\"\)\]*_]*(?:\s+|$)|$)", ln)
+        kept, removed = [], False
+        for piece in pieces:
+            if not piece:
+                continue
+            body = piece.strip()
+            drop = bool(_GENERALIZE.search(body))
+            if not drop and latest:
+                drop = any(_is_later(md, latest) for md in _md_dates(body))
+            if drop:
+                removed = True
+                n_drop += 1
+                continue
+            lead = piece[: len(piece) - len(piece.lstrip())]
+            trail = piece[len(piece.rstrip()):]
+            kept.append(lead + fix_ban(body, band, True) + trail)
+        if removed:
+            kept = [k for k in kept if re.search(r"\w", k)]
+            if not kept:
+                continue
+        out.append("".join(kept).rstrip() if removed else "".join(kept))
+    result = re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+    logger.info("enforce_wording labels=%d banned_rewrites=%d sentences_removed=%d", n_label, n_ban, n_drop)
+    return result
 
 
 ASK_PROVIDERS = ("anthropic", "qwen")
@@ -733,8 +958,19 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
     _start = _time.monotonic()
 
     today = date.today()
-    system_prompt = SCHEMA_CONTEXT.format(today=today.isoformat(), today_dow=today.strftime("%A"),
-                                          duckdb_path=_duckdb_path(), data_root=data_path())
+    system_prompt = build_system_prompt(today)
+    bands = normal_bands(today)
+
+    def guard(text: str) -> str:
+        """Wording check for model text only (never the bot's own fixed messages)."""
+        if not text:
+            return text
+        try:
+            fixed = enforce_wording(text, question, bands)
+        except Exception as e:
+            logger.warning("enforce_wording failed (%s)", type(e).__name__)
+            return text
+        return fixed or "I don't have enough data to answer that. Try asking about specific dates!"
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -772,7 +1008,7 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
             claude_answer, claude_rounds = (claude_result if isinstance(claude_result, tuple)
                                             else (claude_result, 5))
             if claude_answer:
-                return await finish(claude_answer, claude_rounds, CLAUDE_MODEL)
+                return await finish(guard(claude_answer), claude_rounds, CLAUDE_MODEL)
     elif provider == "anthropic":
         logger.warning("TPCR_ASK_PROVIDER=anthropic but no api_key; using Qwen")
 
@@ -828,7 +1064,7 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
                 })
         else:
             # Final text response
-            return await finish(strip_think(message.get("content") or ""), round_num)
+            return await finish(guard(strip_think(message.get("content") or "")), round_num)
 
     messages.append({"role": "user", "content": "You have no more queries. Answer the question now from the results you have."})
     try:
@@ -839,7 +1075,7 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
         answer = ""
 
     if answer:
-        return await finish(answer, 5)
+        return await finish(guard(answer), 5)
 
     if query_results and all(r == NO_RESULTS_MSG for r in query_results):
         # AC4: rounds exhausted, final call empty/raised, >=1 SELECT ran, all empty.

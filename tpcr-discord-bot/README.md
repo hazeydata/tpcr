@@ -79,3 +79,11 @@ Users with the **Premium** Discord role (assigned via Stripe webhook when they s
 3. If the user requests more days than allowed, show `premium_teaser_message()` and return.
 
 See `bot.py` for `has_premium_role()`, `max_forecast_days()`, and `premium_teaser_message()`.
+
+## /ask wording rules
+
+- **Bands:** each park's normal band is p25–p75 of historical WTI (2022-01-01 through yesterday, ≥365 days), read from `$TPCR_DATA_ROOT/wti/wti.parquet` and recomputed per day. Same definition as `operations/tweet_v2/cards.py` `boxes()` (a parity test keeps them in sync). It is listed in the `/ask` system prompt.
+- **Labels:** WTI values are labelled only `below normal` / `normal` / `above normal` against that park's band. `enforce_wording()` adds the computed label to day/value lines and replaces any model label.
+- **Banned phrases:** "below/above average", "typical day", "great/best day to visit" are rewritten to the computed label (or deleted when no single label fits or no band exists).
+- **Seasonal / beyond-data claims:** sentences with "typically", "usually", "historically", etc., or dates later than the last date in the shown data, are removed.
+- Numbers are never changed. Only model text is checked, not the bot's own fixed messages.
