@@ -30,8 +30,16 @@ import scorecard as sc
 import tweet_note
 import weekly
 
-sys.modules.setdefault("requests_oauthlib", type(sys)("requests_oauthlib")).OAuth1 = object
-import wti_predicted_tweet as wpt
+# Stub requests_oauthlib only for this import, inside patch.dict, so the stub (and a wti_predicted_tweet bound to it)
+# never leaks into other test modules' sys.modules (was: a module-level OAuth1 = object that broke later live tests).
+import requests  # noqa: E402,F401 - wti_predicted_tweet's other deps are imported normally (shared, not dropped)
+import tweet_format  # noqa: E402,F401
+import tweet_guard  # noqa: E402,F401
+import tweet_v2  # noqa: E402,F401
+_oauth_stub = type(sys)("requests_oauthlib")
+_oauth_stub.OAuth1 = lambda *a, **k: "auth"
+with mock.patch.dict(sys.modules, {"requests_oauthlib": sys.modules.get("requests_oauthlib", _oauth_stub)}):
+    import wti_predicted_tweet as wpt
 
 AS_OF = date(2026, 10, 12)
 
@@ -450,17 +458,21 @@ class PhaseG(Env):
         post = mock.Mock(return_value="111")
         creds = {k: "x" for k in ("TWITTER_CONSUMER_KEY", "TWITTER_CONSUMER_SECRET", "TWITTER_ACCESS_TOKEN", "TWITTER_ACCESS_TOKEN_SECRET")}
         with mock.patch.multiple(wpt, STATE_FILE=state, load_env=mock.DEFAULT, enforce=mock.DEFAULT, post_discord=mock.DEFAULT,
-                                 render_video_on_wilma=mock.Mock(return_value=None), load_content=mock.Mock(return_value=FORECAST),
-                                 post_tweet=post), \
+                                 load_content=mock.Mock(return_value=(json.dumps(FORECAST), FORECAST)),
+                                 upload_media=mock.Mock(return_value="M1"), post_tweet=post), \
+                mock.patch.object(wpt.tweet_v2, "fetch_history", mock.Mock(return_value="h.parquet")), \
+                mock.patch.object(wpt.tweet_v2, "forecast_staleness", mock.Mock(return_value=None)), \
+                mock.patch.object(wpt.tweet_v2, "post_text", mock.Mock(return_value=MAIN_FORECAST_TEXT)), \
+                mock.patch.object(wpt.tweet_v2, "build", mock.Mock(return_value={"F": {"mp4": "F.mp4", "png": "F.png", "alt": "alt"}})), \
                 mock.patch.dict(os.environ, creds), mock.patch.object(tweet_note, "date", type("D", (date,), {"today": classmethod(lambda c: AS_OF)})), \
                 redirect_stdout(io.StringIO()):
-            wpt.main()
+            wpt.main(["--date", FORECAST["target_date"]])
         return post, state
 
     def test_ac23_forecast_unchanged_and_reply_drafted(self):
         self.assertEqual(wpt.format_tweet(FORECAST), MAIN_FORECAST_TEXT)
         post, state = self.run_forecast(systematic(("AK", "high")))
-        post.assert_called_once_with(MAIN_FORECAST_TEXT, media_id=None)
+        post.assert_called_once_with(MAIN_FORECAST_TEXT, media_id="M1")
         draft = json.loads(state.read_text())["note_drafts"]["2026-10-13"]
         text = "Note: our Animal Kingdom forecasts have been running high lately. We're working on it."
         self.assertEqual(draft, {"text": text, "in_reply_to": "111", "status": "draft",
@@ -703,3 +715,20 @@ class WindowsTestOnly(Env):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# TPCR-TWEET-RESTYLE-CUTOVER: the suites above test the new-format path, so they run as if the old format had
+# already retired (config/tweet_format.json window moved to the past). The window itself is tested in
+# tests/test_tweet_format.py.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "operations" / "scripts"))
+import tweet_format as _tf  # noqa: E402
+from datetime import datetime as _dtm, timezone as _tzu  # noqa: E402
+_PAST_WINDOW = mock.patch.multiple(_tf, FIRST_NEW_RUN=_dtm(2000, 1, 1, tzinfo=_tzu.utc), OLD_RETIRES=_dtm(2000, 1, 2, tzinfo=_tzu.utc))
+
+
+def setUpModule():
+    _PAST_WINDOW.start()
+
+
+def tearDownModule():
+    _PAST_WINDOW.stop()

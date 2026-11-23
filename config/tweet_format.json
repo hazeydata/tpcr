@@ -1,0 +1,9 @@
+{
+  "_doc": "TPCR-TWEET-RESTYLE-CUTOVER: the ONLY place the format window and the new-format reply tiers are set. reply_tier_a/reply_tier_b: |observed - forecast| WTI cutoffs, set by Fred Oct 28 2026 to A=3.0, B=6.0 (miss <= A ✅, A < miss <= B ⬇️/⬆️, > B ⏬/⏫; unset or invalid = new-format reply skipped_bad_config). Read by operations/scripts/tweet_format.py. Times are America/New_York (EDT, UTC-4, on both dates; DST ends 02:00 Nov 1, after old_retires). discord_cta (TPCR-DISCORD-GROWTH-001, Fred Nov 18 2026): a SEPARATE text-only reply 'Free daily forecasts live on our Discord: <invite_url>' threaded under the 8:30 AM OBSERVED post (the OBSERVED and FORECAST texts never change). Two gates, both required: env TPCR_DISCORD_CTA_REPLY=1 AND this block. invite_url = the TPCR #general never-expire invite, https://discord.gg/2Estr7sbP7 (Fred, Nov 19 2026), set on the Mini by the enable card; the committed invite_url / first_post_date / last_post_date stay null (allowed values, exact match only: https://discord.gg/<code>, code ^[A-Za-z0-9-]{2,32}$, or the share page https://hazeydata.ai/theme-park-crowd-report/discord, which forwards to the invite and carries og:image so X shows a card instead of the grey placeholder a bare discord.gg link gets; null, INVITE*/placeholder/example/xxx/x-daily codes are skipped with a logged reason); first_post_date/last_post_date = America/Toronto posting dates (the day the reply goes out, not park day D), YYYY-MM-DD, inclusive, last = first + 13 days (14 posts, max). Set on the Mini at enable; committed values stay null. All null = off; partial or invalid = off plus one ERROR on stderr. After last_post_date it stops on its own.",
+  "first_new_run": "2026-10-29T16:00:00-04:00",
+  "old_retires": "2026-11-01T00:00:00-04:00",
+  "store_name": "tweet_formats.json",
+  "reply_tier_a": 3.0,
+  "reply_tier_b": 6.0,
+  "discord_cta": {"invite_url": null, "first_post_date": null, "last_post_date": null}
+}

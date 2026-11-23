@@ -9,6 +9,9 @@ duckdb>=1.0.0
 # HTTP requests for API access
 requests>=2.31.0
 
+# Ed25519 signature check for signed X reply approvals (x_approved_reply_poster.py, AC 3c)
+cryptography>=41.0.0
+
 # Stripe Premium subscriptions
 stripe>=8.0.0
 

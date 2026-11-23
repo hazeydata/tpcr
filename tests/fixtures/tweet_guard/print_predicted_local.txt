@@ -1,0 +1,11 @@
+gui/501/com.hazeydata.tpcr-tweet-predicted = {
+	active count = 0
+	path = /Users/fred/Library/LaunchAgents/com.hazeydata.tpcr-tweet-predicted.plist
+	state = not running
+	program = /Users/fred/theme-park-crowd-report/.venv/bin/python
+	arguments = {
+		/Users/fred/theme-park-crowd-report/.venv/bin/python
+		/Users/fred/hazeydata/scripts/wti_predicted_tweet_local.py
+	}
+	working directory = /Users/fred/hazeydata
+}

@@ -79,3 +79,13 @@ Users with the **Premium** Discord role (assigned via Stripe webhook when they s
 3. If the user requests more days than allowed, show `premium_teaser_message()` and return.
 
 See `bot.py` for `has_premium_role()`, `max_forecast_days()`, and `premium_teaser_message()`.
+
+## /ask wording rules
+
+- **Bands:** each park's normal band is p25–p75 of historical WTI (2022-01-01 through yesterday, ≥365 days), read from `$TPCR_DATA_ROOT/wti/wti.parquet` and recomputed per day. Same definition as `operations/tweet_v2/cards.py` `boxes()` (a parity test keeps them in sync). It is listed in the `/ask` system prompt.
+- **Labels:** WTI values are labelled only `below normal` / `normal` / `above normal` against that park's band. `enforce_wording()` labels a day/value line (e.g. `• Tue 11/24: 15.8`) only when the answer mentions WTI, Wait Time Index or crowd, and never when the value is followed by min, mins, minutes, m, %, hours, hrs or h (ride waits stay unlabelled). It replaces any model label on those lines.
+- **Banned phrases:** "below/above average" (also "well/far below/above"), "typical day", "great/best day to visit", and comparisons against average/usual/typical ("quieter/busier/lighter/heavier/calmer/slower/less crowded/more crowded/less busy than average/usual/typical") are replaced by the computed label when the sentence's WTI values all map to one label, otherwise deleted (always deleted on day/value lines, or when no band exists).
+- **Comparative "than normal":** "busier/heavier/more crowded than normal" is kept only when the same sentence has a WTI value above the park's band; "quieter/lighter/calmer/less crowded than normal" only with a value below it. Otherwise it is treated like a banned phrase.
+- **Seasonal / beyond-data claims:** sentences with "typically", "usually", "historically", etc., or a date later than the last date in the shown data, are removed. A sentence naming a month (not part of a "Nov 22"-style date) or a holiday/season (Christmas, New Year, holiday season, spring break, Easter, summer, Halloween, Fourth of July, Memorial Day, Labor Day, MLK Day, Presidents Day, Thanksgiving) is also removed when its next occurrence is after the horizon (within 300 days). The horizon is the latest date on a data line, or today when the answer has none. Past references ("last", "this past", "back in", or a following earlier year) and the current month are kept.
+- **Empty answer:** if every sentence is removed, the reply is "I don't have enough data to answer that. Try asking about specific dates!"
+- Numbers are never changed. Only model text is checked, not the bot's own fixed messages.
