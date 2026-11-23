@@ -223,8 +223,9 @@ class FrozenDate(dt.date):
 def _ask(text, parquet_present=True, claude=False):
     with patch("ask_agent.date", FrozenDate):
         if claude:
-            with patch("ask_agent._claude_loop", AsyncMock(return_value=(text, 1))), \
-                 patch.dict(os.environ, {"TPCR_ASK_PROVIDER": "anthropic"}):
+            # #516 routes Claude through OpenRouter; wording still wraps that path.
+            with patch("ask_agent._openrouter_loop", AsyncMock(return_value=(text, 1))), \
+                 patch.dict(os.environ, {"TPCR_ASK_PROVIDER": "openrouter"}):
                 return run(aa.ask_agent(QUESTION, "u1", api_key="k"))
         chat = AsyncMock(return_value={"choices": [{"message": {"role": "assistant", "content": text}}]})
         with patch("ask_agent._chat", chat):

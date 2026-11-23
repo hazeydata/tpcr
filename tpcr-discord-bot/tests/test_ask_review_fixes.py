@@ -100,15 +100,15 @@ def test_strip_think_uppercase():
 # 3. invalid provider
 def test_invalid_provider_fails_at_startup(monkeypatch):
     monkeypatch.setenv("TPCR_ASK_PROVIDER", "openai")
-    with pytest.raises(RuntimeError, match="anthropic or qwen") as ei:
+    with pytest.raises(RuntimeError, match="openrouter or qwen") as ei:
         aa.validate_config()
     assert "'openai'" in str(ei.value)
-    with pytest.raises(RuntimeError, match="anthropic or qwen"):
+    with pytest.raises(RuntimeError, match="openrouter or qwen"):
         asyncio.run(aa.ask_agent("q", "u"))
 
 
 def test_valid_providers_accepted(monkeypatch):
-    for p in ("anthropic", "QWEN", " qwen "):
+    for p in ("openrouter", "anthropic", "QWEN", " qwen "):
         monkeypatch.setenv("TPCR_ASK_PROVIDER", p)
         aa.validate_config()
 
@@ -188,31 +188,29 @@ def test_ac18_qwen_delete_refused():
 
 
 def test_ac18_claude_delete_refused(monkeypatch):
-    monkeypatch.setenv("TPCR_ASK_PROVIDER", "anthropic")
+    monkeypatch.setenv("TPCR_ASK_PROVIDER", "openrouter")
     sent = []
-    blocks = [
-        [types.SimpleNamespace(type="tool_use", id="t1", input={"sql": "DELETE FROM x"})],
-        [types.SimpleNamespace(type="text", text="ok")],
+    replies = [
+        chat_reply(tool_calls=[{"id": "t1", "type": "function", "function": {
+            "name": "run_query", "arguments": json.dumps({"sql": "DELETE FROM x"})}}]),
+        chat_reply("ok"),
     ]
 
-    class Msgs:
-        async def create(self, **kw):
-            sent.append(kw["messages"][-1])
-            return types.SimpleNamespace(content=blocks.pop(0))
+    async def post(api_key, payload):
+        sent.append(payload["messages"][-1])
+        return replies.pop(0)
 
-    fake = types.ModuleType("anthropic")
-    fake.AsyncAnthropic = lambda **kw: types.SimpleNamespace(messages=Msgs())
-    monkeypatch.setitem(sys.modules, "anthropic", fake)
+    monkeypatch.setattr(aa, "_post_openrouter", post)
     with patch("ask_agent.run_duckdb_query") as q:
         assert asyncio.run(aa.ask_agent("q", "u", api_key="sk-test")) == "ok"
     q.assert_not_called()
-    assert sent[-1]["content"][0]["content"] == "Error: Only SELECT queries are allowed."
+    assert sent[-1]["role"] == "tool" and sent[-1]["content"] == "Error: Only SELECT queries are allowed."
 
 
-# 6. any Claude exception falls back and is logged
+# 6. any OpenRouter exception falls back and is logged
 def test_claude_keyerror_falls_back_to_qwen_and_logs(monkeypatch, caplog):
-    monkeypatch.setenv("TPCR_ASK_PROVIDER", "anthropic")
-    with patch("ask_agent._claude_loop", AsyncMock(side_effect=KeyError("content"))), \
+    monkeypatch.setenv("TPCR_ASK_PROVIDER", "openrouter")
+    with patch("ask_agent._openrouter_loop", AsyncMock(side_effect=KeyError("content"))), \
          patch("ask_agent._chat", AsyncMock(return_value=chat_reply("qwen answer"))), \
          caplog.at_level(logging.WARNING, logger=aa.logger.name):
         answer = asyncio.run(aa.ask_agent("q", "u", api_key="sk-test"))
@@ -222,19 +220,17 @@ def test_claude_keyerror_falls_back_to_qwen_and_logs(monkeypatch, caplog):
 
 # 7. Claude log records actual rounds
 def test_claude_log_records_actual_rounds(monkeypatch, caplog):
-    monkeypatch.setenv("TPCR_ASK_PROVIDER", "anthropic")
-    blocks = [
-        [types.SimpleNamespace(type="tool_use", id="t1", input={"sql": "SELECT 1"})],
-        [types.SimpleNamespace(type="text", text="claude done")],
+    monkeypatch.setenv("TPCR_ASK_PROVIDER", "openrouter")
+    replies = [
+        chat_reply(tool_calls=[{"id": "t1", "type": "function", "function": {
+            "name": "run_query", "arguments": json.dumps({"sql": "SELECT 1"})}}]),
+        chat_reply("claude done"),
     ]
 
-    class Msgs:
-        async def create(self, **kw):
-            return types.SimpleNamespace(content=blocks.pop(0))
+    async def post(api_key, payload):
+        return replies.pop(0)
 
-    fake = types.ModuleType("anthropic")
-    fake.AsyncAnthropic = lambda **kw: types.SimpleNamespace(messages=Msgs())
-    monkeypatch.setitem(sys.modules, "anthropic", fake)
+    monkeypatch.setattr(aa, "_post_openrouter", post)
     with patch("ask_agent.run_duckdb_query", return_value="x"), \
          caplog.at_level(logging.INFO, logger=aa.logger.name):
         answer = asyncio.run(aa.ask_agent("q", "u", api_key="sk-test"))
@@ -249,35 +245,18 @@ SECRET = "sk-ant-TESTSECRET123"  # fake key mandated by spec AC24; prepush-scan:
 
 def _planted_errors():
     import httpx
-    try:
-        import anthropic
-    except ImportError:  # stand-ins with the same names/attributes
-        anthropic = None
-    req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
-    errs = [ConnectionError(f"refused for key {SECRET}")]
-    if anthropic is not None:
-        errs.append(anthropic.APIConnectionError(message=f"conn failed {SECRET}", request=req))
-        for cls, code in ((anthropic.AuthenticationError, 401), (anthropic.PermissionDeniedError, 403),
-                          (anthropic.InternalServerError, 500)):
-            errs.append(cls(f"bad x-api-key {SECRET}", response=httpx.Response(code, request=req),
-                            body={"error": SECRET}))
-    else:
-        for name, code in (("APIConnectionError", None), ("AuthenticationError", 401),
-                           ("PermissionDeniedError", 403), ("InternalServerError", 500)):
-            e = type(name, (Exception,), {})(f"bad x-api-key {SECRET}")
-            if code:
-                e.status_code = code
-            errs.append(e)
-    return errs
+    return [ConnectionError(f"refused for key {SECRET}"),
+            httpx.ConnectError(f"conn failed {SECRET}"),
+            aa.OpenRouterHTTPError(401), aa.OpenRouterHTTPError(403), aa.OpenRouterHTTPError(500)]
 
 
 @pytest.mark.parametrize("err", _planted_errors(), ids=lambda e: type(e).__name__)
 def test_ac24_planted_key_never_logged_or_replied(err, monkeypatch, caplog, tmp_path):
-    monkeypatch.setenv("TPCR_ASK_PROVIDER", "anthropic")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
+    monkeypatch.setenv("TPCR_ASK_PROVIDER", "openrouter")
+    monkeypatch.setenv("OPENROUTER_API_KEY", SECRET)
     qlog = tmp_path / "q.jsonl"
     monkeypatch.setenv("TPCR_ASK_QUESTION_LOG", str(qlog))
-    with patch("ask_agent._claude_loop", AsyncMock(side_effect=err)), \
+    with patch("ask_agent._openrouter_loop", AsyncMock(side_effect=err)), \
          patch("ask_agent._chat", AsyncMock(return_value=chat_reply("qwen answer"))), \
          patch("ask_agent.log_question", _REAL_LOG_QUESTION), \
          caplog.at_level(logging.DEBUG):
@@ -294,12 +273,12 @@ def test_ac24_planted_key_never_logged_or_replied(err, monkeypatch, caplog, tmp_
 @pytest.mark.parametrize("err", [e for e in _planted_errors() if getattr(e, "status_code", None) in (401, 403)],
                          ids=lambda e: type(e).__name__)
 def test_ac27_auth_errors_log_error_with_class_and_status_only(err, monkeypatch, caplog):
-    monkeypatch.setenv("TPCR_ASK_PROVIDER", "anthropic")
-    with patch("ask_agent._claude_loop", AsyncMock(side_effect=err)), \
+    monkeypatch.setenv("TPCR_ASK_PROVIDER", "openrouter")
+    with patch("ask_agent._openrouter_loop", AsyncMock(side_effect=err)), \
          patch("ask_agent._chat", AsyncMock(return_value=chat_reply("qwen answer"))), \
          caplog.at_level(logging.DEBUG, logger=aa.logger.name):
         asyncio.run(aa.ask_agent("q", "u", api_key="sk-test"))
-    recs = [r for r in caplog.records if "Claude" in r.getMessage()]
+    recs = [r for r in caplog.records if "OpenRouter" in r.getMessage()]
     assert recs and all(r.levelno == logging.ERROR for r in recs)
     msg = recs[0].getMessage()
     assert type(err).__name__ in msg and str(err.status_code) in msg
@@ -307,26 +286,26 @@ def test_ac27_auth_errors_log_error_with_class_and_status_only(err, monkeypatch,
 
 
 def test_ac15_non_auth_errors_warn_with_class_only(monkeypatch, caplog):
-    monkeypatch.setenv("TPCR_ASK_PROVIDER", "anthropic")
+    monkeypatch.setenv("TPCR_ASK_PROVIDER", "openrouter")
     for err in (asyncio.TimeoutError(), KeyError("leaky-detail"), ConnectionError("leaky-detail")):
         caplog.clear()
-        with patch("ask_agent._claude_loop", AsyncMock(side_effect=err)), \
+        with patch("ask_agent._openrouter_loop", AsyncMock(side_effect=err)), \
              patch("ask_agent._chat", AsyncMock(return_value=chat_reply("qwen answer"))), \
              caplog.at_level(logging.DEBUG, logger=aa.logger.name):
             assert asyncio.run(aa.ask_agent("q", "u", api_key="sk-test")) == "qwen answer"
-        rec = [r for r in caplog.records if "Claude" in r.getMessage()][0]
+        rec = [r for r in caplog.records if "OpenRouter" in r.getMessage()][0]
         assert rec.levelno == logging.WARNING
-        assert rec.getMessage() == f"Claude /ask failed ({type(err).__name__}); falling back to Qwen"
+        assert rec.getMessage() == f"OpenRouter /ask failed ({type(err).__name__}); falling back to Qwen"
 
 
 @pytest.mark.parametrize("mode", ["claude_success", "no_key", "qwen_only"])
 def test_ac24_other_paths_never_leak_key(mode, monkeypatch, caplog, tmp_path):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
-    monkeypatch.setenv("TPCR_ASK_PROVIDER", "qwen" if mode == "qwen_only" else "anthropic")
+    monkeypatch.setenv("OPENROUTER_API_KEY", SECRET)
+    monkeypatch.setenv("TPCR_ASK_PROVIDER", "qwen" if mode == "qwen_only" else "openrouter")
     qlog = tmp_path / "q.jsonl"
     monkeypatch.setenv("TPCR_ASK_QUESTION_LOG", str(qlog))
     key = None if mode == "no_key" else SECRET
-    with patch("ask_agent._claude_loop", AsyncMock(return_value=("claude answer", 1))), \
+    with patch("ask_agent._openrouter_loop", AsyncMock(return_value=("claude answer", 1))), \
          patch("ask_agent._chat", AsyncMock(return_value=chat_reply("qwen answer"))), \
          patch("ask_agent.log_question", _REAL_LOG_QUESTION), caplog.at_level(logging.DEBUG):
         answer = asyncio.run(aa.ask_agent("q", "u", api_key=key))
@@ -347,13 +326,13 @@ def test_ac24_key_never_passed_to_logger_or_log_question():
         if is_log:
             names = {n.id for a in node.args + [k.value for k in node.keywords] for n in ast.walk(a)
                      if isinstance(n, ast.Name)}
-            assert not names & {"api_key", "ANTHROPIC_API_KEY"}, ast.unparse(node)
+            assert not names & {"api_key", "OPENROUTER_API_KEY"}, ast.unparse(node)
 
 
 @pytest.mark.parametrize("claude_result", [(None, 5), ("", 2)])
 def test_ac16_claude_no_text_falls_back_to_qwen(claude_result, monkeypatch):
-    monkeypatch.setenv("TPCR_ASK_PROVIDER", "anthropic")
-    with patch("ask_agent._claude_loop", AsyncMock(return_value=claude_result)), \
+    monkeypatch.setenv("TPCR_ASK_PROVIDER", "openrouter")
+    with patch("ask_agent._openrouter_loop", AsyncMock(return_value=claude_result)), \
          patch("ask_agent._chat", AsyncMock(return_value=chat_reply("qwen answer"))):
         assert asyncio.run(aa.ask_agent("q", "u", api_key="sk-test")) == "qwen answer"
 
