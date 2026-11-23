@@ -276,6 +276,18 @@ def band_label(value: float, band: tuple[float, float]) -> str:
     return "above normal" if value > band[1] else "below normal" if value < band[0] else "normal"
 
 
+def park_band_label(value: float, park_code: str, as_of: date | None = None) -> str:
+    """band_label() against the park's normal band, or "" when no band exists (never guesses)."""
+    band = normal_bands(as_of or date.today()).get(park_code)
+    return band_label(value, band) if band else ""
+
+
+def label_suffix(value: float, park_code: str, as_of: date | None = None) -> str:
+    """" (normal)" for a WTI number, or "" when no band exists (no empty parens)."""
+    label = park_band_label(value, park_code, as_of)
+    return f" ({label})" if label else ""
+
+
 def wti_bands_section(bands: dict) -> str:
     if not bands:
         return ("## WTI Normal Bands\n"

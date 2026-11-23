@@ -43,6 +43,7 @@ import duckdb
 from datetime import date, datetime as _dt, timedelta as _td, timezone as _tz
 from pathlib import Path as _Path
 from dotenv import load_dotenv
+from ask_agent import label_suffix
 
 load_dotenv(os.path.expanduser("~/.env"))
 
@@ -287,14 +288,9 @@ def wti_emoji(wti: float) -> str:
     else: return "💀"
 
 
-def wti_label(wti: float) -> str:
-    if wti <= 12: return "Well below avg WTI"
-    elif wti <= 18: return "Below avg WTI"
-    elif wti <= 25: return "Typical day"
-    elif wti <= 34: return "Above average"
-    elif wti <= 42: return "Well above average"
-    elif wti <= 50: return "Very high WTI"
-    else: return "Extreme WTI"
+def wti_label(wti: float, park_code: str, as_of: date | None = None) -> str:
+    """Suffix like " (normal)" from the park's /ask normal band, or "" when no band exists."""
+    return label_suffix(wti, park_code, as_of)
 
 
 def get_embed_color(wti: float) -> int:
@@ -375,8 +371,8 @@ def build_payload(today: date, get_wti_fn, accuracy) -> dict:
         for park_code, park_name in parks:
             wti = get_wti_fn(park_code, today)
             if wti is not None:
-                label = wti_label(wti)
-                park_lines.append(f"  ▸ **{park_name}** — WTI **{wti:.0f}** (*{label}*)")
+                label = wti_label(wti, park_code, today)
+                park_lines.append(f"  ▸ **{park_name}** — WTI **{wti:.0f}**{label}")
                 if wti < group_best_wti:
                     group_best_wti = wti
                     group_best_park = park_name

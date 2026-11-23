@@ -47,7 +47,7 @@ from calendar_image import generate_calendar_image
 # Load ~/.env BEFORE importing ask_agent so its QWEN_* settings see it
 # (ask_agent also reads them at call time; this is defense in depth).
 load_dotenv(os.path.expanduser("~/.env"))
-from ask_agent import ask_agent, data_path, _duckdb_path, validate_config
+from ask_agent import ask_agent, data_path, _duckdb_path, validate_config, label_suffix, park_band_label
 validate_config()
 
 # Add theme-park-crowd-report/src to sys.path for live inference model
@@ -224,11 +224,11 @@ def wti_emoji(wti: float) -> str:
     if wti <= 12:
         return "❄️"   # Shortest waits
     elif wti <= 18:
-        return "💎"   # Below average — great day
+        return "💎"   # Light crowds (visual scale only)
     elif wti <= 25:
         return "⚪"   # Normal Disney — typical crowds
     elif wti <= 34:
-        return "🌸"   # Above average — plan ahead
+        return "🌸"   # Busier (visual scale only)
     elif wti <= 42:
         return "🔥"   # Busy — rope drop essential
     elif wti <= 50:
@@ -245,22 +245,26 @@ def _priority_queue_name(park_code: str = "") -> str:
     else:
         return "Lightning Lane"
 
-def wti_label(wti: float, park_code: str = "") -> str:
-    pq = _priority_queue_name(park_code)
-    if wti <= 12:
-        return "Well below avg WTI — best day to visit"
-    elif wti <= 18:
-        return "Below avg WTI — great day to visit"
-    elif wti <= 25:
-        return "Typical day — moderate waits, plan headliners"
-    elif wti <= 34:
-        return f"Above average — rope drop and {pq} recommended"
-    elif wti <= 42:
-        return "Well above average — arrive early, plan strategically"
-    elif wti <= 50:
-        return "Very high WTI — consider another day"
-    else:
-        return "Extreme WTI — plan carefully or reschedule"
+def wti_label(wti: float, park_code: str = "", as_of=None) -> str:
+    """Suffix like " (normal)" from the park's /ask normal band, or "" when no band exists."""
+    return label_suffix(wti, WTI_CODE_MAP.get(park_code, park_code), as_of)
+
+def crowd_footer_tip(wti: float, park_code: str = "", as_of=None) -> str:
+    """/crowd footer tip. Empty when the park has no band; the calm tip only for below normal/normal."""
+    label = park_band_label(wti, WTI_CODE_MAP.get(park_code, park_code), as_of)
+    if not label:
+        return ""
+    if label in ("below normal", "normal"):
+        return "💡 Great day to enjoy everything at your pace"
+    if wti > 50:
+        return f"💡 Very busy day — use {_priority_queue_name(park_code)} and arrive early"
+    if wti > 35:
+        return "💡 Hit headliners at rope drop or after 7pm"
+    return ""
+
+def crowd_footer_text(wti: float, park_code: str = "", as_of=None) -> str:
+    tip = crowd_footer_tip(wti, park_code, as_of)
+    return f"{tip}  •  Theme Park Crowd Report" if tip else "Theme Park Crowd Report"
 
 def get_embed_color(wti: float) -> int:
     """Get embed color based on WTI score — median-anchored Benedictus"""
@@ -271,7 +275,7 @@ def get_embed_color(wti: float) -> int:
     elif wti <= 25:
         return 0xD2C8DC  # Lavender — normal Disney
     elif wti <= 34:
-        return 0xFFB1C9  # Light pink — above average
+        return 0xFFB1C9  # Light pink — busier
     elif wti <= 42:
         return 0xEB427B  # Hot pink — busy
     elif wti <= 50:
@@ -920,7 +924,7 @@ async def crowd_command(interaction: discord.Interaction, park: str, date: str =
     embed = discord.Embed(
         title=f"{wti_emoji(wti_score)} {park_full} — {target_date.strftime('%b %d')}",
         url=f"https://hazeydata.ai/theme-park-crowd-report/year-view?park={park_code}",
-        description=f"**{wti_label(wti_score, park_code)}.** WTI {wti_score:.0f} — expect {int(wti_score*0.7)}-{int(wti_score*1.2)} min on headliners.",
+        description=f"WTI **{wti_score:.0f}**{wti_label(wti_score, park_code)} — expect {int(wti_score*0.7)}-{int(wti_score*1.2)} min on headliners.",
         color=get_embed_color(wti_score),
     )
     
@@ -931,17 +935,7 @@ async def crowd_command(interaction: discord.Interaction, park: str, date: str =
         low_wait_text = "\n".join([f"{name}: {wait} min" for name, wait in low_waits])
         embed.add_field(name="✨ Low Waits", value=low_wait_text, inline=True)
     
-    # Park-appropriate priority queue tips
-    priority_tip = _priority_queue_name(park_code)
-
-    if wti_score > 50:
-        tip = f"💡 Very busy day — use {priority_tip} and arrive early"
-    elif wti_score > 35:
-        tip = "💡 Hit headliners at rope drop or after 7pm"
-    else:
-        tip = "💡 Great day to enjoy everything at your pace"
-    
-    embed.set_footer(text=f"{tip}  •  Theme Park Crowd Report")
+    embed.set_footer(text=crowd_footer_text(wti_score, park_code))
     
     await interaction.followup.send(embed=embed)
 
@@ -1134,7 +1128,7 @@ async def best_day_command(interaction: discord.Interaction, park: str, timefram
             wti = d["wti_avg"]
             label = wti_label(wti, park_code)
             marker = "  ◄ **Best**" if d["date"] == best["date"] else ""
-            day_lines.append(f"**{day_name}** {date_str} — WTI **{wti:.0f}** (*{label}*){marker}")
+            day_lines.append(f"**{day_name}** {date_str} — WTI **{wti:.0f}**{label}{marker}")
         description = THIN_LINE + "\n\n" + "\n".join(day_lines)
 
     elif timeframe <= 30:
@@ -1155,7 +1149,7 @@ async def best_day_command(interaction: discord.Interaction, park: str, timefram
                 wti = d["wti_avg"]
                 label = wti_label(wti, park_code)
                 marker = "  ◄ **Best**" if d["date"] == best["date"] else ""
-                day_lines.append(f"  **{day_name}** {date_str} — WTI **{wti:.0f}** (*{label}*){marker}")
+                day_lines.append(f"  **{day_name}** {date_str} — WTI **{wti:.0f}**{label}{marker}")
             desc_parts.append(THIN_LINE + "\n" + week_label + "\n\n" + "\n".join(day_lines))
         description = "\n\n".join(desc_parts)
 
@@ -1174,7 +1168,7 @@ async def best_day_command(interaction: discord.Interaction, park: str, timefram
                 file = discord.File(cal_buf, filename="calendar.png")
                 print(f"📸 Generated image live for {park_code}_{timeframe} (no pre-gen found)")
 
-            tip = f"💡 Best day: {best['date'].strftime('%A %b %d')} — {wti_label(best['wti_avg'], park_code).lower()}"
+            tip = f"💡 Best day: {best['date'].strftime('%A %b %d')} — WTI {best['wti_avg']:.0f}{wti_label(best['wti_avg'], park_code)}"
             embed = discord.Embed(
                 title=f"📅 {park_full} — Next {timeframe} Days",
                 url=f"https://hazeydata.ai/theme-park-crowd-report/year-view?park={park_code}",
@@ -1208,7 +1202,7 @@ async def best_day_command(interaction: discord.Interaction, park: str, timefram
             marker = "  ⭐" if is_overall_best else ""
             week_range = f"{week_start.strftime('%b %d')}–{week_end.strftime('%b %d')}"
             desc_parts.append(
-                f"**{week_range}** — Avg WTI **{avg_wti:.0f}** (*{label}*)\n"
+                f"**{week_range}** — Avg WTI **{avg_wti:.0f}**{label}\n"
                 f"  ▸ Best: **{best_name}** (WTI {best_wti_val:.0f}){marker}"
             )
         description += "\n\n".join(desc_parts)
@@ -1221,7 +1215,7 @@ async def best_day_command(interaction: discord.Interaction, park: str, timefram
             color=get_embed_color(best["wti_avg"]),
         )
 
-        tip = f"💡 Best day: {best['date'].strftime('%A %b %d')} — {wti_label(best['wti_avg'], park_code).lower()}"
+        tip = f"💡 Best day: {best['date'].strftime('%A %b %d')} — WTI {best['wti_avg']:.0f}{wti_label(best['wti_avg'], park_code)}"
         embed.set_footer(text=f"{tip}  •  Theme Park Crowd Report")
 
         await interaction.followup.send(embed=embed)
@@ -1277,7 +1271,7 @@ async def today_command(interaction: discord.Interaction):
             wti = get_wti_score(park_code, target_date)
             if wti is not None:
                 label = wti_label(wti, park_code)
-                park_lines.append(f"  \u25b8 **{park_name}** \u2014 WTI **{wti:.0f}** (*{label}*)")
+                park_lines.append(f"  \u25b8 **{park_name}** \u2014 WTI **{wti:.0f}**{label}")
                 if wti < group_best_wti:
                     group_best_wti = wti
                     group_best_park = park_name
