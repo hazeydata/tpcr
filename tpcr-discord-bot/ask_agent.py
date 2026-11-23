@@ -1133,9 +1133,9 @@ async def _claude_loop(api_key: str, system_prompt: str, question: str) -> str |
         for block in tool_uses:
             sql = (block.input or {}).get("sql", "")
             logger.info("ask claude round=%d sql=%s", round_num, sql)
-            guard = sql_guard_error(sql)
-            if guard:
-                result = guard
+            sql_guard = sql_guard_error(sql)
+            if sql_guard:
+                result = sql_guard
             else:
                 result = await asyncio.to_thread(run_duckdb_query, sql)
             results.append({"type": "tool_result", "tool_use_id": block.id, "content": result})
@@ -1253,9 +1253,9 @@ async def ask_agent(question: str, user_id: str, api_key: str | None = None, use
                 logger.info("ask round=%d sql=%s", round_num, sql)
 
                 # Safety: reject non-SELECT queries
-                guard = sql_guard_error(sql)
-                if guard:
-                    result = guard
+                sql_guard = sql_guard_error(sql)
+                if sql_guard:
+                    result = sql_guard
                 else:
                     result = await asyncio.to_thread(run_duckdb_query, sql)
                     query_results.append(result)
