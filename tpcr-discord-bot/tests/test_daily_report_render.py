@@ -173,8 +173,9 @@ class TestRender:
             "⭐ **Best Picks**", "📈 **Forecast Accuracy**",
         ]
         assert all(s.splitlines()[0] == thin for s in sections)
-        assert "  ▸ **Magic Kingdom** — WTI **20** (*Typical day*)" in desc
-        assert "  ▸ **Animal Kingdom** — WTI **40** (*Well above average*)" in desc
+        # fixture parquet has one day of history -> no band -> number only
+        assert "  ▸ **Magic Kingdom** — WTI **20**\n" in desc
+        assert "  ▸ **Animal Kingdom** — WTI **40**\n" in desc
         assert "  ▸ Entity MAE: **8.2 min** (241 days evaluated)" in desc
         assert "  ▸ WTI MAE: **6.0** | Bias: **+0.7** (238 days)" in desc
         assert embed["footer"]["text"] == (

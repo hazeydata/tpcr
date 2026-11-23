@@ -26,9 +26,9 @@ BENEDICTUS_STOPS = [
     (12,  "#0A2F8F"),   # Deep blue
     (15,  "#3C78D2"),   # Medium blue
     (18,  "#3C78D2"),   # Medium blue
-    (22,  "#D2C8DC"),   # Lavender — typical day
+    (22,  "#D2C8DC"),   # Lavender — mid scale
     (25,  "#D2C8DC"),   # Lavender
-    (30,  "#FFB1C9"),   # Pink — above average
+    (30,  "#FFB1C9"),   # Pink — busier
     (34,  "#FFB1C9"),   # Pink
     (38,  "#EB427B"),   # Rose — long waits
     (42,  "#EB427B"),   # Rose

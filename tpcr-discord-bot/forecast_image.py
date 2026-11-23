@@ -10,6 +10,8 @@ from datetime import date, timedelta
 from io import BytesIO
 from collections import defaultdict
 
+from ask_agent import label_suffix
+
 # Benedictus color palette — median-anchored, data-driven
 # p1=8 (deep blue) → median=22 (lavender/white) → p99=50 (deep red)
 # Blue compressed (good days are rare), pink expanded (where decisions happen)
@@ -17,7 +19,7 @@ BENEDICTUS_STOPS = [
     (8,   (10, 47, 143)),     # p1: Deep blue — shortest waits
     (15,  (60, 120, 210)),    # ~p16: Blue — notably light
     (22,  (210, 200, 220)),   # median: Lavender-white — normal Disney
-    (28,  (255, 177, 201)),   # ~p47: Light pink — above average
+    (28,  (255, 177, 201)),   # ~p47: Light pink — busier
     (34,  (245, 120, 160)),   # ~p60: Medium pink — busy
     (40,  (235, 66, 123)),    # ~p76: Hot pink — very busy
     (50,  (166, 0, 56)),      # p99: Deep red — avoid if you can
@@ -53,13 +55,9 @@ def wti_to_color(wti: float) -> tuple:
     return BENEDICTUS_STOPS[-1][1]
 
 
-def wti_label(wti: float) -> str:
-    if wti <= 20: return "Short waits"
-    elif wti <= 30: return "Below average"
-    elif wti <= 40: return "Moderate"
-    elif wti <= 50: return "Above average"
-    elif wti <= 60: return "Long waits"
-    else: return "Very long waits"
+def wti_label(wti: float, park_code: str = "", as_of=None) -> str:
+    """Suffix like " (normal)" from the park's /ask normal band, or "" when no band (or no park_code)."""
+    return label_suffix(wti, park_code, as_of)
 
 
 def draw_rounded_rect(draw, xy, radius, fill):
@@ -397,7 +395,7 @@ def wti_to_color_scaled(wti: float, wti_min: float, wti_max: float) -> tuple:
     return wti_to_color(mapped_wti)
 
 
-def generate_year_image(park_name: str, days_data: list) -> BytesIO:
+def generate_year_image(park_name: str, days_data: list, park_code: str = "", as_of=None) -> BytesIO:
     """GitHub contributions-style heatmap: 7 rows (days) × ~52 cols (weeks).
     Colors scaled to the park's own WTI range for maximum contrast."""
 
@@ -551,9 +549,9 @@ def generate_year_image(park_name: str, days_data: list) -> BytesIO:
 
         day_str = d["date"].strftime("%a %b %d")
         wti_str = f"WTI {d['wti_avg']:.0f}"
-        label_str = wti_label(d["wti_avg"])
+        label_str = wti_label(d["wti_avg"], park_code, as_of)
 
-        draw.text((bx + 16 * SCALE, by), f"{day_str}  —  {wti_str}  ({label_str})", fill=rank_color, font=font_best_detail)
+        draw.text((bx + 16 * SCALE, by), f"{day_str}  —  {wti_str}{label_str}", fill=rank_color, font=font_best_detail)
 
     buf = BytesIO()
     img.save(buf, format="PNG", optimize=True)
@@ -564,11 +562,14 @@ def generate_year_image(park_name: str, days_data: list) -> BytesIO:
 # =========================================================================
 # PUBLIC API
 # =========================================================================
-def generate_forecast_image(park_name: str, days_data: list) -> BytesIO:
-    """Route to the right visualization based on data length."""
+def generate_forecast_image(park_name: str, days_data: list, park_code: str = "", as_of=None) -> BytesIO:
+    """Route to the right visualization based on data length.
+
+    park_code enables the band label ("below normal" / "normal" / "above normal") on the
+    year image; without it (or without a band) the label is omitted."""
     n = len(days_data)
     if n > 90:
-        return generate_year_image(park_name, days_data)
+        return generate_year_image(park_name, days_data, park_code, as_of)
     elif n > 14:
         return generate_calendar_image(park_name, days_data)
     else:
