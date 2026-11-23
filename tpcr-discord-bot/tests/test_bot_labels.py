@@ -62,6 +62,23 @@ def test_forecast_image_wti_label(parquet, value, expected):
     assert forecast_image.wti_label(value, "MK", TODAY) == expected
 
 
+@pytest.mark.parametrize("value,tip", [(12.0, True), (15.8, True), (25.0, False)])
+def test_crowd_footer_great_day_tip(bot, parquet, value, tip):
+    assert ("Great day to enjoy" in bot.crowd_footer_tip(value, "MK", TODAY)) is tip
+
+
+@pytest.mark.parametrize("value", [15.8, 25.0, 40.0, 60.0])
+def test_crowd_footer_missing_band_no_tip(bot, tmp_path, value):
+    aa._BANDS_CACHE.clear()
+    assert bot.crowd_footer_tip(value, "MK", TODAY) == ""
+    assert bot.crowd_footer_text(value, "MK", TODAY) == "Theme Park Crowd Report"
+
+
+def test_crowd_footer_no_dangling_bullet(bot, parquet):
+    assert bot.crowd_footer_text(25.0, "MK", TODAY) == "Theme Park Crowd Report"
+    assert bot.crowd_footer_text(15.8, "MK", TODAY).endswith("  •  Theme Park Crowd Report")
+
+
 def test_missing_data_omits_label(bot, tmp_path):
     # no parquet at all
     aa._BANDS_CACHE.clear()

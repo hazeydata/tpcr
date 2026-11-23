@@ -47,7 +47,7 @@ from calendar_image import generate_calendar_image
 # Load ~/.env BEFORE importing ask_agent so its QWEN_* settings see it
 # (ask_agent also reads them at call time; this is defense in depth).
 load_dotenv(os.path.expanduser("~/.env"))
-from ask_agent import ask_agent, data_path, _duckdb_path, validate_config, label_suffix
+from ask_agent import ask_agent, data_path, _duckdb_path, validate_config, label_suffix, park_band_label
 validate_config()
 
 # Add theme-park-crowd-report/src to sys.path for live inference model
@@ -248,6 +248,23 @@ def _priority_queue_name(park_code: str = "") -> str:
 def wti_label(wti: float, park_code: str = "", as_of=None) -> str:
     """Suffix like " (normal)" from the park's /ask normal band, or "" when no band exists."""
     return label_suffix(wti, WTI_CODE_MAP.get(park_code, park_code), as_of)
+
+def crowd_footer_tip(wti: float, park_code: str = "", as_of=None) -> str:
+    """/crowd footer tip. Empty when the park has no band; the calm tip only for below normal/normal."""
+    label = park_band_label(wti, WTI_CODE_MAP.get(park_code, park_code), as_of)
+    if not label:
+        return ""
+    if label in ("below normal", "normal"):
+        return "💡 Great day to enjoy everything at your pace"
+    if wti > 50:
+        return f"💡 Very busy day — use {_priority_queue_name(park_code)} and arrive early"
+    if wti > 35:
+        return "💡 Hit headliners at rope drop or after 7pm"
+    return ""
+
+def crowd_footer_text(wti: float, park_code: str = "", as_of=None) -> str:
+    tip = crowd_footer_tip(wti, park_code, as_of)
+    return f"{tip}  •  Theme Park Crowd Report" if tip else "Theme Park Crowd Report"
 
 def get_embed_color(wti: float) -> int:
     """Get embed color based on WTI score — median-anchored Benedictus"""
@@ -918,17 +935,7 @@ async def crowd_command(interaction: discord.Interaction, park: str, date: str =
         low_wait_text = "\n".join([f"{name}: {wait} min" for name, wait in low_waits])
         embed.add_field(name="✨ Low Waits", value=low_wait_text, inline=True)
     
-    # Park-appropriate priority queue tips
-    priority_tip = _priority_queue_name(park_code)
-
-    if wti_score > 50:
-        tip = f"💡 Very busy day — use {priority_tip} and arrive early"
-    elif wti_score > 35:
-        tip = "💡 Hit headliners at rope drop or after 7pm"
-    else:
-        tip = "💡 Great day to enjoy everything at your pace"
-    
-    embed.set_footer(text=f"{tip}  •  Theme Park Crowd Report")
+    embed.set_footer(text=crowd_footer_text(wti_score, park_code))
     
     await interaction.followup.send(embed=embed)
 
