@@ -43,10 +43,17 @@ from forecast_image import generate_forecast_image
 
 logger = logging.getLogger("tpcr-bot")
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] [%(levelname)-8s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+# Spec R5/AC33: the SDK/HTTP loggers emit request ids and headers at DEBUG; pin them
+# to WARNING so a root logger at DEBUG cannot leak them.
+for _noisy in ("anthropic", "httpx", "httpcore", "httpx2", "httpcore2"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 from calendar_image import generate_calendar_image
 # Load ~/.env BEFORE importing ask_agent so its QWEN_* settings see it
 # (ask_agent also reads them at call time; this is defense in depth).
 load_dotenv(os.path.expanduser("~/.env"))
+# Spec R5/AC33: the anthropic SDK reads ANTHROPIC_LOG at import and would override the
+# WARNING pin above; pop after load_dotenv since ~/.env could set it.
+os.environ.pop("ANTHROPIC_LOG", None)
 from ask_agent import ask_agent, data_path, _duckdb_path, validate_config
 validate_config()
 
@@ -1724,6 +1731,16 @@ BOT_COMMANDS_CHANNEL = 1478240248361128079  # #bot-commands (recreated Mar 2)
 FRIENDLY_ERROR = "Sorry, I couldn't answer that right now. Please try again in a bit."
 
 
+def _ask_err(e: BaseException) -> str:
+    """Spec R4: exception class plus integer HTTP status only; never message, body or traceback."""
+    status = getattr(e, "status_code", None)
+    if status is None:
+        status = getattr(e, "status", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        return f"{type(e).__name__}, status {status}"
+    return type(e).__name__
+
+
 @tree.command(name="ask", description="Ask anything about theme park crowds, wait times, and visit planning")
 @app_commands.describe(question="Your question (e.g., 'What's the best day to visit Magic Kingdom this month?')")
 async def ask_command(interaction: discord.Interaction, question: str):
@@ -1750,20 +1767,22 @@ async def ask_command(interaction: discord.Interaction, question: str):
         view = AskFeedbackView(question, str(interaction.user.id), str(interaction.user))
         try:
             await placeholder.edit(content=None, embed=embed, view=view)
-        except Exception:
-            logger.warning("/ask placeholder edit failed; sending new message", exc_info=True)
+        except Exception as edit_err:
+            logger.warning("/ask placeholder edit failed (%s); sending new message", _ask_err(edit_err))
             await interaction.followup.send(embed=embed, view=view)
 
-    except Exception:
-        # Full details server-side only; users never see raw exception text
-        logger.error("/ask failed", exc_info=True)
+    except Exception as e:
+        # Spec R4 / AC24: class + status only. No exc_info: the traceback and its chained
+        # context (an earlier Claude/OpenRouter error) can echo the API key.
+        logger.error("/ask failed (%s)", _ask_err(e))
         try:
             if placeholder is not None:
                 await placeholder.edit(content=FRIENDLY_ERROR, embed=None, view=None)
             else:
                 await interaction.followup.send(FRIENDLY_ERROR, ephemeral=True)
-        except Exception:
-            logger.error("/ask could not deliver error message", exc_info=True)
+        except Exception as deliver_err:
+            # No exc_info: its chained __context__ is the original /ask error (Spec R4).
+            logger.error("/ask could not deliver error message (%s)", _ask_err(deliver_err))
             try:
                 await interaction.followup.send(FRIENDLY_ERROR, ephemeral=True)
             except Exception:
